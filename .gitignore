@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcworkspace/contents.xcworkspacedata
+*.playground/timeline.xctimeline
+*.playground/playground.xcworkspace
+
+# Swift Package Manager
+.build/
+.swiftpm/xcode/
+.swiftpm/configuration/
+Package.resolved
+Packages/
+
+# Environment / Secrets
+.env
+.env.*
+.netrc
+
+# Claude
+.claude/
