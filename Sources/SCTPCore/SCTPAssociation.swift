@@ -436,13 +436,14 @@ public final class SCTPAssociation: Sendable {
 
     private func generateSack() -> SCTPPacket {
         let (localPort, remotePort, remoteTag, cumulativeTSN, gaps, dups) = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, [(UInt16, UInt16)], [UInt32]) in
-            guard let tracker = s.tsnTracker else {
+            guard var tracker = s.tsnTracker else {
                 return (s.localPort, s.remotePort, s.remoteVerificationTag, 0, [], [])
             }
-            var mutableTracker = tracker
-            let dups = mutableTracker.takeDuplicates()
-            s.tsnTracker = mutableTracker
-            return (s.localPort, s.remotePort, s.remoteVerificationTag, tracker.cumulativeTSN, tracker.gapBlocks, dups)
+            let dups = tracker.takeDuplicates()
+            let gaps = tracker.getGapBlocksCached()
+            let cumulativeTSN = tracker.cumulativeTSN
+            s.tsnTracker = tracker
+            return (s.localPort, s.remotePort, s.remoteVerificationTag, cumulativeTSN, gaps, dups)
         }
 
         let sack = SCTPSackChunk(

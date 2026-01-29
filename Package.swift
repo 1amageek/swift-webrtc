@@ -60,5 +60,11 @@ let package = Package(
         .testTarget(name: "SCTPCoreTests", dependencies: ["SCTPCore"], path: "Tests/SCTPCoreTests"),
         .testTarget(name: "DataChannelTests", dependencies: ["DataChannel", "SCTPCore"], path: "Tests/DataChannelTests"),
         .testTarget(name: "WebRTCTests", dependencies: ["WebRTC"], path: "Tests/WebRTCTests"),
+        // Performance Tests
+        .testTarget(
+            name: "PerformanceTests",
+            dependencies: ["STUNCore", "ICELite", "SCTPCore", "DataChannel", "WebRTC"],
+            path: "Tests/PerformanceTests"
+        ),
     ]
 )

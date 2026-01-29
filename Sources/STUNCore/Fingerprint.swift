@@ -75,11 +75,13 @@ public enum STUNFingerprint: Sendable {
 
     /// Compute CRC-32
     private static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFFFFFF
-        for byte in data {
-            let index = Int((crc ^ UInt32(byte)) & 0xFF)
-            crc = (crc >> 8) ^ crc32Table[index]
+        data.withUnsafeBytes { buffer in
+            var crc: UInt32 = 0xFFFFFFFF
+            for byte in buffer {
+                let index = Int((crc ^ UInt32(byte)) & 0xFF)
+                crc = (crc >> 8) ^ crc32Table[index]
+            }
+            return crc ^ 0xFFFFFFFF
         }
-        return crc ^ 0xFFFFFFFF
     }
 }

@@ -25,6 +25,9 @@ public struct TSNTracker: Sendable {
     /// Maximum gap tracking window size
     private let windowSize: UInt32 = 65535
 
+    /// Cached gap blocks (invalidated when TSNs change)
+    private var cachedGapBlocks: [(start: UInt16, end: UInt16)]?
+
     /// Initialize with the peer's initial TSN
     /// - Parameter initialTSN: The initial TSN from INIT/INIT-ACK (first expected TSN)
     public init(initialTSN: UInt32) {
@@ -33,6 +36,7 @@ public struct TSNTracker: Sendable {
         self.cumulativeTSN = initialTSN &- 1
         self.receivedAboveCumulative = []
         self.duplicates = []
+        self.cachedGapBlocks = nil
     }
 
     /// Receive a TSN
@@ -57,6 +61,9 @@ public struct TSNTracker: Sendable {
             return false
         }
 
+        // Invalidate gap blocks cache since state is changing
+        cachedGapBlocks = nil
+
         // Is this the next expected TSN?
         if tsn == cumulativeTSN &+ 1 {
             // Advance cumulative
@@ -75,9 +82,29 @@ public struct TSNTracker: Sendable {
         return true
     }
 
-    /// Get gap ack blocks for SACK
+    /// Get gap ack blocks for SACK (non-mutating, computes each time)
     /// Gap blocks are offsets from cumulative TSN
+    /// Prefer using `getGapBlocksCached()` when the tracker is mutable
     public var gapBlocks: [(start: UInt16, end: UInt16)] {
+        if let cached = cachedGapBlocks {
+            return cached
+        }
+        return computeGapBlocks()
+    }
+
+    /// Get gap ack blocks with caching (mutating)
+    /// Use this method when possible for better performance
+    public mutating func getGapBlocksCached() -> [(start: UInt16, end: UInt16)] {
+        if let cached = cachedGapBlocks {
+            return cached
+        }
+        let computed = computeGapBlocks()
+        cachedGapBlocks = computed
+        return computed
+    }
+
+    /// Compute gap blocks from scratch
+    private func computeGapBlocks() -> [(start: UInt16, end: UInt16)] {
         guard !receivedAboveCumulative.isEmpty else { return [] }
 
         // Sort received TSNs

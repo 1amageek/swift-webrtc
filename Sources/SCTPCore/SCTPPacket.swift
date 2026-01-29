@@ -59,7 +59,8 @@ public struct SCTPPacket: Sendable {
         }
 
         // Compute CRC-32C checksum
-        let crc = crc32c(Data(data[0..<checksumOffset]) + Data([0, 0, 0, 0]) + Data(data[(checksumOffset + 4)...]))
+        // Checksum field is already zeroed (from line 54), so compute directly
+        let crc = crc32c(data)
         data[checksumOffset] = UInt8(crc & 0xFF)
         data[checksumOffset + 1] = UInt8((crc >> 8) & 0xFF)
         data[checksumOffset + 2] = UInt8((crc >> 16) & 0xFF)
@@ -121,30 +122,78 @@ public struct SCTPPacket: Sendable {
     }
 }
 
-/// CRC-32C implementation for SCTP checksum
+/// CRC-32C implementation for SCTP checksum using slicing-by-4
 func crc32c(_ data: Data) -> UInt32 {
-    var crc: UInt32 = 0xFFFFFFFF
-    for byte in data {
-        let index = Int((crc ^ UInt32(byte)) & 0xFF)
-        crc = (crc >> 8) ^ crc32cTable[index]
+    data.withUnsafeBytes { buffer in
+        guard let baseAddress = buffer.baseAddress else {
+            return 0
+        }
+        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
+        var crc: UInt32 = 0xFFFFFFFF
+        var i = 0
+        let count = buffer.count
+
+        // Process 4 bytes at a time using slicing-by-4
+        while i + 4 <= count {
+            // XOR current CRC with 4 bytes (little-endian)
+            let word = crc ^
+                       (UInt32(ptr[i]) |
+                        (UInt32(ptr[i + 1]) << 8) |
+                        (UInt32(ptr[i + 2]) << 16) |
+                        (UInt32(ptr[i + 3]) << 24))
+
+            crc = crc32cTable3[Int(word & 0xFF)] ^
+                  crc32cTable2[Int((word >> 8) & 0xFF)] ^
+                  crc32cTable1[Int((word >> 16) & 0xFF)] ^
+                  crc32cTable0[Int((word >> 24) & 0xFF)]
+            i += 4
+        }
+
+        // Process remaining bytes using the base table
+        while i < count {
+            let index = Int((crc ^ UInt32(ptr[i])) & 0xFF)
+            crc = (crc >> 8) ^ crc32cTable0[index]
+            i += 1
+        }
+
+        return crc ^ 0xFFFFFFFF
     }
-    return crc ^ 0xFFFFFFFF
 }
 
-private let crc32cTable: [UInt32] = {
-    var table = [UInt32](repeating: 0, count: 256)
+/// Generate CRC-32C slicing tables (4 tables for slicing-by-4 algorithm)
+private let (crc32cTable0, crc32cTable1, crc32cTable2, crc32cTable3): ([UInt32], [UInt32], [UInt32], [UInt32]) = {
+    let polynomial: UInt32 = 0x82F63B78 // CRC-32C polynomial (Castagnoli)
+
+    // Generate base table (table0) - standard CRC lookup table
+    var table0 = [UInt32](repeating: 0, count: 256)
     for i in 0..<256 {
         var crc = UInt32(i)
         for _ in 0..<8 {
             if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0x82F63B78 // CRC-32C polynomial
+                crc = (crc >> 1) ^ polynomial
             } else {
                 crc >>= 1
             }
         }
-        table[i] = crc
+        table0[i] = crc
     }
-    return table
+
+    // Generate extended tables for slicing-by-4
+    // Each table[n][i] represents CRC of byte value i shifted by n bytes
+    var table1 = [UInt32](repeating: 0, count: 256)
+    var table2 = [UInt32](repeating: 0, count: 256)
+    var table3 = [UInt32](repeating: 0, count: 256)
+
+    for i in 0..<256 {
+        // table1[i] = CRC of (i followed by one zero byte)
+        table1[i] = (table0[i] >> 8) ^ table0[Int(table0[i] & 0xFF)]
+        // table2[i] = CRC of (i followed by two zero bytes)
+        table2[i] = (table1[i] >> 8) ^ table0[Int(table1[i] & 0xFF)]
+        // table3[i] = CRC of (i followed by three zero bytes)
+        table3[i] = (table2[i] >> 8) ^ table0[Int(table2[i] & 0xFF)]
+    }
+
+    return (table0, table1, table2, table3)
 }()
 
 /// SCTP errors
