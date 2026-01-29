@@ -52,10 +52,10 @@ public struct SCTPChunk: Sendable {
         data.append(UInt8(length & 0xFF))
         data.append(value)
 
-        // Pad to 4-byte boundary
+        // Pad to 4-byte boundary (avoid allocating temporary Data)
         let padding = (4 - (Int(length) % 4)) % 4
-        if padding > 0 {
-            data.append(Data(repeating: 0, count: padding))
+        for _ in 0..<padding {
+            data.append(0)
         }
 
         return data
@@ -63,19 +63,25 @@ public struct SCTPChunk: Sendable {
 
     /// Decode a chunk from data
     public static func decode(from data: Data) throws -> SCTPChunk {
-        guard data.count >= 4 else {
-            throw SCTPError.insufficientData(expected: 4, actual: data.count)
+        try decode(from: data, at: 0)
+    }
+
+    /// Decode a chunk from data at a specific offset (avoids Data copy)
+    public static func decode(from data: Data, at offset: Int) throws -> SCTPChunk {
+        guard data.count >= offset + 4 else {
+            throw SCTPError.insufficientData(expected: offset + 4, actual: data.count)
         }
 
-        let chunkType = data[0]
-        let flags = data[1]
-        let length = UInt16(data[2]) << 8 | UInt16(data[3])
+        let chunkType = data[offset]
+        let flags = data[offset + 1]
+        let length = UInt16(data[offset + 2]) << 8 | UInt16(data[offset + 3])
 
-        guard data.count >= Int(length) else {
-            throw SCTPError.insufficientData(expected: Int(length), actual: data.count)
+        guard data.count >= offset + Int(length) else {
+            throw SCTPError.insufficientData(expected: offset + Int(length), actual: data.count)
         }
 
-        let value = Data(data[4..<Int(length)])
+        // Create value Data - this is the only copy we need
+        let value = Data(data[(offset + 4)..<(offset + Int(length))])
         return SCTPChunk(chunkType: chunkType, flags: flags, value: value)
     }
 }

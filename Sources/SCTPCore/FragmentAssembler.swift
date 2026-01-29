@@ -180,10 +180,11 @@ public struct FragmentAssembler: Sendable {
             expectedTSN = expectedTSN &+ 1
         }
 
-        // Assemble data
-        var data = Data()
+        // Assemble data with pre-allocation
+        let totalSize = sorted.reduce(0) { $0 + $1.data.count }
+        var data = Data(capacity: totalSize)
         for fragment in sorted {
-            data.append(fragment.data)
+            data.append(contentsOf: fragment.data)
         }
 
         return AssembledMessage(

@@ -90,24 +90,19 @@ public struct SCTPPacket: Sendable {
                                    UInt32(data[10]) << 16 |
                                    UInt32(data[11]) << 24
 
-            // Compute checksum with checksum field zeroed
-            var checksumData = Data(data)
-            checksumData[8] = 0
-            checksumData[9] = 0
-            checksumData[10] = 0
-            checksumData[11] = 0
-            let computedChecksum = crc32c(checksumData)
+            // Compute checksum with checksum field treated as zeros (no copy needed)
+            let computedChecksum = crc32cWithZeroedChecksum(data)
 
             guard receivedChecksum == computedChecksum else {
                 throw SCTPError.checksumMismatch(expected: computedChecksum, actual: receivedChecksum)
             }
         }
 
-        // Parse chunks
+        // Parse chunks (use offset-based decode to avoid Data copies)
         var offset = 12
         var chunks: [SCTPChunk] = []
         while offset + 4 <= data.count {
-            let chunk = try SCTPChunk.decode(from: Data(data[offset...]))
+            let chunk = try SCTPChunk.decode(from: data, at: offset)
             chunks.append(chunk)
             let paddedLength = (Int(chunk.length) + 3) & ~3
             offset += paddedLength
@@ -129,19 +124,85 @@ func crc32c(_ data: Data) -> UInt32 {
             return 0
         }
         let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
-        var crc: UInt32 = 0xFFFFFFFF
-        var i = 0
+        return crc32cCore(ptr: ptr, count: buffer.count)
+    }
+}
+
+/// CRC-32C with checksum field (bytes 8-11) treated as zeros
+/// Avoids copying the entire packet just to zero out 4 bytes
+func crc32cWithZeroedChecksum(_ data: Data) -> UInt32 {
+    data.withUnsafeBytes { buffer in
+        guard let baseAddress = buffer.baseAddress else {
+            return 0
+        }
+        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
         let count = buffer.count
 
-        // Process 4 bytes at a time using slicing-by-4
-        while i + 4 <= count {
-            // XOR current CRC with 4 bytes (little-endian)
+        guard count >= 12 else {
+            return crc32cCore(ptr: ptr, count: count)
+        }
+
+        var crc: UInt32 = 0xFFFFFFFF
+
+        // Process bytes 0-7 (header before checksum)
+        let word0 = crc ^
+                   (UInt32(ptr[0]) |
+                    (UInt32(ptr[1]) << 8) |
+                    (UInt32(ptr[2]) << 16) |
+                    (UInt32(ptr[3]) << 24))
+        crc = crc32cTable3[Int(word0 & 0xFF)] ^
+              crc32cTable2[Int((word0 >> 8) & 0xFF)] ^
+              crc32cTable1[Int((word0 >> 16) & 0xFF)] ^
+              crc32cTable0[Int((word0 >> 24) & 0xFF)]
+
+        let word1 = crc ^
+                   (UInt32(ptr[4]) |
+                    (UInt32(ptr[5]) << 8) |
+                    (UInt32(ptr[6]) << 16) |
+                    (UInt32(ptr[7]) << 24))
+        crc = crc32cTable3[Int(word1 & 0xFF)] ^
+              crc32cTable2[Int((word1 >> 8) & 0xFF)] ^
+              crc32cTable1[Int((word1 >> 16) & 0xFF)] ^
+              crc32cTable0[Int((word1 >> 24) & 0xFF)]
+
+        // Process bytes 8-11 as zeros (checksum field)
+        // XOR with 0x00000000 is just crc itself
+        let word2 = crc // ^ 0x00000000
+        crc = crc32cTable3[Int(word2 & 0xFF)] ^
+              crc32cTable2[Int((word2 >> 8) & 0xFF)] ^
+              crc32cTable1[Int((word2 >> 16) & 0xFF)] ^
+              crc32cTable0[Int((word2 >> 24) & 0xFF)]
+
+        // Process remaining bytes (12 to end) using slicing-by-8
+        var i = 12
+        while i + 8 <= count {
+            let word0 = crc ^
+                       (UInt32(ptr[i]) |
+                        (UInt32(ptr[i + 1]) << 8) |
+                        (UInt32(ptr[i + 2]) << 16) |
+                        (UInt32(ptr[i + 3]) << 24))
+            let word1 = UInt32(ptr[i + 4]) |
+                        (UInt32(ptr[i + 5]) << 8) |
+                        (UInt32(ptr[i + 6]) << 16) |
+                        (UInt32(ptr[i + 7]) << 24)
+            crc = crc32cTable7[Int(word0 & 0xFF)] ^
+                  crc32cTable6[Int((word0 >> 8) & 0xFF)] ^
+                  crc32cTable5[Int((word0 >> 16) & 0xFF)] ^
+                  crc32cTable4[Int((word0 >> 24) & 0xFF)] ^
+                  crc32cTable3[Int(word1 & 0xFF)] ^
+                  crc32cTable2[Int((word1 >> 8) & 0xFF)] ^
+                  crc32cTable1[Int((word1 >> 16) & 0xFF)] ^
+                  crc32cTable0[Int((word1 >> 24) & 0xFF)]
+            i += 8
+        }
+
+        // Process remaining 4 bytes if available
+        if i + 4 <= count {
             let word = crc ^
                        (UInt32(ptr[i]) |
                         (UInt32(ptr[i + 1]) << 8) |
                         (UInt32(ptr[i + 2]) << 16) |
                         (UInt32(ptr[i + 3]) << 24))
-
             crc = crc32cTable3[Int(word & 0xFF)] ^
                   crc32cTable2[Int((word >> 8) & 0xFF)] ^
                   crc32cTable1[Int((word >> 16) & 0xFF)] ^
@@ -149,7 +210,7 @@ func crc32c(_ data: Data) -> UInt32 {
             i += 4
         }
 
-        // Process remaining bytes using the base table
+        // Process remaining bytes
         while i < count {
             let index = Int((crc ^ UInt32(ptr[i])) & 0xFF)
             crc = (crc >> 8) ^ crc32cTable0[index]
@@ -160,8 +221,65 @@ func crc32c(_ data: Data) -> UInt32 {
     }
 }
 
-/// Generate CRC-32C slicing tables (4 tables for slicing-by-4 algorithm)
-private let (crc32cTable0, crc32cTable1, crc32cTable2, crc32cTable3): ([UInt32], [UInt32], [UInt32], [UInt32]) = {
+/// Core CRC-32C computation using slicing-by-8
+@inline(__always)
+private func crc32cCore(ptr: UnsafePointer<UInt8>, count: Int) -> UInt32 {
+    var crc: UInt32 = 0xFFFFFFFF
+    var i = 0
+
+    // Process 8 bytes at a time using slicing-by-8
+    while i + 8 <= count {
+        // First 4 bytes
+        let word0 = crc ^
+                   (UInt32(ptr[i]) |
+                    (UInt32(ptr[i + 1]) << 8) |
+                    (UInt32(ptr[i + 2]) << 16) |
+                    (UInt32(ptr[i + 3]) << 24))
+        // Second 4 bytes
+        let word1 = UInt32(ptr[i + 4]) |
+                    (UInt32(ptr[i + 5]) << 8) |
+                    (UInt32(ptr[i + 6]) << 16) |
+                    (UInt32(ptr[i + 7]) << 24)
+
+        crc = crc32cTable7[Int(word0 & 0xFF)] ^
+              crc32cTable6[Int((word0 >> 8) & 0xFF)] ^
+              crc32cTable5[Int((word0 >> 16) & 0xFF)] ^
+              crc32cTable4[Int((word0 >> 24) & 0xFF)] ^
+              crc32cTable3[Int(word1 & 0xFF)] ^
+              crc32cTable2[Int((word1 >> 8) & 0xFF)] ^
+              crc32cTable1[Int((word1 >> 16) & 0xFF)] ^
+              crc32cTable0[Int((word1 >> 24) & 0xFF)]
+        i += 8
+    }
+
+    // Process remaining 4 bytes if available
+    if i + 4 <= count {
+        let word = crc ^
+                   (UInt32(ptr[i]) |
+                    (UInt32(ptr[i + 1]) << 8) |
+                    (UInt32(ptr[i + 2]) << 16) |
+                    (UInt32(ptr[i + 3]) << 24))
+        crc = crc32cTable3[Int(word & 0xFF)] ^
+              crc32cTable2[Int((word >> 8) & 0xFF)] ^
+              crc32cTable1[Int((word >> 16) & 0xFF)] ^
+              crc32cTable0[Int((word >> 24) & 0xFF)]
+        i += 4
+    }
+
+    // Process remaining bytes using the base table
+    while i < count {
+        let index = Int((crc ^ UInt32(ptr[i])) & 0xFF)
+        crc = (crc >> 8) ^ crc32cTable0[index]
+        i += 1
+    }
+
+    return crc ^ 0xFFFFFFFF
+}
+
+/// Generate CRC-32C slicing tables (8 tables for slicing-by-8 algorithm)
+private let (crc32cTable0, crc32cTable1, crc32cTable2, crc32cTable3,
+             crc32cTable4, crc32cTable5, crc32cTable6, crc32cTable7):
+    ([UInt32], [UInt32], [UInt32], [UInt32], [UInt32], [UInt32], [UInt32], [UInt32]) = {
     let polynomial: UInt32 = 0x82F63B78 // CRC-32C polynomial (Castagnoli)
 
     // Generate base table (table0) - standard CRC lookup table
@@ -178,22 +296,26 @@ private let (crc32cTable0, crc32cTable1, crc32cTable2, crc32cTable3): ([UInt32],
         table0[i] = crc
     }
 
-    // Generate extended tables for slicing-by-4
-    // Each table[n][i] represents CRC of byte value i shifted by n bytes
+    // Generate extended tables for slicing-by-8
     var table1 = [UInt32](repeating: 0, count: 256)
     var table2 = [UInt32](repeating: 0, count: 256)
     var table3 = [UInt32](repeating: 0, count: 256)
+    var table4 = [UInt32](repeating: 0, count: 256)
+    var table5 = [UInt32](repeating: 0, count: 256)
+    var table6 = [UInt32](repeating: 0, count: 256)
+    var table7 = [UInt32](repeating: 0, count: 256)
 
     for i in 0..<256 {
-        // table1[i] = CRC of (i followed by one zero byte)
         table1[i] = (table0[i] >> 8) ^ table0[Int(table0[i] & 0xFF)]
-        // table2[i] = CRC of (i followed by two zero bytes)
         table2[i] = (table1[i] >> 8) ^ table0[Int(table1[i] & 0xFF)]
-        // table3[i] = CRC of (i followed by three zero bytes)
         table3[i] = (table2[i] >> 8) ^ table0[Int(table2[i] & 0xFF)]
+        table4[i] = (table3[i] >> 8) ^ table0[Int(table3[i] & 0xFF)]
+        table5[i] = (table4[i] >> 8) ^ table0[Int(table4[i] & 0xFF)]
+        table6[i] = (table5[i] >> 8) ^ table0[Int(table5[i] & 0xFF)]
+        table7[i] = (table6[i] >> 8) ^ table0[Int(table6[i] & 0xFF)]
     }
 
-    return (table0, table1, table2, table3)
+    return (table0, table1, table2, table3, table4, table5, table6, table7)
 }()
 
 /// SCTP errors
