@@ -90,8 +90,13 @@ public struct DCEPOpen: Sendable {
             throw DataChannelError.invalidFormat("DCEP Open data too short for label/protocol")
         }
 
-        let label = String(data: Data(data[12..<12 + labelLen]), encoding: .utf8) ?? ""
-        let proto = String(data: Data(data[12 + labelLen..<12 + labelLen + protoLen]), encoding: .utf8) ?? ""
+        // RFC 8832: Label and protocol MUST be valid UTF-8
+        guard let label = String(data: Data(data[12..<12 + labelLen]), encoding: .utf8) else {
+            throw DataChannelError.invalidFormat("Label is not valid UTF-8")
+        }
+        guard let proto = String(data: Data(data[12 + labelLen..<12 + labelLen + protoLen]), encoding: .utf8) else {
+            throw DataChannelError.invalidFormat("Protocol is not valid UTF-8")
+        }
 
         return DCEPOpen(
             channelType: channelType,

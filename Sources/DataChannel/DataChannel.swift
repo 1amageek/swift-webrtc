@@ -113,11 +113,13 @@ public final class DataChannelManager: Sendable {
         switch data[0] {
         case DCEPMessageType.dataChannelOpen.rawValue:
             let open = try DCEPOpen.decode(from: data)
+            // RFC 8832 Section 8.2.2: High-order bit (0x80) indicates unordered delivery
+            let isOrdered = (open.channelType.rawValue & 0x80) == 0
             let channel = DataChannel(
                 id: streamID,
                 label: open.label,
                 protocol: open.protocol_,
-                ordered: open.channelType == .reliable,
+                ordered: isOrdered,
                 state: .open
             )
             managerState.withLock { s in
