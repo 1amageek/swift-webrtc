@@ -42,6 +42,11 @@ public final class WebRTCConnection: Sendable {
         dtlsConnection.remoteFingerprint
     }
 
+    /// Remote peer's DER-encoded certificate (available after DTLS handshake)
+    public var remoteCertificateDER: Data? {
+        dtlsConnection.remoteCertificateDER
+    }
+
     /// Stream of incoming data channels opened by the remote peer
     public var incomingChannels: AsyncStream<DataChannel> {
         channelState.withLock { state in
