@@ -34,7 +34,9 @@ let package = Package(
         ),
         .target(
             name: "SCTPCore",
-            dependencies: [],
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto"),
+            ],
             path: "Sources/SCTPCore"
         ),
         .target(

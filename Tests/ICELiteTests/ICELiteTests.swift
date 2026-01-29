@@ -48,9 +48,22 @@ struct ICELiteTests {
     func processBindingRequest() throws {
         let agent = ICELiteAgent()
 
-        // Create a STUN binding request with proper MESSAGE-INTEGRITY
+        // Set remote credentials (simulating SDP exchange)
+        let remoteUfrag = "remoteUfrag123"
+        let remotePassword = "remotePassword456789012345"
+        agent.setRemoteCredentials(ufrag: remoteUfrag, password: remotePassword)
+
+        // Create a STUN binding request with proper USERNAME and MESSAGE-INTEGRITY
+        // USERNAME format: remoteUfrag:localUfrag (from the sender's perspective)
+        // The sender uses their ufrag as remoteUfrag and our ufrag as localUfrag
+        let username = "\(remoteUfrag):\(agent.credentials.localUfrag)"
         let key = agent.credentials.stunKey
-        let msg = STUNMessage.bindingRequest()
+
+        // Use ICE-CONTROLLING since ICE Lite is always controlled
+        let msg = STUNMessage.bindingRequest(
+            username: username,
+            iceControlling: 12345
+        )
         let encoded = msg.encodeWithIntegrity(key: key)
 
         let sourceAddress = Data([192, 168, 1, 1])

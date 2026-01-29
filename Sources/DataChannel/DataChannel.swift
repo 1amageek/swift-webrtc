@@ -163,6 +163,20 @@ public final class DataChannelManager: Sendable {
             s.channels[id]?.state = .closed
         }
     }
+
+    /// Shutdown the manager, closing all channels
+    ///
+    /// Call this method when the connection is being closed to ensure
+    /// all channels are properly cleaned up.
+    public func shutdown() {
+        managerState.withLock { s in
+            for channelID in s.channels.keys {
+                s.channels[channelID]?.state = .closed
+            }
+            s.channels.removeAll()
+            s.pendingIncoming.removeAll()
+        }
+    }
 }
 
 // MARK: - Mutex import

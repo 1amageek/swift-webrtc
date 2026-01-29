@@ -21,7 +21,8 @@ struct WebRTCConnectionDemultiplexTests {
         )
 
         try connection.start()
-        #expect(connection.state == .connecting)
+        // Server is now in DTLS handshake state, waiting for ClientHello
+        #expect(connection.state == .dtlsHandshaking)
     }
 
     @Test("Receive empty data is no-op")

@@ -37,16 +37,29 @@ public struct ICECredentials: Sendable, Equatable {
     }
 
     private static func randomAlphanumeric(length: Int) -> String {
-        let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        let chars = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        let charCount = UInt8(chars.count) // 62
+
+        // Use rejection sampling to avoid modulo bias
+        // Reject values >= 248 (248 = 62 * 4, largest multiple of 62 <= 256)
+        let threshold: UInt8 = 248
+
         var result = ""
-        var bytes = Data(count: length)
-        bytes.withUnsafeMutableBytes { ptr in
-            let _ = SecRandomCopyBytes(kSecRandomDefault, length, ptr.baseAddress!)
+        result.reserveCapacity(length)
+
+        while result.count < length {
+            var byte: UInt8 = 0
+            withUnsafeMutableBytes(of: &byte) { ptr in
+                _ = SecRandomCopyBytes(kSecRandomDefault, 1, ptr.baseAddress!)
+            }
+
+            // Rejection sampling: discard biased values
+            if byte < threshold {
+                let index = Int(byte % charCount)
+                result.append(chars[index])
+            }
         }
-        for byte in bytes {
-            let index = Int(byte) % chars.count
-            result.append(chars[chars.index(chars.startIndex, offsetBy: index)])
-        }
+
         return result
     }
 

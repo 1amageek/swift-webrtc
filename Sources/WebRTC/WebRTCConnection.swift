@@ -64,11 +64,15 @@ public final class WebRTCConnection: Sendable {
     private let logger: Logger
 
     private struct ConnState: Sendable {
-        var state: WebRTCConnectionState = .new
+        var stateMachine: ConnectionStateMachine = ConnectionStateMachine()
         var iceAgent: ICELiteAgent
         var sctpAssociation: SCTPAssociation
         var channelManager: DataChannelManager
         var isClient: Bool
+
+        var state: WebRTCConnectionState {
+            stateMachine.state
+        }
     }
 
     private struct ChannelState: Sendable {
@@ -155,13 +159,12 @@ public final class WebRTCConnection: Sendable {
     /// Start the connection process (client-side: initiates DTLS handshake)
     public func start() throws {
         let isClient = connState.withLock { state -> Bool in
-            state.state = .connecting
+            state.stateMachine.process(.dtlsHandshakeStarted)
             return state.isClient
         }
 
         if isClient {
             let datagrams = try dtlsConnection.startHandshake(isClient: true)
-            connState.withLock { $0.state = .dtlsHandshaking }
             for datagram in datagrams {
                 sendHandler(datagram)
             }
@@ -176,7 +179,17 @@ public final class WebRTCConnection: Sendable {
     /// - STUN: detected via `STUNMessage.isSTUN()` (RFC 5389)
     /// - DTLS (first byte 20-63): content type range for DTLS records
     /// - Other: logged and ignored
+    ///
+    /// - Throws: `WebRTCError.closed` if the connection has been closed
     public func receive(_ data: Data, remoteAddress: Data = Data()) throws {
+        // P2.4: Check for closed/failed state before processing
+        let isClosed = connState.withLock { state in
+            state.stateMachine.isTerminal
+        }
+        if isClosed {
+            throw WebRTCError.closed
+        }
+
         guard !data.isEmpty else { return }
 
         let firstByte = data[data.startIndex]
@@ -191,6 +204,14 @@ public final class WebRTCConnection: Sendable {
         // for DTLS content types 20-63 as well.
 
         if firstByte >= 20 && firstByte <= 63 {
+            // P1.5: Validate ICE state before DTLS processing
+            let shouldProcess = connState.withLock { state in
+                state.stateMachine.shouldProcessDTLS()
+            }
+            if !shouldProcess {
+                logger.debug("Ignoring DTLS packet: ICE not connected")
+                return
+            }
             try processDTLS(data, remoteAddress: remoteAddress)
             return
         }
@@ -251,8 +272,9 @@ public final class WebRTCConnection: Sendable {
     /// Close the connection
     public func close() {
         connState.withLock { state in
-            state.state = .closed
+            state.stateMachine.process(.userClose)
             state.iceAgent.close()
+            state.channelManager.shutdown()
         }
         channelState.withLock { state in
             state.incomingContinuation?.finish()
@@ -273,10 +295,11 @@ public final class WebRTCConnection: Sendable {
                 sourcePort: 0
             )
 
-            // Check if ICE just became connected while still holding the lock
-            if state.iceAgent.state == .connected && state.state == .connecting {
-                state.state = .dtlsHandshaking
-                logger.debug("ICE connectivity check succeeded")
+            // Update state machine based on ICE state
+            if state.iceAgent.state == .connected {
+                state.stateMachine.process(.iceConnected)
+            } else if state.iceAgent.state == .failed {
+                state.stateMachine.process(.iceFailed)
             }
 
             return stunResponse
@@ -288,7 +311,16 @@ public final class WebRTCConnection: Sendable {
     }
 
     private func processDTLS(_ data: Data, remoteAddress: Data) throws {
-        let output = try dtlsConnection.processReceivedDatagram(data, remoteAddress: remoteAddress)
+        let output: DTLSConnectionOutput
+        do {
+            output = try dtlsConnection.processReceivedDatagram(data, remoteAddress: remoteAddress)
+        } catch {
+            // P2.2: Propagate DTLS errors to state machine
+            connState.withLock { state in
+                _ = state.stateMachine.process(.dtlsHandshakeFailed(error.localizedDescription))
+            }
+            throw WebRTCError.dtlsHandshakeFailed(error.localizedDescription)
+        }
 
         // Send response datagrams
         for datagram in output.datagramsToSend {
@@ -310,23 +342,31 @@ public final class WebRTCConnection: Sendable {
         // Verify remote fingerprint if expected
         if let expected = expectedFingerprint {
             guard let actual = dtlsConnection.remoteFingerprint else {
-                connState.withLock { $0.state = .failed("No remote certificate after handshake") }
+                connState.withLock { state in
+                    _ = state.stateMachine.process(.dtlsHandshakeFailed("No remote certificate after handshake"))
+                }
                 throw WebRTCError.dtlsHandshakeFailed("No remote certificate")
             }
             guard actual == expected else {
-                connState.withLock { $0.state = .failed("Fingerprint mismatch") }
-                throw WebRTCError.dtlsHandshakeFailed(
-                    "Remote fingerprint mismatch: expected \(expected.sdpFormat), got \(actual.sdpFormat)"
-                )
+                let reason = "Remote fingerprint mismatch: expected \(expected.sdpFormat), got \(actual.sdpFormat)"
+                connState.withLock { state in
+                    _ = state.stateMachine.process(.dtlsHandshakeFailed(reason))
+                }
+                throw WebRTCError.dtlsHandshakeFailed(reason)
             }
         }
 
-        connState.withLock { $0.state = .sctpConnecting }
+        connState.withLock { state in
+            _ = state.stateMachine.process(.dtlsHandshakeComplete)
+        }
         logger.info("DTLS handshake complete, establishing SCTP")
 
         // Initiate SCTP association (client side)
         let isClient = connState.withLock { $0.isClient }
         if isClient {
+            connState.withLock { state in
+                _ = state.stateMachine.process(.sctpAssociating)
+            }
             let initPacket = connState.withLock { $0.sctpAssociation.generateInit() }
             try encryptAndSend(initPacket.encode())
         }
@@ -334,25 +374,44 @@ public final class WebRTCConnection: Sendable {
 
     private func processSCTP(_ plaintext: Data) throws {
         // Parse SCTP packet (already decrypted)
-        let packet = try SCTPPacket.decode(from: plaintext)
-        let (responses, receivedData) = try connState.withLock { state in
-            try state.sctpAssociation.processPacket(packet)
+        let packet: SCTPPacket
+        do {
+            packet = try SCTPPacket.decode(from: plaintext)
+        } catch {
+            // P2.2: Propagate SCTP decode errors
+            connState.withLock { state in
+                _ = state.stateMachine.process(.sctpFailed(error.localizedDescription))
+            }
+            throw WebRTCError.sctpFailed(error.localizedDescription)
+        }
+
+        let responses: [SCTPPacket]
+        let receivedData: [(streamID: UInt16, ppid: UInt32, data: Data)]
+        do {
+            let result = try connState.withLock { state in
+                try state.sctpAssociation.processPacket(packet)
+            }
+            responses = result.responses
+            receivedData = result.receivedData
+        } catch {
+            // P2.2: Propagate SCTP processing errors
+            connState.withLock { state in
+                _ = state.stateMachine.process(.sctpFailed(error.localizedDescription))
+            }
+            throw WebRTCError.sctpFailed(error.localizedDescription)
         }
 
         // Check if SCTP became established
-        let previousState = connState.withLock { state -> WebRTCConnectionState in
+        let didBecomeConnected = connState.withLock { state -> Bool in
             let sctpState = state.sctpAssociation.state
-            let prev = state.state
-            if sctpState == .established && prev == .sctpConnecting {
-                state.state = .connected
+            if sctpState == .established && !state.stateMachine.isSCTPEstablished {
+                state.stateMachine.process(.sctpEstablished)
+                return true
             }
-            return prev
+            return false
         }
-        if previousState == .sctpConnecting {
-            let currentState = connState.withLock { $0.state }
-            if currentState == .connected {
-                logger.info("WebRTC connection established")
-            }
+        if didBecomeConnected {
+            logger.info("WebRTC connection established")
         }
 
         // Send SCTP responses

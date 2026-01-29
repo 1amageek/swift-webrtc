@@ -69,7 +69,10 @@ public struct SCTPPacket: Sendable {
     }
 
     /// Decode an SCTP packet
-    public static func decode(from data: Data) throws -> SCTPPacket {
+    /// - Parameter data: Raw packet data
+    /// - Parameter validateChecksum: Whether to validate CRC-32C checksum (default: true)
+    /// - Throws: SCTPError if packet is malformed or checksum is invalid
+    public static func decode(from data: Data, validateChecksum: Bool = true) throws -> SCTPPacket {
         guard data.count >= 12 else {
             throw SCTPError.insufficientData(expected: 12, actual: data.count)
         }
@@ -77,6 +80,27 @@ public struct SCTPPacket: Sendable {
         let sourcePort = UInt16(data[0]) << 8 | UInt16(data[1])
         let destinationPort = UInt16(data[2]) << 8 | UInt16(data[3])
         let verificationTag = UInt32(data[4]) << 24 | UInt32(data[5]) << 16 | UInt32(data[6]) << 8 | UInt32(data[7])
+
+        // Validate CRC-32C checksum
+        if validateChecksum {
+            // Extract received checksum (bytes 8-11, little-endian)
+            let receivedChecksum = UInt32(data[8]) |
+                                   UInt32(data[9]) << 8 |
+                                   UInt32(data[10]) << 16 |
+                                   UInt32(data[11]) << 24
+
+            // Compute checksum with checksum field zeroed
+            var checksumData = Data(data)
+            checksumData[8] = 0
+            checksumData[9] = 0
+            checksumData[10] = 0
+            checksumData[11] = 0
+            let computedChecksum = crc32c(checksumData)
+
+            guard receivedChecksum == computedChecksum else {
+                throw SCTPError.checksumMismatch(expected: computedChecksum, actual: receivedChecksum)
+            }
+        }
 
         // Parse chunks
         var offset = 12
@@ -130,4 +154,8 @@ public enum SCTPError: Error, Sendable {
     case associationFailed(String)
     case streamReset(String)
     case timeout
+    case checksumMismatch(expected: UInt32, actual: UInt32)
+    case cookieValidationFailed
+    case cookieExpired
+    case maxRetransmitsExceeded
 }

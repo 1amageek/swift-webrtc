@@ -6,6 +6,16 @@
 import Foundation
 import Crypto
 
+/// Result of MESSAGE-INTEGRITY verification
+public enum IntegrityResult: Sendable, Equatable {
+    /// MESSAGE-INTEGRITY attribute present and valid
+    case valid
+    /// MESSAGE-INTEGRITY attribute present but invalid
+    case invalid
+    /// MESSAGE-INTEGRITY attribute not present
+    case missing
+}
+
 /// MESSAGE-INTEGRITY computation and verification
 public enum MessageIntegrity: Sendable {
 
@@ -20,13 +30,13 @@ public enum MessageIntegrity: Sendable {
         return Data(mac)
     }
 
-    /// Verify MESSAGE-INTEGRITY in a STUN message
+    /// Verify MESSAGE-INTEGRITY in a STUN message (tri-state result)
     /// - Parameters:
     ///   - message: The complete STUN message bytes
     ///   - key: The HMAC key
-    /// - Returns: True if integrity check passes
-    public static func verify(message: Data, key: Data) -> Bool {
-        guard message.count >= stunHeaderSize else { return false }
+    /// - Returns: IntegrityResult indicating valid, invalid, or missing
+    public static func verifyWithResult(message: Data, key: Data) -> IntegrityResult {
+        guard message.count >= stunHeaderSize else { return .missing }
 
         // Find MESSAGE-INTEGRITY attribute
         var offset = stunHeaderSize
@@ -38,7 +48,7 @@ public enum MessageIntegrity: Sendable {
             let attrLength = Int(UInt16(message[offset + 2]) << 8 | UInt16(message[offset + 3]))
 
             if attrType == STUNAttributeType.messageIntegrity.rawValue {
-                guard attrLength == 20 else { return false }
+                guard attrLength == 20 else { return .invalid }
 
                 let receivedMAC = Data(message[offset + stunAttributeHeaderSize..<offset + stunAttributeHeaderSize + 20])
 
@@ -50,12 +60,22 @@ public enum MessageIntegrity: Sendable {
                 adjustedMsg[3] = UInt8(adjustedLength & 0xFF)
 
                 let computed = compute(data: adjustedMsg, key: key)
-                return computed == receivedMAC
+                return computed == receivedMAC ? .valid : .invalid
             }
 
             offset += stunAttributeHeaderSize + ((attrLength + 3) & ~3)
         }
 
-        return false // No MESSAGE-INTEGRITY found
+        return .missing
+    }
+
+    /// Verify MESSAGE-INTEGRITY in a STUN message (legacy boolean API)
+    /// - Parameters:
+    ///   - message: The complete STUN message bytes
+    ///   - key: The HMAC key
+    /// - Returns: True if integrity check passes (valid or missing returns false)
+    @available(*, deprecated, message: "Use verifyWithResult instead for proper error handling")
+    public static func verify(message: Data, key: Data) -> Bool {
+        verifyWithResult(message: message, key: key) == .valid
     }
 }
