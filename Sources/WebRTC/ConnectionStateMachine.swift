@@ -215,16 +215,20 @@ public struct ConnectionStateMachine: Sendable {
 extension ConnectionStateMachine {
     /// Check if DTLS processing should be allowed
     ///
-    /// DTLS should only be processed after ICE connectivity is established
-    /// or during the handshake phase.
+    /// DTLS packets must be processed during the handshake and after it
+    /// completes (for encrypted application data like SCTP).
+    ///
+    /// WebRTC Direct skips ICE, so we cannot gate on ICE state alone.
     public func shouldProcessDTLS() -> Bool {
         // Don't process in terminal states
         guard !isTerminal else { return false }
 
-        // Allow DTLS processing if we're in DTLS handshake phase
-        // (this covers cases where DTLS starts before ICE completes)
-        if protocolStates.dtls == .handshaking {
+        // Allow DTLS processing if DTLS is active (handshaking or established)
+        switch protocolStates.dtls {
+        case .handshaking, .connected:
             return true
+        default:
+            break
         }
 
         // Allow DTLS processing if ICE is connected/completed

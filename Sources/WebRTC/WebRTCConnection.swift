@@ -210,11 +210,11 @@ public final class WebRTCConnection: Sendable {
 
         if firstByte >= 20 && firstByte <= 63 {
             // P1.5: Validate ICE state before DTLS processing
-            let shouldProcess = connState.withLock { state in
-                state.stateMachine.shouldProcessDTLS()
+            let (shouldProcess, currentState) = connState.withLock { state in
+                (state.stateMachine.shouldProcessDTLS(), state.stateMachine.state)
             }
             if !shouldProcess {
-                logger.debug("Ignoring DTLS packet: ICE not connected")
+                logger.warning("Ignoring DTLS packet (\(data.count)B): state=\(currentState)")
                 return
             }
             try processDTLS(data, remoteAddress: remoteAddress)

@@ -82,6 +82,16 @@ public final class WebRTCListener: Sendable {
             logger: logger
         )
 
+        // Initialize the server-side DTLS handshake state machine.
+        // This transitions to .dtlsHandshaking so incoming ClientHello
+        // packets pass the shouldProcessDTLS() gate.
+        do {
+            try connection.start()
+        } catch {
+            logger.error("Failed to start server connection: \(error)")
+            return nil
+        }
+
         let continuation = listenerState.withLock { state -> AsyncStream<WebRTCConnection>.Continuation? in
             state.activeConnections[peerID] = connection
             return state.continuation
