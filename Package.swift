@@ -36,7 +36,7 @@ let package = Package(
         packageDependency(
             localPath: localSwiftTLSPackage,
             remoteURL: "https://github.com/1amageek/swift-tls.git",
-            from: "1.0.0"
+            from: "1.1.0"
         ),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
