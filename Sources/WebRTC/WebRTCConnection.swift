@@ -51,6 +51,12 @@ public final class WebRTCConnection: Sendable {
     public var incomingChannels: AsyncStream<DataChannel> {
         channelState.withLock { state in
             if let existing = state.incomingStream { return existing }
+            if state.isClosed {
+                let (stream, continuation) = AsyncStream<DataChannel>.makeStream()
+                continuation.finish()
+                state.incomingStream = stream
+                return stream
+            }
             let (stream, continuation) = AsyncStream<DataChannel>.makeStream()
             state.incomingStream = stream
             state.incomingContinuation = continuation
@@ -83,6 +89,7 @@ public final class WebRTCConnection: Sendable {
     private struct ChannelState: Sendable {
         var incomingStream: AsyncStream<DataChannel>?
         var incomingContinuation: AsyncStream<DataChannel>.Continuation?
+        var isClosed: Bool = false
     }
 
     // MARK: - Init
@@ -282,9 +289,9 @@ public final class WebRTCConnection: Sendable {
             state.channelManager.shutdown()
         }
         channelState.withLock { state in
+            state.isClosed = true
             state.incomingContinuation?.finish()
             state.incomingContinuation = nil
-            state.incomingStream = nil
         }
         dataHandlerState.withLock { $0 = nil }
     }
@@ -292,12 +299,14 @@ public final class WebRTCConnection: Sendable {
     // MARK: - Private protocol processing
 
     private func processSTUN(_ data: Data, remoteAddress: Data) throws {
+        let endpoint = Self.decodeRemoteEndpoint(remoteAddress)
+
         // Single lock for ICE processing + state transition (fixes race condition)
         let response = connState.withLock { state -> Data? in
             let stunResponse = state.iceAgent.processSTUN(
                 data: data,
-                sourceAddress: remoteAddress,
-                sourcePort: 0
+                sourceAddress: endpoint.address,
+                sourcePort: endpoint.port
             )
 
             // Update state machine based on ICE state
@@ -312,6 +321,25 @@ public final class WebRTCConnection: Sendable {
 
         if let response {
             sendHandler(response)
+        }
+    }
+
+    static func decodeRemoteEndpoint(_ remoteAddress: Data) -> (address: Data, port: UInt16) {
+        switch remoteAddress.count {
+        case 6:
+            let address = Data(remoteAddress.prefix(4))
+            let portBytes = remoteAddress.suffix(2)
+            let port = UInt16(portBytes[portBytes.startIndex]) << 8 |
+                UInt16(portBytes[portBytes.index(after: portBytes.startIndex)])
+            return (address, port)
+        case 18:
+            let address = Data(remoteAddress.prefix(16))
+            let portBytes = remoteAddress.suffix(2)
+            let port = UInt16(portBytes[portBytes.startIndex]) << 8 |
+                UInt16(portBytes[portBytes.index(after: portBytes.startIndex)])
+            return (address, port)
+        default:
+            return (remoteAddress, 0)
         }
     }
 

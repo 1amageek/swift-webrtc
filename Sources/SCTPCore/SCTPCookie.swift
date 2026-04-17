@@ -14,7 +14,7 @@ public struct SCTPCookie: Sendable, Equatable {
     /// Cookie expiration time (default: 60 seconds)
     public static let defaultMaxAge: TimeInterval = 60.0
 
-    /// Timestamp when cookie was created (milliseconds since reference date)
+    /// Timestamp when cookie was created (milliseconds since system boot uptime)
     public let timestamp: UInt64
 
     /// Peer's initiate tag (from INIT)
@@ -81,7 +81,7 @@ public struct SCTPCookie: Sendable, Equatable {
         outboundStreams: UInt16,
         inboundStreams: UInt16
     ) -> SCTPCookie {
-        let timestamp = UInt64(Date().timeIntervalSinceReferenceDate * 1000)
+        let timestamp = currentTimestampMilliseconds()
 
         let dataToSign = buildSignableData(
             timestamp: timestamp,
@@ -114,7 +114,10 @@ public struct SCTPCookie: Sendable, Equatable {
     /// - Returns: True if cookie is valid and not expired
     public func validate(secretKey: Data, maxAge: TimeInterval = defaultMaxAge) -> Bool {
         // Check expiration
-        let now = UInt64(Date().timeIntervalSinceReferenceDate * 1000)
+        let now = Self.currentTimestampMilliseconds()
+        guard now >= timestamp else {
+            return false
+        }
         let age = Double(now - timestamp) / 1000.0
         guard age >= 0 && age <= maxAge else {
             return false
@@ -131,8 +134,12 @@ public struct SCTPCookie: Sendable, Equatable {
             inboundStreams: inboundStreams
         )
 
-        let expectedHMAC = Self.computeHMAC(data: dataToSign, key: secretKey)
-        return hmac == expectedHMAC
+        let symmetricKey = SymmetricKey(data: secretKey)
+        return HMAC<SHA256>.isValidAuthenticationCode(
+            hmac,
+            authenticating: dataToSign,
+            using: symmetricKey
+        )
     }
 
     /// Encode the cookie to wire format
@@ -236,6 +243,10 @@ public struct SCTPCookie: Sendable, Equatable {
         let symmetricKey = SymmetricKey(data: key)
         let mac = HMAC<SHA256>.authenticationCode(for: data, using: symmetricKey)
         return Data(mac)
+    }
+
+    private static func currentTimestampMilliseconds() -> UInt64 {
+        UInt64(ProcessInfo.processInfo.systemUptime * 1000)
     }
 }
 

@@ -102,4 +102,54 @@ struct SCTPPacketTests {
         #expect(!initPacket.chunks.isEmpty)
         #expect(assoc.state == .cookieWait)
     }
+
+    @Test("SCTP cookie validates and rejects tampering")
+    func sctpCookieValidation() throws {
+        let secretKey = Data("01234567890123456789012345678901".utf8)
+        let cookie = SCTPCookie.generate(
+            secretKey: secretKey,
+            peerTag: 0x12345678,
+            localTag: 0x9ABCDEF0,
+            peerInitialTSN: 42,
+            peerARWC: 65535,
+            outboundStreams: 8,
+            inboundStreams: 8
+        )
+
+        #expect(cookie.validate(secretKey: secretKey))
+
+        var encoded = cookie.encode()
+        encoded[encoded.startIndex] ^= 0xFF
+        let tampered = try SCTPCookie.decode(from: encoded)
+        #expect(!tampered.validate(secretKey: secretKey))
+    }
+
+    @Test("SCTP cookie rejects future timestamp")
+    func sctpCookieRejectsFutureTimestamp() throws {
+        let secretKey = Data("01234567890123456789012345678901".utf8)
+        let cookie = SCTPCookie.generate(
+            secretKey: secretKey,
+            peerTag: 0x12345678,
+            localTag: 0x9ABCDEF0,
+            peerInitialTSN: 42,
+            peerARWC: 65535,
+            outboundStreams: 8,
+            inboundStreams: 8
+        )
+
+        var encoded = cookie.encode()
+        let futureTimestamp = cookie.timestamp + 60_000
+
+        encoded[0] = UInt8((futureTimestamp >> 56) & 0xFF)
+        encoded[1] = UInt8((futureTimestamp >> 48) & 0xFF)
+        encoded[2] = UInt8((futureTimestamp >> 40) & 0xFF)
+        encoded[3] = UInt8((futureTimestamp >> 32) & 0xFF)
+        encoded[4] = UInt8((futureTimestamp >> 24) & 0xFF)
+        encoded[5] = UInt8((futureTimestamp >> 16) & 0xFF)
+        encoded[6] = UInt8((futureTimestamp >> 8) & 0xFF)
+        encoded[7] = UInt8(futureTimestamp & 0xFF)
+
+        let futureCookie = try SCTPCookie.decode(from: encoded)
+        #expect(!futureCookie.validate(secretKey: secretKey))
+    }
 }

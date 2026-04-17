@@ -93,22 +93,34 @@ struct WebRTCConnectionDemultiplexTests {
         #expect(messages.isEmpty)
     }
 
-    @Test("receive forwards remoteAddress parameter")
-    func remoteAddressParameterForwarded() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
-        let connection = WebRTCConnection.asServer(
-            certificate: cert,
-            sendHandler: { _ in }
+    @Test("remote endpoint decoding extracts IPv4 port")
+    func decodeIPv4RemoteEndpoint() {
+        let endpoint = WebRTCConnection.decodeRemoteEndpoint(
+            Data([192, 168, 1, 1, 0x13, 0x88])
         )
 
-        try connection.start()
+        #expect(endpoint.address == Data([192, 168, 1, 1]))
+        #expect(endpoint.port == 5000)
+    }
 
-        // remoteAddress is forwarded to processSTUN/processDTLS.
-        // For unknown bytes, it's simply ignored. This test verifies
-        // the API accepts the parameter without error.
-        let remoteAddr = Data([192, 168, 1, 1, 0x1F, 0x90]) // ip + port
-        try connection.receive(Data([0x80, 0x01]), remoteAddress: remoteAddr)
-        // No crash, no error — parameter accepted
+    @Test("remote endpoint decoding extracts IPv6 port")
+    func decodeIPv6RemoteEndpoint() {
+        let endpoint = WebRTCConnection.decodeRemoteEndpoint(
+            Data(Array(repeating: 0x20, count: 16) + [0x13, 0x88])
+        )
+
+        #expect(endpoint.address == Data(Array(repeating: 0x20, count: 16)))
+        #expect(endpoint.port == 5000)
+    }
+
+    @Test("remote endpoint decoding falls back to raw address")
+    func decodeRemoteEndpointWithoutPort() {
+        let endpoint = WebRTCConnection.decodeRemoteEndpoint(
+            Data([192, 168, 1, 1])
+        )
+
+        #expect(endpoint.address == Data([192, 168, 1, 1]))
+        #expect(endpoint.port == 0)
     }
 }
 
@@ -156,5 +168,24 @@ struct WebRTCConnectionDataHandlerTests {
         // No way to externally trigger data delivery after close, which is correct.
         let called = handlerCalled.withLock { $0 }
         #expect(!called)
+    }
+
+    @Test("incomingChannels after close returns a terminated stream")
+    func incomingChannelsAfterCloseTerminates() async throws {
+        let cert = try DTLSCertificate.generateSelfSigned()
+        let connection = WebRTCConnection.asServer(
+            certificate: cert,
+            sendHandler: { _ in }
+        )
+
+        connection.close()
+
+        let channels = connection.incomingChannels
+        var receivedCount = 0
+        for await _ in channels {
+            receivedCount += 1
+        }
+
+        #expect(receivedCount == 0)
     }
 }
