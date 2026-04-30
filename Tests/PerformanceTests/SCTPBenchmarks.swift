@@ -245,8 +245,7 @@ struct SCTPBenchmarks {
 
     @Test("Benchmark: Cookie generation")
     func benchmarkCookieGenerate() {
-        var secretKey = Data(count: 32)
-        _ = secretKey.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let secretKey = SCTPSecureRandom.data(count: 32)
 
         let result = benchmark("SCTPCookie.generate", iterations: 10000) {
             _ = SCTPCookie.generate(
@@ -264,8 +263,7 @@ struct SCTPBenchmarks {
 
     @Test("Benchmark: Cookie validation")
     func benchmarkCookieValidate() {
-        var secretKey = Data(count: 32)
-        _ = secretKey.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let secretKey = SCTPSecureRandom.data(count: 32)
 
         let cookie = SCTPCookie.generate(
             secretKey: secretKey,

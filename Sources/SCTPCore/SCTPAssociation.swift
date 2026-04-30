@@ -60,23 +60,9 @@ public final class SCTPAssociation: Sendable {
         localPort: UInt16 = 5000,
         remotePort: UInt16 = 5000
     ) {
-        // Generate random verification tag
-        var tag: UInt32 = 0
-        withUnsafeMutableBytes(of: &tag) { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 4, ptr.baseAddress!)
-        }
-
-        // Generate random initial TSN (P0.2)
-        var initialTSN: UInt32 = 0
-        withUnsafeMutableBytes(of: &initialTSN) { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 4, ptr.baseAddress!)
-        }
-
-        // Generate cookie secret key
-        var secretKey = Data(count: 32)
-        secretKey.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
+        let tag = SCTPSecureRandom.uint32()
+        let initialTSN = SCTPSecureRandom.uint32()
+        let secretKey = SCTPSecureRandom.data(count: 32)
         self.cookieSecretKey = secretKey
 
         self.assocState = Mutex(AssocState(

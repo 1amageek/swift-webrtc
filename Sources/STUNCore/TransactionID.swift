@@ -16,11 +16,7 @@ public struct TransactionID: Sendable, Hashable, Equatable {
 
     /// Generate a random transaction ID
     public static func random() -> TransactionID {
-        var bytes = Data(count: 12)
-        bytes.withUnsafeMutableBytes { ptr in
-            let _ = SecRandomCopyBytes(kSecRandomDefault, 12, ptr.baseAddress!)
-        }
-        return TransactionID(bytes: bytes)
+        TransactionID(bytes: SecureRandom.data(count: 12))
     }
 }
 

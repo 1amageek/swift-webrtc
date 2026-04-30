@@ -148,7 +148,7 @@ struct WebRTCListenerTests {
 
         let conn = listener.acceptConnection(peerID: "127.0.0.1:5000", sendHandler: { _ in })
         #expect(conn != nil)
-        #expect(conn?.state == .new)
+        #expect(conn?.state == .dtlsHandshaking)
     }
 
     @Test("Listener returns existing connection for same peer")

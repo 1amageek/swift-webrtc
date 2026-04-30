@@ -3,6 +3,7 @@
 /// Local and remote ICE username fragments and passwords.
 
 import Foundation
+import STUNCore
 
 /// ICE credential pair for connectivity checks
 public struct ICECredentials: Sendable, Equatable {
@@ -48,10 +49,7 @@ public struct ICECredentials: Sendable, Equatable {
         result.reserveCapacity(length)
 
         while result.count < length {
-            var byte: UInt8 = 0
-            withUnsafeMutableBytes(of: &byte) { ptr in
-                _ = SecRandomCopyBytes(kSecRandomDefault, 1, ptr.baseAddress!)
-            }
+            let byte = SecureRandom.byte()
 
             // Rejection sampling: discard biased values
             if byte < threshold {
