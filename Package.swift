@@ -1,23 +1,5 @@
 // swift-tools-version: 6.2
 import PackageDescription
-import Foundation
-
-private let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-private let localSwiftTLSPackage = packageDirectory
-    .appendingPathComponent("../swift-tls")
-    .standardizedFileURL
-
-private func packageDependency(
-    localPath: URL,
-    remoteURL: String,
-    from version: Version
-) -> Package.Dependency {
-    let manifestPath = localPath.appendingPathComponent("Package.swift").path
-    if FileManager.default.fileExists(atPath: manifestPath) {
-        return .package(path: localPath.path)
-    }
-    return .package(url: remoteURL, from: version)
-}
 
 let package = Package(
     name: "swift-webrtc",
@@ -33,11 +15,7 @@ let package = Package(
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
-        packageDependency(
-            localPath: localSwiftTLSPackage,
-            remoteURL: "https://github.com/1amageek/swift-tls.git",
-            from: "1.1.0"
-        ),
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.1.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
     ],
