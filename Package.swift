@@ -4,8 +4,8 @@ import PackageDescription
 let package = Package(
     name: "swift-webrtc",
     platforms: [
-        .macOS(.v15), .iOS(.v18), .tvOS(.v18),
-        .watchOS(.v11), .visionOS(.v2),
+        .macOS(.v26), .iOS(.v26), .tvOS(.v26),
+        .watchOS(.v26), .visionOS(.v26),
     ],
     products: [
         .library(name: "WebRTC", targets: ["WebRTC"]),
@@ -15,7 +15,7 @@ let package = Package(
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.1.1"),
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.2.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
     ],
