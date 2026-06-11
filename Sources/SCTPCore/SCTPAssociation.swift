@@ -60,7 +60,8 @@ public final class SCTPAssociation: Sendable {
         localPort: UInt16 = 5000,
         remotePort: UInt16 = 5000
     ) {
-        let tag = SCTPSecureRandom.uint32()
+        // RFC 4960 §3.3.2: the initiate tag must not be 0
+        let tag = SCTPSecureRandom.uint32NonZero()
         let initialTSN = SCTPSecureRandom.uint32()
         let secretKey = SCTPSecureRandom.data(count: 32)
         self.cookieSecretKey = secretKey
@@ -102,13 +103,28 @@ public final class SCTPAssociation: Sendable {
 
     /// Process incoming SCTP packet
     /// - Returns: Response packets to send, and any received data
+    /// - Throws: `SCTPError.verificationTagMismatch` for spoofed/stale packets,
+    ///   `SCTPError.associationAborted` when the peer aborts the association,
+    ///   decode and buffer-limit errors from chunk processing
     public func processPacket(_ packet: SCTPPacket) throws -> (responses: [SCTPPacket], receivedData: [(streamID: UInt16, ppid: UInt32, data: Data)]) {
+        try validateVerificationTag(packet)
+
         var responses: [SCTPPacket] = []
         var receivedData: [(streamID: UInt16, ppid: UInt32, data: Data)] = []
+        var receivedDataChunk = false
 
-        for chunk in packet.chunks {
+        chunkLoop: for chunk in packet.chunks {
             guard let chunkType = SCTPChunkType(rawValue: chunk.chunkType) else {
-                continue
+                // RFC 4960 §3.2: the upper two bits of an unrecognized chunk
+                // type select the action.
+                switch chunk.chunkType >> 6 {
+                case 0b00, 0b01:
+                    // 00/01: stop processing the rest of this packet
+                    break chunkLoop
+                default:
+                    // 10/11: skip this chunk, continue processing
+                    continue
+                }
             }
 
             switch chunkType {
@@ -120,7 +136,7 @@ public final class SCTPAssociation: Sendable {
             case .initAck:
                 try handleInitAck(chunk)
                 // Send COOKIE-ECHO
-                let cookieEcho = generateCookieEcho()
+                let cookieEcho = try generateCookieEcho()
                 responses.append(cookieEcho)
 
             case .cookieEcho:
@@ -132,26 +148,22 @@ public final class SCTPAssociation: Sendable {
 
             case .data:
                 let dataChunk = try SCTPDataChunk.decode(from: chunk.value, flags: chunk.flags)
+                // Duplicates must also trigger a SACK (with duplicate report)
+                receivedDataChunk = true
 
-                // Track TSN
-                let isNew = assocState.withLock { s -> Bool in
-                    s.tsnTracker?.receive(tsn: dataChunk.tsn) ?? true
+                let assembled = try assocState.withLock { s -> [AssembledMessage] in
+                    guard var tracker = s.tsnTracker else {
+                        throw SCTPError.invalidState("DATA chunk received before TSN tracking was initialized")
+                    }
+                    let isNew = tracker.receive(tsn: dataChunk.tsn)
+                    s.tsnTracker = tracker
+                    guard isNew else { return [] }
+                    return try s.fragmentAssembler.process(chunk: dataChunk)
                 }
 
-                if isNew {
-                    // Process through fragment assembler
-                    let assembled = assocState.withLock { s in
-                        s.fragmentAssembler.process(chunk: dataChunk)
-                    }
-
-                    for msg in assembled {
-                        receivedData.append((msg.streamID, msg.ppid, msg.data))
-                    }
+                for msg in assembled {
+                    receivedData.append((msg.streamID, msg.ppid, msg.data))
                 }
-
-                // Generate SACK
-                let sack = generateSack()
-                responses.append(sack)
 
             case .sack:
                 let sackChunk = try SCTPSackChunk.decode(from: chunk.value)
@@ -173,12 +185,69 @@ public final class SCTPAssociation: Sendable {
                 // Heartbeat acknowledged - update RTT if needed
                 break
 
-            default:
+            case .abort:
+                // RFC 4960 §9.1: the association is destroyed immediately
+                assocState.withLock { $0.state = .closed }
+                throw SCTPError.associationAborted
+
+            case .error:
+                // Operation Error is advisory and does not change association
+                // state (RFC 4960 §3.3.10)
+                break
+
+            case .forwardTSN, .reConfig:
+                // Recognized extension chunks, not yet implemented — skip
                 break
             }
         }
 
+        // RFC 4960 §6.2: send at most one SACK per packet, after all DATA
+        // chunks in the packet have been processed
+        if receivedDataChunk {
+            guard let sack = generateSack() else {
+                throw SCTPError.invalidState("SACK requested before TSN tracking was initialized")
+            }
+            responses.append(sack)
+
+            // Garbage-collect abandoned fragment groups now that the
+            // cumulative TSN has advanced
+            assocState.withLock { s in
+                if let tracker = s.tsnTracker {
+                    s.fragmentAssembler.cleanup(currentTSN: tracker.cumulativeTSN)
+                }
+            }
+        }
+
         return (responses, receivedData)
+    }
+
+    /// Validate the packet's verification tag (RFC 4960 §8.5)
+    private func validateVerificationTag(_ packet: SCTPPacket) throws {
+        // RFC 4960 §8.5.1 (A): packets carrying INIT must use tag 0
+        let containsInit = packet.chunks.contains { $0.chunkType == SCTPChunkType.initChunk.rawValue }
+        if containsInit {
+            guard packet.verificationTag == 0 else {
+                throw SCTPError.verificationTagMismatch(expected: 0, actual: packet.verificationTag)
+            }
+            return
+        }
+
+        let (localTag, remoteTag) = assocState.withLock {
+            ($0.localVerificationTag, $0.remoteVerificationTag)
+        }
+
+        if packet.verificationTag == localTag {
+            return
+        }
+
+        // RFC 4960 §8.5.1 (B): an ABORT sent in response to an unexpected
+        // packet reflects the sender's own tag (T-bit semantics)
+        let containsAbort = packet.chunks.contains { $0.chunkType == SCTPChunkType.abort.rawValue }
+        if containsAbort && packet.verificationTag == remoteTag {
+            return
+        }
+
+        throw SCTPError.verificationTagMismatch(expected: localTag, actual: packet.verificationTag)
     }
 
     /// Send data on a stream
@@ -317,11 +386,19 @@ public final class SCTPAssociation: Sendable {
             let paramType = readUInt16(value, offset: offset)
             let paramLength = Int(readUInt16(value, offset: offset + 2))
 
+            // Parameter length includes its own 4-byte header; anything
+            // smaller is malformed and would stall the scan
+            guard paramLength >= 4 else {
+                throw SCTPError.invalidFormat("Invalid parameter length in INIT-ACK")
+            }
+
             if paramType == 7 { // State Cookie
-                guard offset + 4 + paramLength - 4 <= value.count else {
+                guard paramLength >= 4, offset + paramLength <= value.count else {
                     throw SCTPError.invalidFormat("Cookie parameter truncated")
                 }
-                cookieData = Data(value[(offset + 4)..<(offset + paramLength)])
+                // chunk.value is a slice — index relative to startIndex
+                let base = value.startIndex
+                cookieData = Data(value[(base + offset + 4)..<(base + offset + paramLength)])
                 break
             }
 
@@ -345,9 +422,12 @@ public final class SCTPAssociation: Sendable {
         }
     }
 
-    private func generateCookieEcho() -> SCTPPacket {
-        let (localPort, remotePort, remoteTag, cookie) = assocState.withLock { s in
-            (s.localPort, s.remotePort, s.remoteVerificationTag, s.receivedCookie ?? Data())
+    private func generateCookieEcho() throws -> SCTPPacket {
+        let (localPort, remotePort, remoteTag, cookie) = try assocState.withLock { s -> (UInt16, UInt16, UInt32, Data) in
+            guard let cookie = s.receivedCookie else {
+                throw SCTPError.invalidState("COOKIE-ECHO requested before INIT-ACK delivered a cookie")
+            }
+            return (s.localPort, s.remotePort, s.remoteVerificationTag, cookie)
         }
 
         let chunk = SCTPChunk(chunkType: SCTPChunkType.cookieEcho.rawValue, value: cookie)
@@ -420,16 +500,23 @@ public final class SCTPAssociation: Sendable {
         )
     }
 
-    private func generateSack() -> SCTPPacket {
-        let (localPort, remotePort, remoteTag, cumulativeTSN, gaps, dups) = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, [(UInt16, UInt16)], [UInt32]) in
+    /// Generate a SACK for the current receive state.
+    /// - Returns: nil when TSN tracking has not been initialized yet
+    ///   (no DATA can legitimately have been received)
+    private func generateSack() -> SCTPPacket? {
+        let snapshot = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, [(start: UInt16, end: UInt16)], [UInt32])? in
             guard var tracker = s.tsnTracker else {
-                return (s.localPort, s.remotePort, s.remoteVerificationTag, 0, [], [])
+                return nil
             }
             let dups = tracker.takeDuplicates()
-            let gaps = tracker.getGapBlocksCached()
+            let gaps = tracker.gapBlocks
             let cumulativeTSN = tracker.cumulativeTSN
             s.tsnTracker = tracker
             return (s.localPort, s.remotePort, s.remoteVerificationTag, cumulativeTSN, gaps, dups)
+        }
+
+        guard let (localPort, remotePort, remoteTag, cumulativeTSN, gaps, dups) = snapshot else {
+            return nil
         }
 
         let sack = SCTPSackChunk(

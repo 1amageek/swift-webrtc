@@ -203,7 +203,7 @@ public struct SCTPCookie: Sendable, Equatable {
         let inboundStreams = readUInt16(data, offset: offset)
         offset += 2
 
-        let hmac = Data(data[offset..<offset + 32])
+        let hmac = Data(data[(data.startIndex + offset)..<(data.startIndex + offset + 32)])
 
         return SCTPCookie(
             timestamp: timestamp,

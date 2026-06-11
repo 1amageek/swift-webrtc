@@ -47,6 +47,16 @@ struct DCEPMessageTests {
         #expect(decoded.channelType == .reliableUnordered)
         #expect(decoded.label == "unordered")
     }
+
+    @Test("DCEP Open with unknown channel type is rejected")
+    func dcepOpenUnknownChannelTypeThrows() {
+        var encoded = DCEPOpen(channelType: .reliable, label: "x").encode()
+        encoded[1] = 0x55 // not a defined DCEPChannelType
+
+        #expect(throws: DataChannelError.self) {
+            _ = try DCEPOpen.decode(from: encoded)
+        }
+    }
 }
 
 @Suite("DataChannelManager Tests")

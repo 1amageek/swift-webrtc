@@ -36,7 +36,8 @@ struct FragmentKey: Hashable, Sendable {
     let streamID: UInt16
     let sequenceNumber: UInt16
     let unordered: Bool
-    // For unordered messages, we use TSN of first fragment as identifier
+    // For unordered messages, the TSN of the first-arrived fragment
+    // disambiguates the group.
     let firstTSN: UInt32?
 
     init(streamID: UInt16, sequenceNumber: UInt16, unordered: Bool, firstTSN: UInt32? = nil) {
@@ -49,8 +50,12 @@ struct FragmentKey: Hashable, Sendable {
 
 /// Reassembles fragmented messages
 public struct FragmentAssembler: Sendable {
-    /// Pending fragments keyed by (streamID, sequenceNumber, unordered)
+    /// Pending fragments keyed by (streamID, sequenceNumber, unordered).
+    /// Fragment arrays are kept sorted by TSN (insertion order invariant).
     private var pendingFragments: [FragmentKey: [Fragment]]
+
+    /// O(1) lookup of unordered fragment groups by (streamID, sequenceNumber)
+    private var unorderedKeyIndex: [UInt32: FragmentKey]
 
     /// Expected sequence number per stream (for ordered delivery)
     private var expectedSequence: [UInt16: UInt16]
@@ -58,14 +63,18 @@ public struct FragmentAssembler: Sendable {
     /// Buffered complete messages waiting for in-order delivery
     private var orderedBuffer: [UInt16: [UInt16: AssembledMessage]]
 
-    /// Maximum number of pending fragments before cleanup
+    /// Hard cap on concurrent pending fragment groups
     private let maxPendingFragments: Int = 1000
+
+    /// Hard cap on buffered out-of-order messages per stream
+    private let maxBufferedMessagesPerStream: Int = 1024
 
     /// Maximum age for fragments (in terms of TSN distance)
     private let maxFragmentAge: UInt32 = 65535
 
     public init() {
         self.pendingFragments = [:]
+        self.unorderedKeyIndex = [:]
         self.expectedSequence = [:]
         self.orderedBuffer = [:]
     }
@@ -74,17 +83,12 @@ public struct FragmentAssembler: Sendable {
     /// - Parameters:
     ///   - chunk: The DATA chunk to process
     /// - Returns: Array of assembled messages ready for delivery
-    public mutating func process(chunk: SCTPDataChunk) -> [AssembledMessage] {
+    /// - Throws: `SCTPError.receiveBufferExceeded` if the peer exceeds
+    ///   reassembly or reordering buffer limits
+    public mutating func process(chunk: SCTPDataChunk) throws -> [AssembledMessage] {
         let isBeginning = chunk.flags & 0x02 != 0
         let isEnding = chunk.flags & 0x01 != 0
         let isUnordered = chunk.flags & 0x04 != 0
-
-        let fragment = Fragment(
-            tsn: chunk.tsn,
-            data: chunk.userData,
-            isBeginning: isBeginning,
-            isEnding: isEnding
-        )
 
         // Single-chunk message (both B and E flags set)
         if isBeginning && isEnding {
@@ -99,37 +103,28 @@ public struct FragmentAssembler: Sendable {
             if isUnordered {
                 return [message]
             } else {
-                return deliverOrdered(message: message)
+                return try deliverOrdered(message: message)
             }
         }
 
         // Multi-chunk message - find or create fragment group
         let key: FragmentKey
+        var indexKey: UInt32 = 0
         if isUnordered {
-            // For unordered, find existing group or create new
-            if isBeginning {
+            indexKey = Self.unorderedIndexKey(
+                streamID: chunk.streamIdentifier,
+                sequenceNumber: chunk.streamSequenceNumber
+            )
+            if let existing = unorderedKeyIndex[indexKey] {
+                key = existing
+            } else {
                 key = FragmentKey(
                     streamID: chunk.streamIdentifier,
                     sequenceNumber: chunk.streamSequenceNumber,
                     unordered: true,
                     firstTSN: chunk.tsn
                 )
-            } else {
-                // Find existing group by matching stream and sequence
-                if let existingKey = findUnorderedKey(
-                    streamID: chunk.streamIdentifier,
-                    sequenceNumber: chunk.streamSequenceNumber
-                ) {
-                    key = existingKey
-                } else {
-                    // No beginning fragment yet - create placeholder
-                    key = FragmentKey(
-                        streamID: chunk.streamIdentifier,
-                        sequenceNumber: chunk.streamSequenceNumber,
-                        unordered: true,
-                        firstTSN: chunk.tsn
-                    )
-                }
+                unorderedKeyIndex[indexKey] = key
             }
         } else {
             key = FragmentKey(
@@ -139,19 +134,38 @@ public struct FragmentAssembler: Sendable {
             )
         }
 
-        // Add fragment to group
+        // Enforce the group cap before creating a new group — a peer that
+        // opens unbounded incomplete fragment groups is violating flow control.
+        if pendingFragments[key] == nil && pendingFragments.count >= maxPendingFragments {
+            if isUnordered {
+                unorderedKeyIndex.removeValue(forKey: indexKey)
+            }
+            throw SCTPError.receiveBufferExceeded(streamID: chunk.streamIdentifier)
+        }
+
+        let fragment = Fragment(
+            tsn: chunk.tsn,
+            data: chunk.userData,
+            isBeginning: isBeginning,
+            isEnding: isEnding
+        )
+
+        // Insert at the sorted position so assembly never needs to re-sort
         var fragments = pendingFragments[key] ?? []
-        fragments.append(fragment)
+        Self.insertSorted(fragment, into: &fragments)
         pendingFragments[key] = fragments
 
         // Try to assemble
         if let assembled = tryAssemble(key: key, ppid: chunk.payloadProtocolIdentifier) {
             pendingFragments.removeValue(forKey: key)
+            if isUnordered {
+                unorderedKeyIndex.removeValue(forKey: indexKey)
+            }
 
             if isUnordered {
                 return [assembled]
             } else {
-                return deliverOrdered(message: assembled)
+                return try deliverOrdered(message: assembled)
             }
         }
 
@@ -160,10 +174,8 @@ public struct FragmentAssembler: Sendable {
 
     /// Try to assemble fragments into a complete message
     private func tryAssemble(key: FragmentKey, ppid: UInt32) -> AssembledMessage? {
-        guard let fragments = pendingFragments[key] else { return nil }
-
-        // Sort fragments by TSN
-        let sorted = fragments.sorted { TSNTracker.isLessThan($0.tsn, $1.tsn) }
+        // Fragments are maintained in TSN order by insertSorted
+        guard let sorted = pendingFragments[key] else { return nil }
 
         // Check if we have beginning
         guard let first = sorted.first, first.isBeginning else { return nil }
@@ -197,7 +209,7 @@ public struct FragmentAssembler: Sendable {
     }
 
     /// Deliver ordered message, buffering if out of order
-    private mutating func deliverOrdered(message: AssembledMessage) -> [AssembledMessage] {
+    private mutating func deliverOrdered(message: AssembledMessage) throws -> [AssembledMessage] {
         let streamID = message.streamID
         let seqNum = message.sequenceNumber
 
@@ -218,6 +230,9 @@ public struct FragmentAssembler: Sendable {
         } else if seqNum > expected || (expected > 0xF000 && seqNum < 0x1000) {
             // Out of order - buffer for later
             var streamBuffer = orderedBuffer[streamID] ?? [:]
+            guard streamBuffer.count < maxBufferedMessagesPerStream else {
+                throw SCTPError.receiveBufferExceeded(streamID: streamID)
+            }
             streamBuffer[seqNum] = message
             orderedBuffer[streamID] = streamBuffer
             return []
@@ -227,42 +242,34 @@ public struct FragmentAssembler: Sendable {
         }
     }
 
-    /// Find unordered fragment key by stream and sequence
-    private func findUnorderedKey(streamID: UInt16, sequenceNumber: UInt16) -> FragmentKey? {
-        for key in pendingFragments.keys {
-            if key.streamID == streamID &&
-               key.sequenceNumber == sequenceNumber &&
-               key.unordered {
-                return key
-            }
-        }
-        return nil
-    }
-
-    /// Clean up stale fragments
+    /// Clean up stale fragment groups by TSN age.
+    ///
+    /// Group count limits are enforced at insertion time (`process` throws),
+    /// so this only garbage-collects abandoned incomplete groups.
     /// - Parameter currentTSN: Current cumulative TSN for age calculation
     public mutating func cleanup(currentTSN: UInt32) {
-        // Remove fragment groups where all fragments are too old
-        pendingFragments = pendingFragments.filter { _, fragments in
-            guard let newest = fragments.max(by: { TSNTracker.isLessThan($0.tsn, $1.tsn) }) else {
-                return false
+        guard !pendingFragments.isEmpty else { return }
+
+        var staleKeys: [FragmentKey] = []
+        for (key, fragments) in pendingFragments {
+            // Fragments are TSN-sorted, so the newest is last
+            guard let newest = fragments.last else {
+                staleKeys.append(key)
+                continue
             }
             let age = currentTSN &- newest.tsn
-            return age < maxFragmentAge
+            if age >= maxFragmentAge {
+                staleKeys.append(key)
+            }
         }
 
-        // Limit total pending fragments
-        if pendingFragments.count > maxPendingFragments {
-            // Remove oldest groups first
-            let sortedKeys = pendingFragments.keys.sorted { a, b in
-                let aOldest = pendingFragments[a]?.min(by: { TSNTracker.isLessThan($0.tsn, $1.tsn) })?.tsn ?? 0
-                let bOldest = pendingFragments[b]?.min(by: { TSNTracker.isLessThan($0.tsn, $1.tsn) })?.tsn ?? 0
-                return TSNTracker.isLessThan(aOldest, bOldest)
-            }
-
-            let removeCount = pendingFragments.count - maxPendingFragments
-            for key in sortedKeys.prefix(removeCount) {
-                pendingFragments.removeValue(forKey: key)
+        for key in staleKeys {
+            pendingFragments.removeValue(forKey: key)
+            if key.unordered {
+                unorderedKeyIndex.removeValue(forKey: Self.unorderedIndexKey(
+                    streamID: key.streamID,
+                    sequenceNumber: key.sequenceNumber
+                ))
             }
         }
     }
@@ -277,5 +284,27 @@ public struct FragmentAssembler: Sendable {
         expectedSequence.removeValue(forKey: streamID)
         orderedBuffer.removeValue(forKey: streamID)
         pendingFragments = pendingFragments.filter { $0.key.streamID != streamID }
+        unorderedKeyIndex = unorderedKeyIndex.filter { $0.value.streamID != streamID }
+    }
+
+    // MARK: - Private helpers
+
+    private static func unorderedIndexKey(streamID: UInt16, sequenceNumber: UInt16) -> UInt32 {
+        UInt32(streamID) << 16 | UInt32(sequenceNumber)
+    }
+
+    /// Binary-insert a fragment keeping the array sorted by TSN
+    private static func insertSorted(_ fragment: Fragment, into fragments: inout [Fragment]) {
+        var low = 0
+        var high = fragments.count
+        while low < high {
+            let mid = (low + high) / 2
+            if TSNTracker.isLessThan(fragments[mid].tsn, fragment.tsn) {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        fragments.insert(fragment, at: low)
     }
 }

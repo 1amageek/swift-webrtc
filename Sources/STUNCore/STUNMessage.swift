@@ -187,54 +187,55 @@ public struct STUNMessage: Sendable {
     /// Encode with MESSAGE-INTEGRITY and FINGERPRINT
     /// - Parameter key: The HMAC-SHA1 key (ICE password)
     /// - Returns: Encoded message with integrity and fingerprint
+    ///
+    /// Builds the wire format in a single buffer: the header length field is
+    /// first written to cover MESSAGE-INTEGRITY for the HMAC input, then
+    /// patched in place to also cover FINGERPRINT for the CRC input
+    /// (RFC 5389 §15.4, §15.5).
     public func encodeWithIntegrity(key: Data) -> Data {
-        var msg = self
-        let attrDataWithoutIntegrity = encodeAttributes()
+        let attrData = encodeAttributes()
 
-        // Build header with length including MESSAGE-INTEGRITY (24 bytes)
-        let lengthWithIntegrity = UInt16(attrDataWithoutIntegrity.count + stunAttributeHeaderSize + 20)
-        var preIntegrity = Data(capacity: stunHeaderSize + attrDataWithoutIntegrity.count)
+        let integrityAttrSize = stunAttributeHeaderSize + 20 // HMAC-SHA1
+        let fingerprintAttrSize = stunAttributeHeaderSize + 4 // CRC-32
 
-        preIntegrity.append(UInt8(messageType.rawValue >> 8))
-        preIntegrity.append(UInt8(messageType.rawValue & 0xFF))
-        preIntegrity.append(UInt8(lengthWithIntegrity >> 8))
-        preIntegrity.append(UInt8(lengthWithIntegrity & 0xFF))
-        preIntegrity.append(UInt8(stunMagicCookie >> 24))
-        preIntegrity.append(UInt8((stunMagicCookie >> 16) & 0xFF))
-        preIntegrity.append(UInt8((stunMagicCookie >> 8) & 0xFF))
-        preIntegrity.append(UInt8(stunMagicCookie & 0xFF))
-        preIntegrity.append(transactionID.bytes)
-        preIntegrity.append(attrDataWithoutIntegrity)
+        var data = Data(capacity: stunHeaderSize + attrData.count + integrityAttrSize + fingerprintAttrSize)
 
-        let hmac = MessageIntegrity.compute(data: preIntegrity, key: key)
-        msg.attributes.append(STUNAttribute(
-            type: STUNAttributeType.messageIntegrity.rawValue,
-            value: hmac
-        ))
+        // Header — length covers attributes + MESSAGE-INTEGRITY
+        let lengthWithIntegrity = UInt16(attrData.count + integrityAttrSize)
+        data.append(UInt8(messageType.rawValue >> 8))
+        data.append(UInt8(messageType.rawValue & 0xFF))
+        data.append(UInt8(lengthWithIntegrity >> 8))
+        data.append(UInt8(lengthWithIntegrity & 0xFF))
+        data.append(UInt8(stunMagicCookie >> 24))
+        data.append(UInt8((stunMagicCookie >> 16) & 0xFF))
+        data.append(UInt8((stunMagicCookie >> 8) & 0xFF))
+        data.append(UInt8(stunMagicCookie & 0xFF))
+        data.append(transactionID.bytes)
+        data.append(attrData)
 
-        // Now encode with FINGERPRINT
-        let attrDataWithIntegrity = msg.encodeAttributes()
-        let lengthWithFingerprint = UInt16(attrDataWithIntegrity.count + stunAttributeHeaderSize + 4)
+        // MESSAGE-INTEGRITY over the buffer so far (value is 20 bytes,
+        // already 4-byte aligned — no padding needed)
+        let hmac = MessageIntegrity.compute(data: data, key: key)
+        data.append(UInt8(STUNAttributeType.messageIntegrity.rawValue >> 8))
+        data.append(UInt8(STUNAttributeType.messageIntegrity.rawValue & 0xFF))
+        data.append(0)
+        data.append(20)
+        data.append(hmac)
 
-        var preFingerprint = Data(capacity: stunHeaderSize + attrDataWithIntegrity.count)
-        preFingerprint.append(UInt8(messageType.rawValue >> 8))
-        preFingerprint.append(UInt8(messageType.rawValue & 0xFF))
-        preFingerprint.append(UInt8(lengthWithFingerprint >> 8))
-        preFingerprint.append(UInt8(lengthWithFingerprint & 0xFF))
-        preFingerprint.append(UInt8(stunMagicCookie >> 24))
-        preFingerprint.append(UInt8((stunMagicCookie >> 16) & 0xFF))
-        preFingerprint.append(UInt8((stunMagicCookie >> 8) & 0xFF))
-        preFingerprint.append(UInt8(stunMagicCookie & 0xFF))
-        preFingerprint.append(transactionID.bytes)
-        preFingerprint.append(attrDataWithIntegrity)
+        // Patch the length in place to also cover FINGERPRINT
+        let lengthWithFingerprint = UInt16(attrData.count + integrityAttrSize + fingerprintAttrSize)
+        data[2] = UInt8(lengthWithFingerprint >> 8)
+        data[3] = UInt8(lengthWithFingerprint & 0xFF)
 
-        let fp = STUNFingerprint.compute(data: preFingerprint)
-        msg.attributes.append(STUNAttribute(
-            type: STUNAttributeType.fingerprint.rawValue,
-            value: fp
-        ))
+        // FINGERPRINT over the buffer so far (value is 4 bytes, aligned)
+        let fp = STUNFingerprint.compute(data: data)
+        data.append(UInt8(STUNAttributeType.fingerprint.rawValue >> 8))
+        data.append(UInt8(STUNAttributeType.fingerprint.rawValue & 0xFF))
+        data.append(0)
+        data.append(4)
+        data.append(fp)
 
-        return msg.encode()
+        return data
     }
 
     private func encodeAttributes() -> Data {

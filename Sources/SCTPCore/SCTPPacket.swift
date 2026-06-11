@@ -329,4 +329,8 @@ public enum SCTPError: Error, Sendable {
     case cookieValidationFailed
     case cookieExpired
     case maxRetransmitsExceeded
+    case verificationTagMismatch(expected: UInt32, actual: UInt32)
+    case associationAborted
+    case invalidState(String)
+    case receiveBufferExceeded(streamID: UInt16)
 }

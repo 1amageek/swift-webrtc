@@ -18,15 +18,12 @@ public final class WebRTCListener: Sendable {
     /// The local certificate fingerprint
     public let localFingerprint: CertificateFingerprint
 
-    /// Stream of accepted connections
+    /// Stream of accepted connections.
+    ///
+    /// The stream is created eagerly at init, so connections accepted before
+    /// the first subscription are buffered rather than dropped.
     public var connections: AsyncStream<WebRTCConnection> {
-        listenerState.withLock { state in
-            if let existing = state.stream { return existing }
-            let (stream, continuation) = AsyncStream<WebRTCConnection>.makeStream()
-            state.stream = stream
-            state.continuation = continuation
-            return stream
-        }
+        listenerState.withLock { $0.stream }
     }
 
     // MARK: - Private state
@@ -36,7 +33,7 @@ public final class WebRTCListener: Sendable {
     private let listenerState: Mutex<ListenerState>
 
     private struct ListenerState: Sendable {
-        var stream: AsyncStream<WebRTCConnection>?
+        var stream: AsyncStream<WebRTCConnection>
         var continuation: AsyncStream<WebRTCConnection>.Continuation?
         var activeConnections: [String: WebRTCConnection] = [:]
         var isClosed: Bool = false
@@ -51,7 +48,10 @@ public final class WebRTCListener: Sendable {
         self.certificate = certificate
         self.localFingerprint = certificate.fingerprint
         self.logger = logger
-        self.listenerState = Mutex(ListenerState())
+        // Create the stream eagerly so connections accepted before the first
+        // subscription are buffered rather than dropped
+        let (stream, continuation) = AsyncStream<WebRTCConnection>.makeStream()
+        self.listenerState = Mutex(ListenerState(stream: stream, continuation: continuation))
     }
 
     // MARK: - Connection acceptance
@@ -126,7 +126,6 @@ public final class WebRTCListener: Sendable {
             state.activeConnections.removeAll()
             state.continuation?.finish()
             state.continuation = nil
-            state.stream = nil
             return conns
         }
 

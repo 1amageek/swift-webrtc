@@ -139,12 +139,12 @@ struct SCTPBenchmarks {
     // MARK: - Fragment Assembler
 
     @Test("Benchmark: Fragment assembly (single chunk)")
-    func benchmarkFragmentSingle() {
+    func benchmarkFragmentSingle() throws {
         var assembler = FragmentAssembler()
         let fragmentData = Data(repeating: 0x42, count: 1000)
 
         var tsn: UInt32 = 0
-        let result = benchmark("FragmentAssembler (single)", iterations: 10000) {
+        let result = try benchmark("FragmentAssembler (single)", iterations: 10000) {
             let c = SCTPDataChunk(
                 tsn: tsn,
                 streamIdentifier: 0,
@@ -152,20 +152,20 @@ struct SCTPBenchmarks {
                 payloadProtocolIdentifier: 51,
                 userData: fragmentData
             )
-            _ = assembler.process(chunk: c)
+            _ = try assembler.process(chunk: c)
             tsn += 1
         }
         print(result)
     }
 
     @Test("Benchmark: Fragment assembly (multi-chunk)")
-    func benchmarkFragmentMulti() {
+    func benchmarkFragmentMulti() throws {
         var assembler = FragmentAssembler()
         let fragmentData = Data(repeating: 0x42, count: 500)
 
         var tsn: UInt32 = 0
         var seq: UInt16 = 0
-        let result = benchmark("FragmentAssembler (multi)", iterations: 5000) {
+        let result = try benchmark("FragmentAssembler (multi)", iterations: 5000) {
             // 4-chunk message
             let begin = SCTPDataChunk(
                 tsn: tsn, streamIdentifier: 0, streamSequenceNumber: seq,
@@ -188,10 +188,10 @@ struct SCTPBenchmarks {
                 beginningFragment: false, endingFragment: true
             )
 
-            _ = assembler.process(chunk: begin)
-            _ = assembler.process(chunk: mid1)
-            _ = assembler.process(chunk: mid2)
-            _ = assembler.process(chunk: end)
+            _ = try assembler.process(chunk: begin)
+            _ = try assembler.process(chunk: mid1)
+            _ = try assembler.process(chunk: mid2)
+            _ = try assembler.process(chunk: end)
 
             tsn += 4
             seq += 1
@@ -200,13 +200,13 @@ struct SCTPBenchmarks {
     }
 
     @Test("Benchmark: Fragment assembly (out of order)")
-    func benchmarkFragmentOutOfOrder() {
+    func benchmarkFragmentOutOfOrder() throws {
         var assembler = FragmentAssembler()
         let fragmentData = Data(repeating: 0x42, count: 500)
 
         var tsn: UInt32 = 0
         var seq: UInt16 = 0
-        let result = benchmark("FragmentAssembler (out-of-order)", iterations: 5000) {
+        let result = try benchmark("FragmentAssembler (out-of-order)", iterations: 5000) {
             // Receive 4-chunk message out of order
             let begin = SCTPDataChunk(
                 tsn: tsn, streamIdentifier: 0, streamSequenceNumber: seq,
@@ -230,10 +230,10 @@ struct SCTPBenchmarks {
             )
 
             // Receive out of order: end, mid1, begin, mid2
-            _ = assembler.process(chunk: end)
-            _ = assembler.process(chunk: mid1)
-            _ = assembler.process(chunk: begin)
-            _ = assembler.process(chunk: mid2)
+            _ = try assembler.process(chunk: end)
+            _ = try assembler.process(chunk: mid1)
+            _ = try assembler.process(chunk: begin)
+            _ = try assembler.process(chunk: mid2)
 
             tsn += 4
             seq += 1

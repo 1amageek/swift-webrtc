@@ -21,4 +21,16 @@ enum SCTPSecureRandom {
         }
         return value
     }
+
+    /// Random UInt32 guaranteed to be non-zero.
+    ///
+    /// RFC 4960 §3.3.2: the Initiate Tag must not be 0.
+    static func uint32NonZero() -> UInt32 {
+        while true {
+            let value = uint32()
+            if value != 0 {
+                return value
+            }
+        }
+    }
 }

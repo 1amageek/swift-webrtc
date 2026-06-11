@@ -25,9 +25,6 @@ public struct TSNTracker: Sendable {
     /// Maximum gap tracking window size
     private let windowSize: UInt32 = 65535
 
-    /// Cached gap blocks (invalidated when TSNs change)
-    private var cachedGapBlocks: [(start: UInt16, end: UInt16)]?
-
     /// Initialize with the peer's initial TSN
     /// - Parameter initialTSN: The initial TSN from INIT/INIT-ACK (first expected TSN)
     public init(initialTSN: UInt32) {
@@ -36,7 +33,6 @@ public struct TSNTracker: Sendable {
         self.cumulativeTSN = initialTSN &- 1
         self.receivedAboveCumulative = []
         self.duplicates = []
-        self.cachedGapBlocks = nil
     }
 
     /// Receive a TSN
@@ -61,9 +57,6 @@ public struct TSNTracker: Sendable {
             return false
         }
 
-        // Invalidate gap blocks cache since state is changing
-        cachedGapBlocks = nil
-
         // Is this the next expected TSN?
         if tsn == cumulativeTSN &+ 1 {
             // Advance cumulative
@@ -82,25 +75,14 @@ public struct TSNTracker: Sendable {
         return true
     }
 
-    /// Get gap ack blocks for SACK (non-mutating, computes each time)
-    /// Gap blocks are offsets from cumulative TSN
-    /// Prefer using `getGapBlocksCached()` when the tracker is mutable
+    /// Get gap ack blocks for SACK.
+    /// Gap blocks are offsets from cumulative TSN.
+    ///
+    /// Computed on demand. SACKs are generated once per received packet,
+    /// and any new TSN changes the gap structure, so caching across calls
+    /// can never hit — computing directly is both simpler and faster.
     public var gapBlocks: [(start: UInt16, end: UInt16)] {
-        if let cached = cachedGapBlocks {
-            return cached
-        }
-        return computeGapBlocks()
-    }
-
-    /// Get gap ack blocks with caching (mutating)
-    /// Use this method when possible for better performance
-    public mutating func getGapBlocksCached() -> [(start: UInt16, end: UInt16)] {
-        if let cached = cachedGapBlocks {
-            return cached
-        }
-        let computed = computeGapBlocks()
-        cachedGapBlocks = computed
-        return computed
+        computeGapBlocks()
     }
 
     /// Compute gap blocks from scratch

@@ -22,12 +22,16 @@ public struct PendingChunk: Sendable {
     /// Whether this chunk has been marked for retransmission
     public var markedForRetransmit: Bool
 
+    /// Miss indications from SACK gap reports (RFC 4960 §7.2.4)
+    public var missIndications: Int
+
     public init(dataChunk: SCTPDataChunk, sentTime: ContinuousClock.Instant) {
         self.dataChunk = dataChunk
         self.firstSentTime = sentTime
         self.lastSentTime = sentTime
         self.retransmitCount = 0
         self.markedForRetransmit = false
+        self.missIndications = 0
     }
 }
 
@@ -122,15 +126,35 @@ public struct RetransmissionQueue: Sendable {
             }
         }
 
-        // Mark gap-acknowledged chunks (don't remove, but note they're received)
-        for (start, end) in gapBlocks {
-            let gapStart = cumulativeTSN &+ UInt32(start)
-            let gapEnd = cumulativeTSN &+ UInt32(end)
+        // Fast retransmit (RFC 4960 §7.2.4): chunks below the highest TSN
+        // covered by a gap block that were NOT gap-acknowledged accumulate
+        // miss indications; after 3 reports they are marked for fast
+        // retransmission.
+        if !gapBlocks.isEmpty {
+            var highestGapOffset: UInt32 = 0
+            for (start, end) in gapBlocks where start <= end {
+                if UInt32(end) > highestGapOffset {
+                    highestGapOffset = UInt32(end)
+                }
+            }
+            let highestGapAcked = cumulativeTSN &+ highestGapOffset
 
-            for tsn in pending.keys {
-                if TSNTracker.isInRange(tsn, start: gapStart, end: gapEnd) {
-                    // This chunk was selectively acknowledged
-                    // We could remove it, but keep for fast retransmit logic
+            for (tsn, var chunk) in pending {
+                let offset = tsn &- cumulativeTSN
+                // Only TSNs after the cumulative ack and below the highest
+                // gap-acked TSN can be reported missing.
+                guard offset > 0, TSNTracker.isLessThan(tsn, highestGapAcked) else { continue }
+
+                let isGapAcked = gapBlocks.contains { block in
+                    block.start <= block.end &&
+                    offset >= UInt32(block.start) && offset <= UInt32(block.end)
+                }
+                if !isGapAcked {
+                    chunk.missIndications += 1
+                    if chunk.missIndications >= 3 {
+                        chunk.markedForRetransmit = true
+                    }
+                    pending[tsn] = chunk
                 }
             }
         }
@@ -154,30 +178,45 @@ public struct RetransmissionQueue: Sendable {
     /// - Returns: Chunks to retransmit, or nil if max retransmits exceeded
     public mutating func pendingRetransmissions(now: ContinuousClock.Instant = .now) -> Result<[SCTPDataChunk], RetransmissionError> {
         var toRetransmit: [SCTPDataChunk] = []
+        var timerExpired = false
+        var fastRetransmit = false
 
         for (tsn, var chunk) in pending {
             let elapsed = now - chunk.lastSentTime
+            let rtoExpired = elapsed >= rto
 
-            // Check if RTO expired or marked for fast retransmit
-            if elapsed >= rto || chunk.markedForRetransmit {
+            if rtoExpired || chunk.markedForRetransmit {
                 if chunk.retransmitCount >= maxRetransmit {
                     return .failure(.maxRetransmitsExceeded(tsn: tsn))
+                }
+
+                if rtoExpired {
+                    timerExpired = true
+                } else {
+                    fastRetransmit = true
                 }
 
                 chunk.retransmitCount += 1
                 chunk.lastSentTime = now
                 chunk.markedForRetransmit = false
+                chunk.missIndications = 0
                 pending[tsn] = chunk
 
                 toRetransmit.append(chunk.dataChunk)
-
-                // Exponential backoff
-                rto = min(rto * 2, maxRTO)
-
-                // Congestion control: reduce cwnd and ssthresh
-                ssthresh = max(cwnd / 2, 4 * 1460)
-                cwnd = 1460
             }
+        }
+
+        // Apply backoff and congestion response once per timeout event,
+        // not once per expired chunk (RFC 4960 §6.3.3 E2, §7.2.3).
+        if timerExpired {
+            rto = min(rto * 2, maxRTO)
+            ssthresh = max(cwnd / 2, 4 * 1460)
+            cwnd = 1460
+        } else if fastRetransmit {
+            // Fast retransmit halves the window without collapsing to one MTU
+            // and does not back off the RTO (RFC 4960 §7.2.4).
+            ssthresh = max(cwnd / 2, 4 * 1460)
+            cwnd = ssthresh
         }
 
         // Sort by TSN for proper ordering

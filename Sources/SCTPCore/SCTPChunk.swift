@@ -72,16 +72,18 @@ public struct SCTPChunk: Sendable {
             throw SCTPError.insufficientData(expected: offset + 4, actual: data.count)
         }
 
-        let chunkType = data[offset]
-        let flags = data[offset + 1]
-        let length = UInt16(data[offset + 2]) << 8 | UInt16(data[offset + 3])
+        let base = data.startIndex + offset
+        let chunkType = data[base]
+        let flags = data[base + 1]
+        let length = UInt16(data[base + 2]) << 8 | UInt16(data[base + 3])
 
         guard data.count >= offset + Int(length) else {
             throw SCTPError.insufficientData(expected: offset + Int(length), actual: data.count)
         }
 
-        // Create value Data - this is the only copy we need
-        let value = Data(data[(offset + 4)..<(offset + Int(length))])
+        // Zero-copy slice of the packet buffer. The slice has a non-zero
+        // startIndex, so all value consumers must index relative to startIndex.
+        let value = data[(base + 4)..<(base + Int(length))]
         return SCTPChunk(chunkType: chunkType, flags: flags, value: value)
     }
 }
@@ -202,12 +204,15 @@ public struct SCTPDataChunk: Sendable {
         guard data.count >= 12 else {
             throw SCTPError.insufficientData(expected: 12, actual: data.count)
         }
+        // Single copy: the chunk value is a zero-copy slice of the packet
+        // buffer, so materialize the payload here with a fresh startIndex
+        // before it crosses module boundaries.
         return SCTPDataChunk(
             tsn: readUInt32(data, offset: 0),
             streamIdentifier: readUInt16(data, offset: 4),
             streamSequenceNumber: readUInt16(data, offset: 6),
             payloadProtocolIdentifier: readUInt32(data, offset: 8),
-            userData: Data(data[12...]),
+            userData: Data(data[(data.startIndex + 12)...]),
             beginningFragment: flags & 0x02 != 0,
             endingFragment: flags & 0x01 != 0,
             unordered: flags & 0x04 != 0
@@ -243,7 +248,7 @@ public struct SCTPSackChunk: Sendable {
 
     /// Encode to chunk value
     public func encode() -> Data {
-        var data = Data()
+        var data = Data(capacity: 12 + 4 * gapAckBlocks.count + 4 * duplicateTSNs.count)
         appendUInt32(&data, cumulativeTSNAck)
         appendUInt32(&data, advertisedReceiverWindowCredit)
         appendUInt16(&data, UInt16(gapAckBlocks.count))
@@ -268,17 +273,24 @@ public struct SCTPSackChunk: Sendable {
         let numGaps = Int(readUInt16(data, offset: 8))
         let numDups = Int(readUInt16(data, offset: 10))
 
+        // A SACK whose declared block counts exceed the available bytes is
+        // malformed — reject it instead of silently accepting a partial chunk.
+        let requiredCount = 12 + 4 * numGaps + 4 * numDups
+        guard data.count >= requiredCount else {
+            throw SCTPError.insufficientData(expected: requiredCount, actual: data.count)
+        }
+
         var gaps: [(UInt16, UInt16)] = []
+        gaps.reserveCapacity(numGaps)
         var offset = 12
         for _ in 0..<numGaps {
-            guard offset + 4 <= data.count else { break }
             gaps.append((readUInt16(data, offset: offset), readUInt16(data, offset: offset + 2)))
             offset += 4
         }
 
         var dups: [UInt32] = []
+        dups.reserveCapacity(numDups)
         for _ in 0..<numDups {
-            guard offset + 4 <= data.count else { break }
             dups.append(readUInt32(data, offset: offset))
             offset += 4
         }

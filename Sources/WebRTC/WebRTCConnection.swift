@@ -19,6 +19,16 @@ import DataChannel
 import Logging
 
 /// A WebRTC Direct connection over UDP
+///
+/// ## Concurrency
+///
+/// All public methods are thread-safe. Datagrams passed to
+/// `receive(_:remoteAddress:)` should be delivered from a single task at a
+/// time: concurrent calls may reorder DTLS records and SCTP TSNs. SCTP
+/// tolerates reordering via SACK and retransmission, so this affects latency
+/// rather than correctness. No internal lock is held while invoking
+/// `SendHandler` or `DataHandler` callbacks, so synchronous loopback
+/// transports cannot deadlock.
 public final class WebRTCConnection: Sendable {
 
     /// Callback to send raw bytes to the remote peer
@@ -47,21 +57,13 @@ public final class WebRTCConnection: Sendable {
         dtlsConnection.remoteCertificateDER
     }
 
-    /// Stream of incoming data channels opened by the remote peer
+    /// Stream of incoming data channels opened by the remote peer.
+    ///
+    /// The stream is created eagerly at init, so channels announced before
+    /// the first subscription are buffered rather than dropped. The stream
+    /// finishes when the connection closes or fails.
     public var incomingChannels: AsyncStream<DataChannel> {
-        channelState.withLock { state in
-            if let existing = state.incomingStream { return existing }
-            if state.isClosed {
-                let (stream, continuation) = AsyncStream<DataChannel>.makeStream()
-                continuation.finish()
-                state.incomingStream = stream
-                return stream
-            }
-            let (stream, continuation) = AsyncStream<DataChannel>.makeStream()
-            state.incomingStream = stream
-            state.incomingContinuation = continuation
-            return stream
-        }
+        channelState.withLock { $0.incomingStream }
     }
 
     // MARK: - Private state
@@ -73,6 +75,12 @@ public final class WebRTCConnection: Sendable {
     private let sendHandler: SendHandler
     private let expectedFingerprint: CertificateFingerprint?
     private let logger: Logger
+
+    /// Periodic driver for SCTP T3-rtx retransmissions
+    private let retransmitTask: Mutex<Task<Void, Never>?>
+
+    /// Interval between retransmission timer checks
+    private static let retransmitTickInterval: Duration = .milliseconds(250)
 
     private struct ConnState: Sendable {
         var stateMachine: ConnectionStateMachine = ConnectionStateMachine()
@@ -87,9 +95,8 @@ public final class WebRTCConnection: Sendable {
     }
 
     private struct ChannelState: Sendable {
-        var incomingStream: AsyncStream<DataChannel>?
+        var incomingStream: AsyncStream<DataChannel>
         var incomingContinuation: AsyncStream<DataChannel>.Continuation?
-        var isClosed: Bool = false
     }
 
     // MARK: - Init
@@ -143,8 +150,15 @@ public final class WebRTCConnection: Sendable {
             channelManager: DataChannelManager(isInitiator: isClient),
             isClient: isClient
         ))
-        self.channelState = Mutex(ChannelState())
+        // Create the stream eagerly so channels arriving before the first
+        // subscription are buffered rather than dropped
+        let (incomingStream, incomingContinuation) = AsyncStream<DataChannel>.makeStream()
+        self.channelState = Mutex(ChannelState(
+            incomingStream: incomingStream,
+            incomingContinuation: incomingContinuation
+        ))
         self.dataHandlerState = Mutex(nil)
+        self.retransmitTask = Mutex(nil)
     }
 
     // MARK: - Connection lifecycle
@@ -242,8 +256,12 @@ public final class WebRTCConnection: Sendable {
     ///   - label: Channel label
     ///   - ordered: Whether messages should be delivered in order
     /// - Returns: The opened data channel
+    /// - Throws: `WebRTCError.invalidState` if the connection is not established
     public func openDataChannel(label: String, ordered: Bool = true) throws -> DataChannel {
-        let (channel, sctpPacket) = connState.withLock { state -> (DataChannel, SCTPPacket) in
+        let (channel, sctpPacket) = try connState.withLock { state -> (DataChannel, SCTPPacket) in
+            guard state.stateMachine.isConnected else {
+                throw WebRTCError.invalidState("Cannot open data channel in state \(state.stateMachine.state)")
+            }
             let (channel, dcepData) = state.channelManager.openChannel(label: label, ordered: ordered)
             let sctpPacket = state.sctpAssociation.sendData(
                 streamID: channel.id,
@@ -262,6 +280,7 @@ public final class WebRTCConnection: Sendable {
     ///   - data: The data to send
     ///   - channelID: The data channel stream ID
     ///   - binary: Whether data is binary (true) or string (false)
+    /// - Throws: `WebRTCError.invalidState` if the connection is not established
     public func send(_ data: Data, on channelID: UInt16, binary: Bool = true) throws {
         let ppid: UInt32
         if data.isEmpty {
@@ -270,8 +289,11 @@ public final class WebRTCConnection: Sendable {
             ppid = binary ? DataChannelPPID.binary.rawValue : DataChannelPPID.string.rawValue
         }
 
-        let sctpPacket = connState.withLock { state in
-            state.sctpAssociation.sendData(
+        let sctpPacket = try connState.withLock { state -> SCTPPacket in
+            guard state.stateMachine.isConnected else {
+                throw WebRTCError.invalidState("Cannot send data in state \(state.stateMachine.state)")
+            }
+            return state.sctpAssociation.sendData(
                 streamID: channelID,
                 payloadProtocolIdentifier: ppid,
                 data: data
@@ -283,17 +305,25 @@ public final class WebRTCConnection: Sendable {
 
     /// Close the connection
     public func close() {
+        retransmitTask.withLock { task in
+            task?.cancel()
+            task = nil
+        }
         connState.withLock { state in
             state.stateMachine.process(.userClose)
             state.iceAgent.close()
             state.channelManager.shutdown()
         }
+        finishIncomingChannels()
+        dataHandlerState.withLock { $0 = nil }
+    }
+
+    /// Finish the incoming-channels stream so `for await` consumers terminate
+    private func finishIncomingChannels() {
         channelState.withLock { state in
-            state.isClosed = true
             state.incomingContinuation?.finish()
             state.incomingContinuation = nil
         }
-        dataHandlerState.withLock { $0 = nil }
     }
 
     // MARK: - Private protocol processing
@@ -349,10 +379,12 @@ public final class WebRTCConnection: Sendable {
             output = try dtlsConnection.processReceivedDatagram(data, remoteAddress: remoteAddress)
         } catch {
             // P2.2: Propagate DTLS errors to state machine
+            let reason = String(describing: error)
             connState.withLock { state in
-                _ = state.stateMachine.process(.dtlsHandshakeFailed(error.localizedDescription))
+                _ = state.stateMachine.process(.dtlsHandshakeFailed(reason))
             }
-            throw WebRTCError.dtlsHandshakeFailed(error.localizedDescription)
+            finishIncomingChannels()
+            throw WebRTCError.dtlsHandshakeFailed(reason)
         }
 
         // Send response datagrams
@@ -412,10 +444,12 @@ public final class WebRTCConnection: Sendable {
             packet = try SCTPPacket.decode(from: plaintext)
         } catch {
             // P2.2: Propagate SCTP decode errors
+            let reason = String(describing: error)
             connState.withLock { state in
-                _ = state.stateMachine.process(.sctpFailed(error.localizedDescription))
+                _ = state.stateMachine.process(.sctpFailed(reason))
             }
-            throw WebRTCError.sctpFailed(error.localizedDescription)
+            finishIncomingChannels()
+            throw WebRTCError.sctpFailed(reason)
         }
 
         let responses: [SCTPPacket]
@@ -426,12 +460,28 @@ public final class WebRTCConnection: Sendable {
             }
             responses = result.responses
             receivedData = result.receivedData
-        } catch {
-            // P2.2: Propagate SCTP processing errors
-            connState.withLock { state in
-                _ = state.stateMachine.process(.sctpFailed(error.localizedDescription))
+        } catch let error as SCTPError {
+            if case .verificationTagMismatch(let expected, let actual) = error {
+                // RFC 4960 §8.5: a packet with an invalid verification tag is
+                // silently discarded. Failing the association here would let an
+                // attacker who can inject a single datagram kill the connection.
+                logger.warning("Discarding SCTP packet: verification tag mismatch (expected \(expected), got \(actual))")
+                return
             }
-            throw WebRTCError.sctpFailed(error.localizedDescription)
+            // P2.2: Propagate SCTP processing errors
+            let reason = String(describing: error)
+            connState.withLock { state in
+                _ = state.stateMachine.process(.sctpFailed(reason))
+            }
+            finishIncomingChannels()
+            throw WebRTCError.sctpFailed(reason)
+        } catch {
+            let reason = String(describing: error)
+            connState.withLock { state in
+                _ = state.stateMachine.process(.sctpFailed(reason))
+            }
+            finishIncomingChannels()
+            throw WebRTCError.sctpFailed(reason)
         }
 
         // Check if SCTP became established
@@ -445,6 +495,7 @@ public final class WebRTCConnection: Sendable {
         }
         if didBecomeConnected {
             logger.info("WebRTC connection established")
+            startRetransmissionDriver()
         }
 
         // Send SCTP responses
@@ -486,6 +537,67 @@ public final class WebRTCConnection: Sendable {
             for channel in newChannels {
                 continuation?.yield(channel)
             }
+        }
+    }
+
+    // MARK: - Retransmission driver
+
+    /// Start the periodic SCTP retransmission driver (RFC 4960 §6.3 T3-rtx).
+    ///
+    /// `SCTPAssociation` is purely reactive — it only acts when a packet
+    /// arrives — so a periodic driver is required for lost DATA chunks to
+    /// ever be retransmitted.
+    private func startRetransmissionDriver() {
+        retransmitTask.withLock { task in
+            guard task == nil else { return }
+            task = Task { [weak self] in
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(for: Self.retransmitTickInterval)
+                    } catch {
+                        return // task cancelled during sleep
+                    }
+                    guard let self else { return }
+                    if self.driveRetransmissions() { return }
+                }
+            }
+        }
+    }
+
+    /// Perform one retransmission tick.
+    /// - Returns: true when the driver should stop (terminal state or failure)
+    private func driveRetransmissions() -> Bool {
+        let isTerminal = connState.withLock { $0.stateMachine.isTerminal }
+        if isTerminal {
+            return true
+        }
+
+        let result = connState.withLock { $0.sctpAssociation.getPendingRetransmissions() }
+        switch result {
+        case .success(let packets):
+            do {
+                for packet in packets {
+                    try encryptAndSend(packet.encode())
+                }
+            } catch {
+                let reason = "Retransmission send failed: \(String(describing: error))"
+                logger.error("\(reason)")
+                connState.withLock { state in
+                    _ = state.stateMachine.process(.sctpFailed(reason))
+                }
+                finishIncomingChannels()
+                return true
+            }
+            return false
+
+        case .failure(let error):
+            let reason = String(describing: error)
+            logger.error("SCTP retransmission limit exceeded: \(reason)")
+            connState.withLock { state in
+                _ = state.stateMachine.process(.sctpFailed(reason))
+            }
+            finishIncomingChannels()
+            return true
         }
     }
 

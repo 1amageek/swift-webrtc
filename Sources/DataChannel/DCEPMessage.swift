@@ -80,7 +80,11 @@ public struct DCEPOpen: Sendable {
             throw DataChannelError.invalidFormat("Not a DCEP Open message")
         }
 
-        let channelType = DCEPChannelType(rawValue: data[1]) ?? .reliable
+        // RFC 8832 §5.1: unknown channel types must not be silently coerced —
+        // accepting one as "reliable" would change delivery semantics
+        guard let channelType = DCEPChannelType(rawValue: data[1]) else {
+            throw DataChannelError.invalidFormat("Unknown DCEP channel type: \(data[1])")
+        }
         let priority = UInt16(data[2]) << 8 | UInt16(data[3])
         let reliability = UInt32(data[4]) << 24 | UInt32(data[5]) << 16 | UInt32(data[6]) << 8 | UInt32(data[7])
         let labelLen = Int(UInt16(data[8]) << 8 | UInt16(data[9]))

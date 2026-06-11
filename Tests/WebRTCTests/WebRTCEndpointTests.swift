@@ -201,4 +201,25 @@ struct WebRTCListenerTests {
         #expect(conn1?.state == .closed)
         #expect(conn2?.state == .closed)
     }
+
+    @Test("Connections accepted before subscription are buffered")
+    func connectionsBufferedBeforeSubscription() async throws {
+        let cert = try DTLSCertificate.generateSelfSigned()
+        let listener = WebRTCListener(certificate: cert)
+
+        // Accept BEFORE anyone iterates `connections` — the eager stream
+        // must buffer the connection instead of dropping it
+        let accepted = listener.acceptConnection(peerID: "peer1", sendHandler: { _ in })
+        #expect(accepted != nil)
+
+        // Finish the stream so iteration terminates
+        listener.close()
+
+        var received: [WebRTCConnection] = []
+        for await conn in listener.connections {
+            received.append(conn)
+        }
+        #expect(received.count == 1)
+        #expect(received.first === accepted)
+    }
 }
