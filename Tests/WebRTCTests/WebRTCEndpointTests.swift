@@ -165,6 +165,25 @@ struct WebRTCListenerTests {
         #expect(conn1 === conn2)
     }
 
+    @Test("Listener replaces a terminal connection for the same peer")
+    func listenerReplacesTerminalConnection() throws {
+        let cert = try DTLSCertificate.generateSelfSigned()
+        let listener = WebRTCListener(certificate: cert)
+
+        let accepted1 = listener.acceptConnection(peerID: "127.0.0.1:5000", sendHandler: { _ in })
+        let conn1 = try #require(accepted1)
+        conn1.close()
+        #expect(conn1.state.isTerminal)
+
+        // A reconnect attempt from the same address must get a fresh
+        // connection, not the dead one
+        let accepted2 = listener.acceptConnection(peerID: "127.0.0.1:5000", sendHandler: { _ in })
+        let conn2 = try #require(accepted2)
+        #expect(conn1 !== conn2)
+        #expect(conn2.state == .dtlsHandshaking)
+        #expect(listener.connection(for: "127.0.0.1:5000") === conn2)
+    }
+
     @Test("Listener returns nil after close")
     func listenerCloseRejectsConnections() throws {
         let cert = try DTLSCertificate.generateSelfSigned()

@@ -501,10 +501,15 @@ public final class SCTPAssociation: Sendable {
     }
 
     /// Generate a SACK for the current receive state.
+    ///
+    /// The advertised receiver window reflects the bytes currently held by
+    /// the fragment assembler (incomplete fragments and out-of-order
+    /// messages). Fully assembled in-order data is delivered to the
+    /// application immediately and no longer counts against the window.
     /// - Returns: nil when TSN tracking has not been initialized yet
     ///   (no DATA can legitimately have been received)
     private func generateSack() -> SCTPPacket? {
-        let snapshot = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, [(start: UInt16, end: UInt16)], [UInt32])? in
+        let snapshot = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, [(start: UInt16, end: UInt16)], [UInt32], UInt32)? in
             guard var tracker = s.tsnTracker else {
                 return nil
             }
@@ -512,15 +517,20 @@ public final class SCTPAssociation: Sendable {
             let gaps = tracker.gapBlocks
             let cumulativeTSN = tracker.cumulativeTSN
             s.tsnTracker = tracker
-            return (s.localPort, s.remotePort, s.remoteVerificationTag, cumulativeTSN, gaps, dups)
+            let buffered = UInt32(clamping: s.fragmentAssembler.bufferedBytes)
+            let available = s.advertisedReceiverWindowCredit >= buffered
+                ? s.advertisedReceiverWindowCredit - buffered
+                : 0
+            return (s.localPort, s.remotePort, s.remoteVerificationTag, cumulativeTSN, gaps, dups, available)
         }
 
-        guard let (localPort, remotePort, remoteTag, cumulativeTSN, gaps, dups) = snapshot else {
+        guard let (localPort, remotePort, remoteTag, cumulativeTSN, gaps, dups, availableWindow) = snapshot else {
             return nil
         }
 
         let sack = SCTPSackChunk(
             cumulativeTSNAck: cumulativeTSN,
+            advertisedReceiverWindowCredit: availableWindow,
             gapAckBlocks: gaps,
             duplicateTSNs: dups
         )

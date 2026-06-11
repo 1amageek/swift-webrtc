@@ -21,3 +21,17 @@ public enum WebRTCConnectionState: Sendable, Equatable {
     /// Connection closed
     case closed
 }
+
+extension WebRTCConnectionState {
+    /// Whether the connection can never become usable again.
+    ///
+    /// `disconnected` is not terminal — it may recover.
+    public var isTerminal: Bool {
+        switch self {
+        case .failed, .closed:
+            return true
+        case .new, .connecting, .dtlsHandshaking, .sctpConnecting, .connected, .disconnected:
+            return false
+        }
+    }
+}

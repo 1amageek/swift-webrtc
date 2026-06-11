@@ -63,6 +63,11 @@ public struct FragmentAssembler: Sendable {
     /// Buffered complete messages waiting for in-order delivery
     private var orderedBuffer: [UInt16: [UInt16: AssembledMessage]]
 
+    /// Total payload bytes currently held in `pendingFragments` and
+    /// `orderedBuffer`. Maintained incrementally so SACK generation can
+    /// report a receive window without scanning the buffers.
+    public private(set) var bufferedBytes: Int = 0
+
     /// Hard cap on concurrent pending fragment groups
     private let maxPendingFragments: Int = 1000
 
@@ -154,10 +159,14 @@ public struct FragmentAssembler: Sendable {
         var fragments = pendingFragments[key] ?? []
         Self.insertSorted(fragment, into: &fragments)
         pendingFragments[key] = fragments
+        bufferedBytes += fragment.data.count
 
         // Try to assemble
         if let assembled = tryAssemble(key: key, ppid: chunk.payloadProtocolIdentifier) {
+            // Assembled data is the concatenation of every fragment in the
+            // group, so its size equals the bytes leaving the buffer
             pendingFragments.removeValue(forKey: key)
+            bufferedBytes -= assembled.data.count
             if isUnordered {
                 unorderedKeyIndex.removeValue(forKey: indexKey)
             }
@@ -222,6 +231,7 @@ public struct FragmentAssembler: Sendable {
 
             // Deliver any buffered messages that are now in order
             while let buffered = orderedBuffer[streamID]?.removeValue(forKey: expectedSequence[streamID] ?? 0) {
+                bufferedBytes -= buffered.data.count
                 delivered.append(buffered)
                 expectedSequence[streamID] = (expectedSequence[streamID] ?? 0) &+ 1
             }
@@ -235,6 +245,7 @@ public struct FragmentAssembler: Sendable {
             }
             streamBuffer[seqNum] = message
             orderedBuffer[streamID] = streamBuffer
+            bufferedBytes += message.data.count
             return []
         } else {
             // Old/duplicate message - discard
@@ -264,7 +275,9 @@ public struct FragmentAssembler: Sendable {
         }
 
         for key in staleKeys {
-            pendingFragments.removeValue(forKey: key)
+            if let removed = pendingFragments.removeValue(forKey: key) {
+                bufferedBytes -= removed.reduce(0) { $0 + $1.data.count }
+            }
             if key.unordered {
                 unorderedKeyIndex.removeValue(forKey: Self.unorderedIndexKey(
                     streamID: key.streamID,
@@ -282,8 +295,13 @@ public struct FragmentAssembler: Sendable {
     /// Reset state for a stream
     public mutating func resetStream(_ streamID: UInt16) {
         expectedSequence.removeValue(forKey: streamID)
-        orderedBuffer.removeValue(forKey: streamID)
-        pendingFragments = pendingFragments.filter { $0.key.streamID != streamID }
+        if let removedMessages = orderedBuffer.removeValue(forKey: streamID) {
+            bufferedBytes -= removedMessages.values.reduce(0) { $0 + $1.data.count }
+        }
+        for (key, fragments) in pendingFragments where key.streamID == streamID {
+            bufferedBytes -= fragments.reduce(0) { $0 + $1.data.count }
+            pendingFragments.removeValue(forKey: key)
+        }
         unorderedKeyIndex = unorderedKeyIndex.filter { $0.value.streamID != streamID }
     }
 

@@ -118,6 +118,44 @@ struct SCTPAssociationTests {
         #expect(received[1].data == Data("b".utf8))
     }
 
+    @Test("SACK advertises a window reduced by buffered fragment bytes")
+    func sackAdvertisesDynamicWindow() throws {
+        let (client, server) = try establishPair()
+
+        // Learn a valid TSN/tag by letting the client build a normal packet,
+        // then replace its DATA chunk with a beginning-only fragment that
+        // the server must hold in its reassembly buffer.
+        let payload = Data(repeating: 0x42, count: 1000)
+        let valid = client.sendData(streamID: 0, payloadProtocolIdentifier: 53, data: payload)
+        let originalChunk = try #require(valid.chunks.first)
+        let original = try SCTPDataChunk.decode(from: originalChunk.value, flags: originalChunk.flags)
+
+        let fragment = SCTPDataChunk(
+            tsn: original.tsn,
+            streamIdentifier: 0,
+            streamSequenceNumber: 0,
+            payloadProtocolIdentifier: 53,
+            userData: payload,
+            beginningFragment: true,
+            endingFragment: false
+        )
+        let packet = SCTPPacket(
+            sourcePort: valid.sourcePort,
+            destinationPort: valid.destinationPort,
+            verificationTag: valid.verificationTag,
+            chunks: [fragment.toChunk()]
+        )
+
+        let (responses, received) = try server.processPacket(packet)
+        #expect(received.isEmpty)
+
+        let sackChunk = try #require(responses
+            .flatMap(\.chunks)
+            .first { $0.chunkType == SCTPChunkType.sack.rawValue })
+        let sack = try SCTPSackChunk.decode(from: sackChunk.value)
+        #expect(sack.advertisedReceiverWindowCredit == 65535 - 1000)
+    }
+
     @Test("SACK acknowledgment clears the retransmission queue")
     func sackClearsRetransmissionQueue() throws {
         let (client, server) = try establishPair()
@@ -322,6 +360,70 @@ struct FragmentAssemblerLimitTests {
         let assembled = try assembler.process(chunk: begin)
         #expect(assembled.count == 1)
         #expect(assembled.first?.data == payload + payload)
+    }
+
+    @Test("bufferedBytes tracks incomplete fragments and drains on assembly")
+    func bufferedBytesTracksFragments() throws {
+        var assembler = FragmentAssembler()
+        let payload = Data(repeating: 0xAB, count: 500)
+
+        let begin = SCTPDataChunk(
+            tsn: 10, streamIdentifier: 0, streamSequenceNumber: 0,
+            payloadProtocolIdentifier: 53, userData: payload,
+            beginningFragment: true, endingFragment: false
+        )
+        _ = try assembler.process(chunk: begin)
+        #expect(assembler.bufferedBytes == 500)
+
+        let end = SCTPDataChunk(
+            tsn: 11, streamIdentifier: 0, streamSequenceNumber: 0,
+            payloadProtocolIdentifier: 53, userData: payload,
+            beginningFragment: false, endingFragment: true
+        )
+        let assembled = try assembler.process(chunk: end)
+        #expect(assembled.count == 1)
+        #expect(assembler.bufferedBytes == 0)
+    }
+
+    @Test("bufferedBytes tracks out-of-order messages and drains on delivery")
+    func bufferedBytesTracksReorderBuffer() throws {
+        var assembler = FragmentAssembler()
+        let payload = Data(repeating: 0xCD, count: 300)
+
+        // Sequence 1 arrives before expected sequence 0 — buffered
+        _ = try assembler.process(chunk: SCTPDataChunk(
+            tsn: 11, streamIdentifier: 0, streamSequenceNumber: 1,
+            payloadProtocolIdentifier: 53, userData: payload
+        ))
+        #expect(assembler.bufferedBytes == 300)
+
+        // Sequence 0 arrives — both deliver, buffer drains
+        let delivered = try assembler.process(chunk: SCTPDataChunk(
+            tsn: 10, streamIdentifier: 0, streamSequenceNumber: 0,
+            payloadProtocolIdentifier: 53, userData: payload
+        ))
+        #expect(delivered.count == 2)
+        #expect(assembler.bufferedBytes == 0)
+    }
+
+    @Test("resetStream releases buffered bytes")
+    func resetStreamReleasesBufferedBytes() throws {
+        var assembler = FragmentAssembler()
+        let payload = Data(repeating: 0xEF, count: 400)
+
+        _ = try assembler.process(chunk: SCTPDataChunk(
+            tsn: 10, streamIdentifier: 7, streamSequenceNumber: 0,
+            payloadProtocolIdentifier: 53, userData: payload,
+            beginningFragment: true, endingFragment: false
+        ))
+        _ = try assembler.process(chunk: SCTPDataChunk(
+            tsn: 20, streamIdentifier: 7, streamSequenceNumber: 5,
+            payloadProtocolIdentifier: 53, userData: payload
+        ))
+        #expect(assembler.bufferedBytes == 800)
+
+        assembler.resetStream(7)
+        #expect(assembler.bufferedBytes == 0)
     }
 
     @Test("Per-stream reorder buffer cap is enforced")

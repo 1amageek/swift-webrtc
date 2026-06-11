@@ -72,9 +72,22 @@ public final class WebRTCListener: Sendable {
         let isClosed = listenerState.withLock { $0.isClosed }
         if isClosed { return nil }
 
-        // Check if connection already exists
+        // Check if connection already exists. A terminal (failed/closed)
+        // connection is replaced by a fresh one so the peer can reconnect
+        // from the same address.
         let existing = listenerState.withLock { $0.activeConnections[peerID] }
-        if let existing { return existing }
+        if let existing {
+            if !existing.state.isTerminal {
+                return existing
+            }
+            logger.info("Replacing terminal connection for peer: \(peerID)")
+            listenerState.withLock { state in
+                if state.activeConnections[peerID] === existing {
+                    state.activeConnections.removeValue(forKey: peerID)
+                }
+            }
+            existing.close()
+        }
 
         let connection = WebRTCConnection.asServer(
             certificate: certificate,

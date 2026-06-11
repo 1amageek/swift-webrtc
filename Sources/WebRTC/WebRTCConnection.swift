@@ -206,7 +206,19 @@ public final class WebRTCConnection: Sendable {
     /// - DTLS (first byte 20-63): content type range for DTLS records
     /// - Other: logged and ignored
     ///
-    /// - Throws: `WebRTCError.closed` if the connection has been closed
+    /// Contract: every throw from this method means the connection is
+    /// terminal (`state.isTerminal == true`). The connection has already
+    /// transitioned to `.failed`/`.closed` and `incomingChannels` has been
+    /// finished before the error propagates — callers should stop feeding
+    /// data, drop their routing entry, and dispose of the connection.
+    /// Recoverable conditions (unknown protocol bytes, packets that fail
+    /// SCTP verification-tag validation per RFC 4960 §8.5, DTLS packets
+    /// arriving in a non-DTLS state) are discarded internally and do NOT
+    /// throw.
+    ///
+    /// - Throws: `WebRTCError.closed` if the connection has been closed,
+    ///   `WebRTCError.dtlsHandshakeFailed` on a fatal DTLS failure,
+    ///   `WebRTCError.sctpFailed` on a fatal SCTP failure
     public func receive(_ data: Data, remoteAddress: Data = Data()) throws {
         // P2.4: Check for closed/failed state before processing
         let isClosed = connState.withLock { state in
@@ -218,6 +230,24 @@ public final class WebRTCConnection: Sendable {
 
         guard !data.isEmpty else { return }
 
+        do {
+            try demultiplex(data, remoteAddress: remoteAddress)
+        } catch {
+            // Enforce the terminal contract: any error escaping receive()
+            // leaves the connection failed and the incoming-channels stream
+            // finished, including paths whose handlers did not transition
+            // explicitly (e.g. send failures while emitting responses).
+            connState.withLock { state in
+                if !state.stateMachine.isTerminal {
+                    _ = state.stateMachine.process(.error(String(describing: error)))
+                }
+            }
+            finishIncomingChannels()
+            throw error
+        }
+    }
+
+    private func demultiplex(_ data: Data, remoteAddress: Data) throws {
         let firstByte = data[data.startIndex]
 
         // RFC 5764 §5.1.2 demultiplex by first byte value:
