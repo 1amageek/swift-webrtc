@@ -120,7 +120,9 @@ public struct FragmentAssembler: Sendable {
                 streamID: chunk.streamIdentifier,
                 sequenceNumber: chunk.streamSequenceNumber,
                 ppid: chunk.payloadProtocolIdentifier,
-                data: chunk.userData,
+                // chunk.userData is [UInt8] in the Embedded-clean core; bridge to
+                // Data at this adapter-side boundary.
+                data: Data(chunk.userData),
                 unordered: isUnordered
             )
 
@@ -178,7 +180,9 @@ public struct FragmentAssembler: Sendable {
 
         let fragment = Fragment(
             tsn: chunk.tsn,
-            data: chunk.userData,
+            // chunk.userData is [UInt8] in the Embedded-clean core; bridge to
+            // Data at this adapter-side boundary.
+            data: Data(chunk.userData),
             isBeginning: isBeginning,
             isEnding: isEnding
         )

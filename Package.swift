@@ -25,6 +25,7 @@ let package = Package(
         .library(name: "STUNWireCore", targets: ["STUNWireCore"]),
         .library(name: "STUNCore", targets: ["STUNCore"]),
         .library(name: "ICELite", targets: ["ICELite"]),
+        .library(name: "SCTPWireCore", targets: ["SCTPWireCore"]),
         .library(name: "SCTPCore", targets: ["SCTPCore"]),
         .library(name: "DataChannelCore", targets: ["DataChannelCore"]),
         .library(name: "DataChannel", targets: ["DataChannel"]),
@@ -59,9 +60,20 @@ let package = Package(
             dependencies: ["STUNCore"],
             path: "Sources/ICELite"
         ),
+        // ---- Embedded-clean SCTP wire codec (dual-build: host + Embedded) ----
+        .target(
+            name: "SCTPWireCore",
+            dependencies: [
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
+            path: "Sources/SCTPWireCore",
+            swiftSettings: coreSettings
+        ),
+        // ---- Foundation adapter: keeps the existing Data-based SCTP API ----
         .target(
             name: "SCTPCore",
             dependencies: [
+                "SCTPWireCore",
                 .product(name: "Crypto", package: "swift-crypto"),
             ],
             path: "Sources/SCTPCore"

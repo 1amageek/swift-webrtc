@@ -516,8 +516,9 @@ public final class SCTPAssociation: Sendable {
     }
 
     private func handleCookieEcho(_ chunk: SCTPChunk) throws -> SCTPPacket {
-        // Validate cookie (HMAC + expiry)
-        let cookie = try SCTPCookie.decode(from: chunk.value)
+        // Validate cookie (HMAC + expiry). chunk.value is [UInt8] in the
+        // Embedded-clean core; bridge to Data for the Foundation cookie codec.
+        let cookie = try SCTPCookie.decode(from: Data(chunk.value))
 
         guard cookie.validate(secretKey: cookieSecretKey) else {
             throw SCTPError.cookieValidationFailed

@@ -2,7 +2,7 @@
 ///
 /// Each SCTP chunk has: type (1) + flags (1) + length (2) + value
 
-import Foundation
+import P2PCoreBytes
 
 /// SCTP chunk type identifiers
 public enum SCTPChunkType: UInt8, Sendable {
@@ -22,7 +22,10 @@ public enum SCTPChunkType: UInt8, Sendable {
     case reConfig = 130
 }
 
-/// An SCTP chunk
+/// An SCTP chunk.
+///
+/// The Embedded-clean core stores the value as `[UInt8]`. The `SCTPCore` adapter
+/// adds the `Data`-based init/property and `encode()->Data`/`decode(from:Data)`.
 public struct SCTPChunk: Sendable {
     /// Chunk type
     public let chunkType: UInt8
@@ -34,9 +37,9 @@ public struct SCTPChunk: Sendable {
     public let length: UInt16
 
     /// Chunk value
-    public let value: Data
+    public let value: [UInt8]
 
-    public init(chunkType: UInt8, flags: UInt8 = 0, value: Data) {
+    public init(chunkType: UInt8, flags: UInt8 = 0, value: [UInt8]) {
         self.chunkType = chunkType
         self.flags = flags
         self.length = UInt16(4 + value.count)
@@ -44,15 +47,16 @@ public struct SCTPChunk: Sendable {
     }
 
     /// Encode the chunk
-    public func encode() -> Data {
-        var data = Data(capacity: Int(length))
+    public func encodeBytes() -> [UInt8] {
+        var data = [UInt8]()
+        data.reserveCapacity(Int(length))
         data.append(chunkType)
         data.append(flags)
         data.append(UInt8(length >> 8))
         data.append(UInt8(length & 0xFF))
-        data.append(value)
+        data.append(contentsOf: value)
 
-        // Pad to 4-byte boundary (avoid allocating temporary Data)
+        // Pad to 4-byte boundary (avoid allocating temporary buffer)
         let padding = (4 - (Int(length) % 4)) % 4
         for _ in 0..<padding {
             data.append(0)
@@ -61,37 +65,34 @@ public struct SCTPChunk: Sendable {
         return data
     }
 
-    /// Decode a chunk from data
-    public static func decode(from data: Data) throws -> SCTPChunk {
+    /// Decode a chunk from bytes
+    public static func decode(from data: [UInt8]) throws(SCTPWireError) -> SCTPChunk {
         try decode(from: data, at: 0)
     }
 
-    /// Decode a chunk from data at a specific offset (avoids Data copy)
-    public static func decode(from data: Data, at offset: Int) throws -> SCTPChunk {
+    /// Decode a chunk from bytes at a specific offset
+    public static func decode(from data: [UInt8], at offset: Int) throws(SCTPWireError) -> SCTPChunk {
         guard data.count >= offset + 4 else {
-            throw SCTPError.insufficientData(expected: offset + 4, actual: data.count)
+            throw .decode(.insufficientData(expected: offset + 4, actual: data.count))
         }
 
-        let base = data.startIndex + offset
-        let chunkType = data[base]
-        let flags = data[base + 1]
-        let length = UInt16(data[base + 2]) << 8 | UInt16(data[base + 3])
+        let chunkType = data[offset]
+        let flags = data[offset + 1]
+        let length = UInt16(data[offset + 2]) << 8 | UInt16(data[offset + 3])
 
         // RFC 4960 §3.2: the Chunk Length includes the 4-byte chunk header, so
         // it must be at least 4. A declared length below 4 is malformed and, if
         // accepted, would cause the packet-level chunk loop to never advance
         // (padded length 0) — an unbounded loop / OOM on a single packet.
         guard length >= 4 else {
-            throw SCTPError.invalidFormat("Chunk length \(length) below minimum of 4")
+            throw .decode(.invalidFormat("Chunk length \(length) below minimum of 4"))
         }
 
         guard data.count >= offset + Int(length) else {
-            throw SCTPError.insufficientData(expected: offset + Int(length), actual: data.count)
+            throw .decode(.insufficientData(expected: offset + Int(length), actual: data.count))
         }
 
-        // Zero-copy slice of the packet buffer. The slice has a non-zero
-        // startIndex, so all value consumers must index relative to startIndex.
-        let value = data[(base + 4)..<(base + Int(length))]
+        let value = Array(data[(offset + 4)..<(offset + Int(length))])
         return SCTPChunk(chunkType: chunkType, flags: flags, value: value)
     }
 }
@@ -121,33 +122,34 @@ public struct SCTPInitChunk: Sendable {
     }
 
     /// Encode to chunk value
-    public func encode() -> Data {
-        var data = Data(capacity: 16)
-        appendUInt32(&data, initiateTag)
-        appendUInt32(&data, advertisedReceiverWindowCredit)
-        appendUInt16(&data, numberOfOutboundStreams)
-        appendUInt16(&data, numberOfInboundStreams)
-        appendUInt32(&data, initialTSN)
+    public func encodeBytes() -> [UInt8] {
+        var data = [UInt8]()
+        data.reserveCapacity(16)
+        sctpAppendUInt32(&data, initiateTag)
+        sctpAppendUInt32(&data, advertisedReceiverWindowCredit)
+        sctpAppendUInt16(&data, numberOfOutboundStreams)
+        sctpAppendUInt16(&data, numberOfInboundStreams)
+        sctpAppendUInt32(&data, initialTSN)
         return data
     }
 
     /// Decode from chunk value
-    public static func decode(from data: Data) throws -> SCTPInitChunk {
+    public static func decode(from data: [UInt8]) throws(SCTPWireError) -> SCTPInitChunk {
         guard data.count >= 16 else {
-            throw SCTPError.insufficientData(expected: 16, actual: data.count)
+            throw .decode(.insufficientData(expected: 16, actual: data.count))
         }
         return SCTPInitChunk(
-            initiateTag: readUInt32(data, offset: 0),
-            advertisedReceiverWindowCredit: readUInt32(data, offset: 4),
-            numberOfOutboundStreams: readUInt16(data, offset: 8),
-            numberOfInboundStreams: readUInt16(data, offset: 10),
-            initialTSN: readUInt32(data, offset: 12)
+            initiateTag: sctpReadUInt32(data, offset: 0),
+            advertisedReceiverWindowCredit: sctpReadUInt32(data, offset: 4),
+            numberOfOutboundStreams: sctpReadUInt16(data, offset: 8),
+            numberOfInboundStreams: sctpReadUInt16(data, offset: 10),
+            initialTSN: sctpReadUInt32(data, offset: 12)
         )
     }
 
     /// Create an SCTP chunk from this INIT
     public func toChunk(type: SCTPChunkType = .initChunk) -> SCTPChunk {
-        SCTPChunk(chunkType: type.rawValue, value: encode())
+        SCTPChunk(chunkType: type.rawValue, value: encodeBytes())
     }
 }
 
@@ -168,7 +170,7 @@ public struct SCTPDataChunk: Sendable {
     public let payloadProtocolIdentifier: UInt32
 
     /// User data
-    public let userData: Data
+    public let userData: [UInt8]
 
     /// Chunk flags
     public let flags: UInt8
@@ -178,7 +180,7 @@ public struct SCTPDataChunk: Sendable {
         streamIdentifier: UInt16,
         streamSequenceNumber: UInt16,
         payloadProtocolIdentifier: UInt32,
-        userData: Data,
+        userData: [UInt8],
         beginningFragment: Bool = true,
         endingFragment: Bool = true,
         unordered: Bool = false
@@ -197,30 +199,28 @@ public struct SCTPDataChunk: Sendable {
     }
 
     /// Encode to chunk value
-    public func encode() -> Data {
-        var data = Data(capacity: 12 + userData.count)
-        appendUInt32(&data, tsn)
-        appendUInt16(&data, streamIdentifier)
-        appendUInt16(&data, streamSequenceNumber)
-        appendUInt32(&data, payloadProtocolIdentifier)
-        data.append(userData)
+    public func encodeBytes() -> [UInt8] {
+        var data = [UInt8]()
+        data.reserveCapacity(12 + userData.count)
+        sctpAppendUInt32(&data, tsn)
+        sctpAppendUInt16(&data, streamIdentifier)
+        sctpAppendUInt16(&data, streamSequenceNumber)
+        sctpAppendUInt32(&data, payloadProtocolIdentifier)
+        data.append(contentsOf: userData)
         return data
     }
 
     /// Decode from chunk value
-    public static func decode(from data: Data, flags: UInt8) throws -> SCTPDataChunk {
+    public static func decode(from data: [UInt8], flags: UInt8) throws(SCTPWireError) -> SCTPDataChunk {
         guard data.count >= 12 else {
-            throw SCTPError.insufficientData(expected: 12, actual: data.count)
+            throw .decode(.insufficientData(expected: 12, actual: data.count))
         }
-        // Single copy: the chunk value is a zero-copy slice of the packet
-        // buffer, so materialize the payload here with a fresh startIndex
-        // before it crosses module boundaries.
         return SCTPDataChunk(
-            tsn: readUInt32(data, offset: 0),
-            streamIdentifier: readUInt16(data, offset: 4),
-            streamSequenceNumber: readUInt16(data, offset: 6),
-            payloadProtocolIdentifier: readUInt32(data, offset: 8),
-            userData: Data(data[(data.startIndex + 12)...]),
+            tsn: sctpReadUInt32(data, offset: 0),
+            streamIdentifier: sctpReadUInt16(data, offset: 4),
+            streamSequenceNumber: sctpReadUInt16(data, offset: 6),
+            payloadProtocolIdentifier: sctpReadUInt32(data, offset: 8),
+            userData: Array(data[12...]),
             beginningFragment: flags & 0x02 != 0,
             endingFragment: flags & 0x01 != 0,
             unordered: flags & 0x04 != 0
@@ -229,7 +229,7 @@ public struct SCTPDataChunk: Sendable {
 
     /// Create an SCTP chunk from this DATA
     public func toChunk() -> SCTPChunk {
-        SCTPChunk(chunkType: SCTPChunkType.data.rawValue, flags: flags, value: encode())
+        SCTPChunk(chunkType: SCTPChunkType.data.rawValue, flags: flags, value: encodeBytes())
     }
 }
 
@@ -255,51 +255,52 @@ public struct SCTPSackChunk: Sendable {
     }
 
     /// Encode to chunk value
-    public func encode() -> Data {
-        var data = Data(capacity: 12 + 4 * gapAckBlocks.count + 4 * duplicateTSNs.count)
-        appendUInt32(&data, cumulativeTSNAck)
-        appendUInt32(&data, advertisedReceiverWindowCredit)
-        appendUInt16(&data, UInt16(gapAckBlocks.count))
-        appendUInt16(&data, UInt16(duplicateTSNs.count))
+    public func encodeBytes() -> [UInt8] {
+        var data = [UInt8]()
+        data.reserveCapacity(12 + 4 * gapAckBlocks.count + 4 * duplicateTSNs.count)
+        sctpAppendUInt32(&data, cumulativeTSNAck)
+        sctpAppendUInt32(&data, advertisedReceiverWindowCredit)
+        sctpAppendUInt16(&data, UInt16(gapAckBlocks.count))
+        sctpAppendUInt16(&data, UInt16(duplicateTSNs.count))
         for gap in gapAckBlocks {
-            appendUInt16(&data, gap.start)
-            appendUInt16(&data, gap.end)
+            sctpAppendUInt16(&data, gap.start)
+            sctpAppendUInt16(&data, gap.end)
         }
         for tsn in duplicateTSNs {
-            appendUInt32(&data, tsn)
+            sctpAppendUInt32(&data, tsn)
         }
         return data
     }
 
     /// Decode from chunk value
-    public static func decode(from data: Data) throws -> SCTPSackChunk {
+    public static func decode(from data: [UInt8]) throws(SCTPWireError) -> SCTPSackChunk {
         guard data.count >= 12 else {
-            throw SCTPError.insufficientData(expected: 12, actual: data.count)
+            throw .decode(.insufficientData(expected: 12, actual: data.count))
         }
-        let cumulativeTSNAck = readUInt32(data, offset: 0)
-        let arwc = readUInt32(data, offset: 4)
-        let numGaps = Int(readUInt16(data, offset: 8))
-        let numDups = Int(readUInt16(data, offset: 10))
+        let cumulativeTSNAck = sctpReadUInt32(data, offset: 0)
+        let arwc = sctpReadUInt32(data, offset: 4)
+        let numGaps = Int(sctpReadUInt16(data, offset: 8))
+        let numDups = Int(sctpReadUInt16(data, offset: 10))
 
         // A SACK whose declared block counts exceed the available bytes is
         // malformed — reject it instead of silently accepting a partial chunk.
         let requiredCount = 12 + 4 * numGaps + 4 * numDups
         guard data.count >= requiredCount else {
-            throw SCTPError.insufficientData(expected: requiredCount, actual: data.count)
+            throw .decode(.insufficientData(expected: requiredCount, actual: data.count))
         }
 
-        var gaps: [(UInt16, UInt16)] = []
+        var gaps: [(start: UInt16, end: UInt16)] = []
         gaps.reserveCapacity(numGaps)
         var offset = 12
         for _ in 0..<numGaps {
-            gaps.append((readUInt16(data, offset: offset), readUInt16(data, offset: offset + 2)))
+            gaps.append((sctpReadUInt16(data, offset: offset), sctpReadUInt16(data, offset: offset + 2)))
             offset += 4
         }
 
         var dups: [UInt32] = []
         dups.reserveCapacity(numDups)
         for _ in 0..<numDups {
-            dups.append(readUInt32(data, offset: offset))
+            dups.append(sctpReadUInt32(data, offset: offset))
             offset += 4
         }
 
@@ -313,31 +314,31 @@ public struct SCTPSackChunk: Sendable {
 
     /// Create an SCTP chunk from this SACK
     public func toChunk() -> SCTPChunk {
-        SCTPChunk(chunkType: SCTPChunkType.sack.rawValue, value: encode())
+        SCTPChunk(chunkType: SCTPChunkType.sack.rawValue, value: encodeBytes())
     }
 }
 
-// MARK: - Helpers
+// MARK: - Byte helpers (Embedded-clean, [UInt8])
 
-private func appendUInt16(_ data: inout Data, _ value: UInt16) {
+func sctpAppendUInt16(_ data: inout [UInt8], _ value: UInt16) {
     data.append(UInt8(value >> 8))
     data.append(UInt8(value & 0xFF))
 }
 
-private func appendUInt32(_ data: inout Data, _ value: UInt32) {
+func sctpAppendUInt32(_ data: inout [UInt8], _ value: UInt32) {
     data.append(UInt8(value >> 24))
     data.append(UInt8((value >> 16) & 0xFF))
     data.append(UInt8((value >> 8) & 0xFF))
     data.append(UInt8(value & 0xFF))
 }
 
-func readUInt16(_ data: Data, offset: Int) -> UInt16 {
-    UInt16(data[data.startIndex + offset]) << 8 | UInt16(data[data.startIndex + offset + 1])
+func sctpReadUInt16(_ data: [UInt8], offset: Int) -> UInt16 {
+    UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
 }
 
-func readUInt32(_ data: Data, offset: Int) -> UInt32 {
-    UInt32(data[data.startIndex + offset]) << 24 |
-    UInt32(data[data.startIndex + offset + 1]) << 16 |
-    UInt32(data[data.startIndex + offset + 2]) << 8 |
-    UInt32(data[data.startIndex + offset + 3])
+func sctpReadUInt32(_ data: [UInt8], offset: Int) -> UInt32 {
+    UInt32(data[offset]) << 24 |
+    UInt32(data[offset + 1]) << 16 |
+    UInt32(data[offset + 2]) << 8 |
+    UInt32(data[offset + 3])
 }

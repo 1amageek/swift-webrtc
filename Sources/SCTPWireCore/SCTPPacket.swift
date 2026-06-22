@@ -2,9 +2,12 @@
 ///
 /// SCTP common header and chunk format for SCTP-over-DTLS.
 
-import Foundation
+import P2PCoreBytes
 
-/// SCTP packet header (12 bytes)
+/// SCTP packet header (12 bytes).
+///
+/// The Embedded-clean core encodes/decodes over `[UInt8]`. The `SCTPCore`
+/// adapter adds the `Data`-based `encode()->Data`/`decode(from:Data)` surface.
 public struct SCTPPacket: Sendable {
     /// Source port
     public let sourcePort: UInt16
@@ -35,8 +38,9 @@ public struct SCTPPacket: Sendable {
     }
 
     /// Encode the SCTP packet
-    public func encode() -> Data {
-        var data = Data(capacity: 12)
+    public func encodeBytes() -> [UInt8] {
+        var data = [UInt8]()
+        data.reserveCapacity(12)
 
         data.append(UInt8(sourcePort >> 8))
         data.append(UInt8(sourcePort & 0xFF))
@@ -55,11 +59,11 @@ public struct SCTPPacket: Sendable {
 
         // Encode chunks
         for chunk in chunks {
-            data.append(chunk.encode())
+            data.append(contentsOf: chunk.encodeBytes())
         }
 
         // Compute CRC-32C checksum
-        // Checksum field is already zeroed (from line 54), so compute directly
+        // Checksum field is already zeroed, so compute directly
         let crc = crc32c(data)
         data[checksumOffset] = UInt8(crc & 0xFF)
         data[checksumOffset + 1] = UInt8((crc >> 8) & 0xFF)
@@ -72,10 +76,10 @@ public struct SCTPPacket: Sendable {
     /// Decode an SCTP packet
     /// - Parameter data: Raw packet data
     /// - Parameter validateChecksum: Whether to validate CRC-32C checksum (default: true)
-    /// - Throws: SCTPError if packet is malformed or checksum is invalid
-    public static func decode(from data: Data, validateChecksum: Bool = true) throws -> SCTPPacket {
+    /// - Throws: SCTPWireError if packet is malformed or checksum is invalid
+    public static func decode(from data: [UInt8], validateChecksum: Bool = true) throws(SCTPWireError) -> SCTPPacket {
         guard data.count >= 12 else {
-            throw SCTPError.insufficientData(expected: 12, actual: data.count)
+            throw .decode(.insufficientData(expected: 12, actual: data.count))
         }
 
         let sourcePort = UInt16(data[0]) << 8 | UInt16(data[1])
@@ -94,11 +98,11 @@ public struct SCTPPacket: Sendable {
             let computedChecksum = crc32cWithZeroedChecksum(data)
 
             guard receivedChecksum == computedChecksum else {
-                throw SCTPError.checksumMismatch(expected: computedChecksum, actual: receivedChecksum)
+                throw .decode(.checksumMismatch(expected: computedChecksum, actual: receivedChecksum))
             }
         }
 
-        // Parse chunks (use offset-based decode to avoid Data copies)
+        // Parse chunks (use offset-based decode to avoid copies)
         var offset = 12
         var chunks: [SCTPChunk] = []
         while offset + 4 <= data.count {
@@ -106,11 +110,10 @@ public struct SCTPPacket: Sendable {
             chunks.append(chunk)
             // SCTPChunk.decode rejects length < 4, so paddedLength is always
             // >= 4. Re-assert the loop's progress invariant locally so this
-            // loop can never spin without consuming bytes, regardless of how
-            // the chunk was constructed.
+            // loop can never spin without consuming bytes.
             let paddedLength = (Int(chunk.length) + 3) & ~3
             guard paddedLength >= 4 else {
-                throw SCTPError.invalidFormat("Chunk padded length \(paddedLength) does not advance parser")
+                throw .decode(.invalidFormat("Chunk padded length \(paddedLength) does not advance parser"))
             }
             offset += paddedLength
         }
@@ -124,25 +127,22 @@ public struct SCTPPacket: Sendable {
     }
 }
 
-/// CRC-32C implementation for SCTP checksum using slicing-by-4
-func crc32c(_ data: Data) -> UInt32 {
-    data.withUnsafeBytes { buffer in
-        guard let baseAddress = buffer.baseAddress else {
-            return 0
-        }
-        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
-        return crc32cCore(ptr: ptr, count: buffer.count)
+// MARK: - CRC-32C (RFC 3309 / Castagnoli), slicing-by-8
+
+/// CRC-32C over a byte buffer.
+public func crc32c(_ data: [UInt8]) -> UInt32 {
+    data.withUnsafeBufferPointer { buffer in
+        guard let baseAddress = buffer.baseAddress else { return 0 }
+        return crc32cCore(ptr: baseAddress, count: buffer.count)
     }
 }
 
-/// CRC-32C with checksum field (bytes 8-11) treated as zeros
-/// Avoids copying the entire packet just to zero out 4 bytes
-func crc32cWithZeroedChecksum(_ data: Data) -> UInt32 {
-    data.withUnsafeBytes { buffer in
-        guard let baseAddress = buffer.baseAddress else {
-            return 0
-        }
-        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
+/// CRC-32C with checksum field (bytes 8-11) treated as zeros.
+///
+/// Avoids copying the entire packet just to zero out 4 bytes.
+func crc32cWithZeroedChecksum(_ data: [UInt8]) -> UInt32 {
+    data.withUnsafeBufferPointer { buffer in
+        guard let ptr = buffer.baseAddress else { return 0 }
         let count = buffer.count
 
         guard count >= 12 else {
@@ -183,23 +183,23 @@ func crc32cWithZeroedChecksum(_ data: Data) -> UInt32 {
         // Process remaining bytes (12 to end) using slicing-by-8
         var i = 12
         while i + 8 <= count {
-            let word0 = crc ^
+            let w0 = crc ^
                        (UInt32(ptr[i]) |
                         (UInt32(ptr[i + 1]) << 8) |
                         (UInt32(ptr[i + 2]) << 16) |
                         (UInt32(ptr[i + 3]) << 24))
-            let word1 = UInt32(ptr[i + 4]) |
+            let w1 = UInt32(ptr[i + 4]) |
                         (UInt32(ptr[i + 5]) << 8) |
                         (UInt32(ptr[i + 6]) << 16) |
                         (UInt32(ptr[i + 7]) << 24)
-            crc = crc32cTable7[Int(word0 & 0xFF)] ^
-                  crc32cTable6[Int((word0 >> 8) & 0xFF)] ^
-                  crc32cTable5[Int((word0 >> 16) & 0xFF)] ^
-                  crc32cTable4[Int((word0 >> 24) & 0xFF)] ^
-                  crc32cTable3[Int(word1 & 0xFF)] ^
-                  crc32cTable2[Int((word1 >> 8) & 0xFF)] ^
-                  crc32cTable1[Int((word1 >> 16) & 0xFF)] ^
-                  crc32cTable0[Int((word1 >> 24) & 0xFF)]
+            crc = crc32cTable7[Int(w0 & 0xFF)] ^
+                  crc32cTable6[Int((w0 >> 8) & 0xFF)] ^
+                  crc32cTable5[Int((w0 >> 16) & 0xFF)] ^
+                  crc32cTable4[Int((w0 >> 24) & 0xFF)] ^
+                  crc32cTable3[Int(w1 & 0xFF)] ^
+                  crc32cTable2[Int((w1 >> 8) & 0xFF)] ^
+                  crc32cTable1[Int((w1 >> 16) & 0xFF)] ^
+                  crc32cTable0[Int((w1 >> 24) & 0xFF)]
             i += 8
         }
 
@@ -228,8 +228,7 @@ func crc32cWithZeroedChecksum(_ data: Data) -> UInt32 {
     }
 }
 
-/// Core CRC-32C computation using slicing-by-8
-@inline(__always)
+/// Core CRC-32C computation using slicing-by-8.
 private func crc32cCore(ptr: UnsafePointer<UInt8>, count: Int) -> UInt32 {
     var crc: UInt32 = 0xFFFFFFFF
     var i = 0
@@ -283,7 +282,7 @@ private func crc32cCore(ptr: UnsafePointer<UInt8>, count: Int) -> UInt32 {
     return crc ^ 0xFFFFFFFF
 }
 
-/// Generate CRC-32C slicing tables (8 tables for slicing-by-8 algorithm)
+/// Generate CRC-32C slicing tables (8 tables for slicing-by-8 algorithm).
 private let (crc32cTable0, crc32cTable1, crc32cTable2, crc32cTable3,
              crc32cTable4, crc32cTable5, crc32cTable6, crc32cTable7):
     ([UInt32], [UInt32], [UInt32], [UInt32], [UInt32], [UInt32], [UInt32], [UInt32]) = {
@@ -324,22 +323,3 @@ private let (crc32cTable0, crc32cTable1, crc32cTable2, crc32cTable3,
 
     return (table0, table1, table2, table3, table4, table5, table6, table7)
 }()
-
-/// SCTP errors
-public enum SCTPError: Error, Sendable {
-    case insufficientData(expected: Int, actual: Int)
-    case invalidFormat(String)
-    case associationFailed(String)
-    case streamReset(String)
-    case timeout
-    case checksumMismatch(expected: UInt32, actual: UInt32)
-    case cookieValidationFailed
-    case cookieExpired
-    case maxRetransmitsExceeded
-    case verificationTagMismatch(expected: UInt32, actual: UInt32)
-    case associationAborted
-    case invalidState(String)
-    case receiveBufferExceeded(streamID: UInt16)
-    case invalidStreamIdentifier(streamID: UInt16, negotiated: UInt16)
-    case sendQueueFull(bytesInFlight: Int, limit: Int)
-}
