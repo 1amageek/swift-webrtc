@@ -15,7 +15,7 @@ let package = Package(
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.2.0"),
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
     ],

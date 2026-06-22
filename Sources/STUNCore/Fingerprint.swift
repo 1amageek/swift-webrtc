@@ -27,7 +27,10 @@ public enum STUNFingerprint: Sendable {
     /// Verify FINGERPRINT in a STUN message
     /// - Parameter message: The complete STUN message bytes
     /// - Returns: True if fingerprint check passes
-    public static func verify(message: Data) -> Bool {
+    public static func verify(message input: Data) -> Bool {
+        // Normalize to a zero-based buffer: the offsets below are absolute and
+        // would trap/misparse on a Data slice.
+        let message = input.startIndex == 0 ? input : Data(input)
         guard message.count >= stunHeaderSize + stunAttributeHeaderSize + 4 else {
             return false
         }

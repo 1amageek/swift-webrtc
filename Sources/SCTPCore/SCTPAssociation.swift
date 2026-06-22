@@ -27,6 +27,15 @@ public final class SCTPAssociation: Sendable {
     /// Secret key for cookie HMAC (generated once per association)
     private let cookieSecretKey: Data
 
+    /// Maximum number of inbound streams this endpoint is willing to accept.
+    /// Advertised in INIT/INIT-ACK and used to bound the negotiated inbound
+    /// stream count. DATA for a stream ID at or above the negotiated count is
+    /// rejected (RFC 4960 §3.3.2 / §6.5).
+    private let localMaxInboundStreams: UInt16
+
+    /// Maximum number of outbound streams this endpoint will open.
+    private let localMaxOutboundStreams: UInt16
+
     private struct AssocState: Sendable {
         var state: SCTPAssociationState = .closed
         var localPort: UInt16
@@ -54,17 +63,28 @@ public final class SCTPAssociation: Sendable {
 
         // Retransmission queue
         var retransmissionQueue: RetransmissionQueue = RetransmissionQueue()
+
+        // Consumed COOKIE-ECHO cache (RFC 4960 §5.1.5): maps a consumed
+        // cookie's HMAC to the system-uptime millisecond timestamp at which it
+        // was consumed, so a captured valid COOKIE-ECHO cannot be replayed for
+        // the remainder of the cookie's validity window.
+        var consumedCookies: [Data: UInt64] = [:]
     }
 
     public init(
         localPort: UInt16 = 5000,
-        remotePort: UInt16 = 5000
+        remotePort: UInt16 = 5000,
+        maxInboundStreams: UInt16 = 65535,
+        maxOutboundStreams: UInt16 = 65535
     ) {
         // RFC 4960 §3.3.2: the initiate tag must not be 0
         let tag = SCTPSecureRandom.uint32NonZero()
         let initialTSN = SCTPSecureRandom.uint32()
         let secretKey = SCTPSecureRandom.data(count: 32)
         self.cookieSecretKey = secretKey
+        // RFC 4960 §3.3.2: at least one stream in each direction.
+        self.localMaxInboundStreams = max(1, maxInboundStreams)
+        self.localMaxOutboundStreams = max(1, maxOutboundStreams)
 
         self.assocState = Mutex(AssocState(
             localPort: localPort,
@@ -88,8 +108,8 @@ public final class SCTPAssociation: Sendable {
 
         let initChunk = SCTPInitChunk(
             initiateTag: tag,
-            numberOfOutboundStreams: 65535,
-            numberOfInboundStreams: 65535,
+            numberOfOutboundStreams: localMaxOutboundStreams,
+            numberOfInboundStreams: localMaxInboundStreams,
             initialTSN: tsn
         )
 
@@ -154,6 +174,15 @@ public final class SCTPAssociation: Sendable {
                 let assembled = try assocState.withLock { s -> [AssembledMessage] in
                     guard var tracker = s.tsnTracker else {
                         throw SCTPError.invalidState("DATA chunk received before TSN tracking was initialized")
+                    }
+                    // RFC 4960 §6.5: a DATA chunk for a stream ID beyond the
+                    // negotiated inbound stream count is invalid. Reject it
+                    // instead of letting per-stream maps grow for all 65535 IDs.
+                    guard dataChunk.streamIdentifier < s.negotiatedInboundStreams else {
+                        throw SCTPError.invalidStreamIdentifier(
+                            streamID: dataChunk.streamIdentifier,
+                            negotiated: s.negotiatedInboundStreams
+                        )
                     }
                     let isNew = tracker.receive(tsn: dataChunk.tsn)
                     s.tsnTracker = tracker
@@ -240,60 +269,70 @@ public final class SCTPAssociation: Sendable {
             return
         }
 
-        // RFC 4960 §8.5.1 (B): an ABORT sent in response to an unexpected
-        // packet reflects the sender's own tag (T-bit semantics)
-        let containsAbort = packet.chunks.contains { $0.chunkType == SCTPChunkType.abort.rawValue }
-        if containsAbort && packet.verificationTag == remoteTag {
-            return
-        }
-
+        // A legitimate peer that wants to abort an established association sends
+        // the ABORT carrying OUR local verification tag (handled above), which
+        // it learned during the handshake. We deliberately do NOT accept an
+        // ABORT bearing the peer's own (remote) verification tag: that tag
+        // travels in cleartext on every packet, so an off-path attacker who can
+        // observe one datagram could otherwise forge a reflected-tag ABORT and
+        // tear down the association (RFC 4960 §8.5.1 reflected-tag ABORTs are
+        // only meaningful for out-of-the-blue packets, not for destroying a
+        // live association). Origin authenticity for in-association control is
+        // provided by the verified DTLS layer beneath SCTP.
+        _ = remoteTag
         throw SCTPError.verificationTagMismatch(expected: localTag, actual: packet.verificationTag)
     }
 
     /// Send data on a stream
+    /// - Throws: `SCTPError.sendQueueFull` when the retransmission queue's
+    ///   send-window ceiling is reached (backpressure); the caller must retry
+    ///   later rather than dropping data. The TSN/stream sequence are only
+    ///   advanced once the chunk is successfully enqueued, so a rejected send
+    ///   leaves no gap in the sequence space.
     public func sendData(
         streamID: UInt16,
         payloadProtocolIdentifier: UInt32,
         data: Data,
         unordered: Bool = false
-    ) -> SCTPPacket {
-        let (localPort, remotePort, remoteTag, tsn, seqNum) = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, UInt16) in
+    ) throws -> SCTPPacket {
+        return try assocState.withLock { s -> SCTPPacket in
             let tsn = s.nextTSN
-            s.nextTSN = s.nextTSN &+ 1
             let seqNum = s.nextStreamSeqNumber[streamID, default: 0]
+
+            let dataChunk = SCTPDataChunk(
+                tsn: tsn,
+                streamIdentifier: streamID,
+                streamSequenceNumber: seqNum,
+                payloadProtocolIdentifier: payloadProtocolIdentifier,
+                userData: data,
+                unordered: unordered
+            )
+
+            // Enqueue first; only advance the sequence space if it is admitted,
+            // so backpressure never burns a TSN or stream sequence number.
+            try s.retransmissionQueue.enqueue(dataChunk)
+
+            s.nextTSN = s.nextTSN &+ 1
             if !unordered {
                 s.nextStreamSeqNumber[streamID] = seqNum &+ 1
             }
-            return (s.localPort, s.remotePort, s.remoteVerificationTag, tsn, seqNum)
+
+            return SCTPPacket(
+                sourcePort: s.localPort,
+                destinationPort: s.remotePort,
+                verificationTag: s.remoteVerificationTag,
+                chunks: [dataChunk.toChunk()]
+            )
         }
-
-        let dataChunk = SCTPDataChunk(
-            tsn: tsn,
-            streamIdentifier: streamID,
-            streamSequenceNumber: seqNum,
-            payloadProtocolIdentifier: payloadProtocolIdentifier,
-            userData: data,
-            unordered: unordered
-        )
-
-        // Add to retransmission queue
-        assocState.withLock { s in
-            s.retransmissionQueue.enqueue(dataChunk)
-        }
-
-        return SCTPPacket(
-            sourcePort: localPort,
-            destinationPort: remotePort,
-            verificationTag: remoteTag,
-            chunks: [dataChunk.toChunk()]
-        )
     }
 
     /// Get pending retransmissions
+    /// - Parameter now: Current time; injectable for deterministic testing of
+    ///   timer-driven retransmission and abort behavior.
     /// - Returns: Packets to retransmit, or error if max retransmits exceeded
-    public func getPendingRetransmissions() -> Result<[SCTPPacket], SCTPError> {
+    public func getPendingRetransmissions(now: ContinuousClock.Instant = .now) -> Result<[SCTPPacket], SCTPError> {
         assocState.withLock { s in
-            switch s.retransmissionQueue.pendingRetransmissions() {
+            switch s.retransmissionQueue.pendingRetransmissions(now: now) {
             case .success(let chunks):
                 guard !chunks.isEmpty else { return .success([]) }
                 let packets = chunks.map { chunk in
@@ -306,6 +345,11 @@ public final class SCTPAssociation: Sendable {
                 }
                 return .success(packets)
             case .failure:
+                // RFC 4960 §8.2: exceeding 'Association.Max.Retrans' for a DATA
+                // chunk destroys the association. Transition to closed so the
+                // association cannot continue to be used after the peer is
+                // considered unreachable.
+                s.state = .closed
                 return .failure(.maxRetransmitsExceeded)
             }
         }
@@ -320,35 +364,55 @@ public final class SCTPAssociation: Sendable {
 
     private func handleInit(_ initChunk: SCTPInitChunk, sourcePort: UInt16) -> SCTPPacket {
         let (localPort, remotePort, localTag, localTSN, cookie) = assocState.withLock { s -> (UInt16, UInt16, UInt32, UInt32, SCTPCookie) in
-            s.remoteVerificationTag = initChunk.initiateTag
-            s.remotePort = sourcePort
-            s.peerInitialTSN = initChunk.initialTSN
-            s.peerARWC = initChunk.advertisedReceiverWindowCredit
-            s.negotiatedOutboundStreams = min(65535, initChunk.numberOfInboundStreams)
-            s.negotiatedInboundStreams = min(65535, initChunk.numberOfOutboundStreams)
+            // RFC 4960 §5.2.1/§5.2.2: an INIT received while the association is
+            // not CLOSED must NOT tear down or mutate the live association. We
+            // reply with an INIT-ACK carrying a fresh cookie that encodes the
+            // peer's *new* parameters, but defer committing them until a valid
+            // COOKIE-ECHO for that cookie arrives (handled in handleCookieEcho).
+            // This prevents a spoofed/duplicate INIT from resetting TSN tracking
+            // and verification tags on an established association.
+            let isCold = (s.state == .closed)
 
-            // Initialize TSN tracker with peer's initial TSN
-            s.tsnTracker = TSNTracker(initialTSN: initChunk.initialTSN)
+            // Negotiate stream counts as a true minimum of our local maxima and
+            // the peer's request (RFC 4960 §5.1.1):
+            //  - outbound (we send) = min(our OS, peer's MIS)
+            //  - inbound  (we recv) = min(our MIS, peer's OS)
+            let negotiatedOutbound = min(localMaxOutboundStreams, initChunk.numberOfInboundStreams)
+            let negotiatedInbound = min(localMaxInboundStreams, initChunk.numberOfOutboundStreams)
 
-            // Generate secure cookie (P0.1)
+            if isCold {
+                s.remoteVerificationTag = initChunk.initiateTag
+                s.remotePort = sourcePort
+                s.peerInitialTSN = initChunk.initialTSN
+                s.peerARWC = initChunk.advertisedReceiverWindowCredit
+                s.negotiatedOutboundStreams = negotiatedOutbound
+                s.negotiatedInboundStreams = negotiatedInbound
+
+                // Initialize TSN tracker with peer's initial TSN
+                s.tsnTracker = TSNTracker(initialTSN: initChunk.initialTSN)
+            }
+
+            // Generate secure cookie (P0.1) encoding the peer's parameters from
+            // THIS INIT. The cookie — not live state — is the source of truth
+            // that handleCookieEcho commits.
             let cookie = SCTPCookie.generate(
                 secretKey: cookieSecretKey,
                 peerTag: initChunk.initiateTag,
                 localTag: s.localVerificationTag,
                 peerInitialTSN: initChunk.initialTSN,
                 peerARWC: initChunk.advertisedReceiverWindowCredit,
-                outboundStreams: s.negotiatedOutboundStreams,
-                inboundStreams: s.negotiatedInboundStreams
+                outboundStreams: negotiatedOutbound,
+                inboundStreams: negotiatedInbound
             )
 
-            return (s.localPort, s.remotePort, s.localVerificationTag, s.nextTSN, cookie)
+            return (s.localPort, sourcePort, s.localVerificationTag, s.nextTSN, cookie)
         }
 
-        // Build INIT-ACK with cookie
+        // Build INIT-ACK with cookie, advertising our local stream maxima.
         let initAck = SCTPInitChunk(
             initiateTag: localTag,
-            numberOfOutboundStreams: 65535,
-            numberOfInboundStreams: 65535,
+            numberOfOutboundStreams: localMaxOutboundStreams,
+            numberOfInboundStreams: localMaxInboundStreams,
             initialTSN: localTSN
         )
 
@@ -402,8 +466,20 @@ public final class SCTPAssociation: Sendable {
                 break
             }
 
-            // Move to next parameter (padded to 4 bytes)
-            offset += (paramLength + 3) & ~3
+            // RFC 4960 §3.2.1: the top two bits of an unrecognized parameter
+            // type select the action. We don't recognize any non-cookie
+            // parameter here, so honor a stop-action (00/01) by halting the
+            // scan; skip-actions (10/11) fall through to the advance below.
+            switch paramType >> 14 {
+            case 0b00, 0b01:
+                // Stop parameter processing. The cookie (if absent) is caught
+                // by the guard after the loop, surfacing a typed error rather
+                // than silently continuing.
+                offset = value.count
+            default:
+                // Move to next parameter (padded to 4 bytes)
+                offset += (paramLength + 3) & ~3
+            }
         }
 
         guard let cookie = cookieData else {
@@ -414,8 +490,8 @@ public final class SCTPAssociation: Sendable {
             s.remoteVerificationTag = initAck.initiateTag
             s.peerInitialTSN = initAck.initialTSN
             s.peerARWC = initAck.advertisedReceiverWindowCredit
-            s.negotiatedOutboundStreams = min(65535, initAck.numberOfInboundStreams)
-            s.negotiatedInboundStreams = min(65535, initAck.numberOfOutboundStreams)
+            s.negotiatedOutboundStreams = min(localMaxOutboundStreams, initAck.numberOfInboundStreams)
+            s.negotiatedInboundStreams = min(localMaxInboundStreams, initAck.numberOfOutboundStreams)
             s.receivedCookie = cookie
             s.tsnTracker = TSNTracker(initialTSN: initAck.initialTSN)
             s.state = .cookieEchoed
@@ -440,15 +516,36 @@ public final class SCTPAssociation: Sendable {
     }
 
     private func handleCookieEcho(_ chunk: SCTPChunk) throws -> SCTPPacket {
-        // Validate cookie
+        // Validate cookie (HMAC + expiry)
         let cookie = try SCTPCookie.decode(from: chunk.value)
 
         guard cookie.validate(secretKey: cookieSecretKey) else {
             throw SCTPError.cookieValidationFailed
         }
 
-        // Restore association state from cookie
-        let (localPort, remotePort, remoteTag) = assocState.withLock { s -> (UInt16, UInt16, UInt32) in
+        // RFC 4960 §5.1.5: reject a replayed COOKIE-ECHO. A captured valid
+        // cookie is otherwise replayable for the whole validity window, which
+        // would let an attacker re-establish / reset the association. The
+        // cookie's HMAC (which includes the creation timestamp) uniquely
+        // identifies it, so consuming it once is sufficient.
+        let (localPort, remotePort, remoteTag) = try assocState.withLock { s -> (UInt16, UInt16, UInt32) in
+            // Evict consumed-cookie entries older than the cookie validity
+            // window so the cache cannot grow without bound.
+            let now = SCTPCookie.nowMilliseconds()
+            let maxAgeMillis = UInt64(SCTPCookie.defaultMaxAge * 1000)
+            s.consumedCookies = s.consumedCookies.filter { _, consumedAt in
+                now >= consumedAt && (now - consumedAt) <= maxAgeMillis
+            }
+
+            if s.consumedCookies[cookie.hmac] != nil {
+                throw SCTPError.cookieValidationFailed
+            }
+            s.consumedCookies[cookie.hmac] = now
+
+            // Commit the peer parameters carried by the validated cookie. This
+            // is the only path that mutates TSN tracking / verification tags
+            // for an inbound peer — handleInit no longer does so for a live
+            // association (RFC 4960 §5.2).
             s.remoteVerificationTag = cookie.peerTag
             s.peerInitialTSN = cookie.peerInitialTSN
             s.peerARWC = cookie.peerARWC

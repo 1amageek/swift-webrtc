@@ -284,12 +284,12 @@ struct SCTPBenchmarks {
     // MARK: - Retransmission Queue
 
     @Test("Benchmark: Retransmission queue enqueue/ack")
-    func benchmarkRetransmissionQueue() {
+    func benchmarkRetransmissionQueue() throws {
         var queue = RetransmissionQueue()
         let clock = ContinuousClock()
         let data = Data(repeating: 0x42, count: 1000)
 
-        let result = benchmark("RetransmissionQueue", iterations: 5000) {
+        let result = try benchmark("RetransmissionQueue", iterations: 5000) {
             // Enqueue 10 chunks
             for i: UInt32 in 0..<10 {
                 let chunk = SCTPDataChunk(
@@ -299,7 +299,7 @@ struct SCTPBenchmarks {
                     payloadProtocolIdentifier: 51,
                     userData: data
                 )
-                queue.enqueue(chunk, sentTime: clock.now)
+                try queue.enqueue(chunk, sentTime: clock.now)
             }
 
             // Acknowledge all

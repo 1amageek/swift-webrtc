@@ -130,6 +130,51 @@ struct STUNMessageTests {
         #expect(id1.bytes.count == 12)
     }
 
+    // MARK: - Finding 4: decode from a sliced Data (non-zero startIndex)
+
+    @Test("decode works on a Data slice with non-zero startIndex")
+    func decodeFromSlicedData() throws {
+        let msg = STUNMessage.bindingRequest(username: "user:remote", priority: 100)
+        let encoded = msg.encode()
+
+        // Prepend a byte and drop it, producing a slice whose startIndex == 1.
+        var prefixed = Data([0xEE])
+        prefixed.append(encoded)
+        let slice = prefixed.dropFirst()
+        #expect(slice.startIndex == 1)
+
+        let decoded = try STUNMessage.decode(from: slice)
+        #expect(decoded.messageType == .bindingRequest)
+        #expect(decoded.transactionID == msg.transactionID)
+        #expect(decoded.attribute(ofType: .username) != nil)
+        #expect(decoded.attribute(ofType: .priority) != nil)
+    }
+
+    @Test("isSTUN works on a Data slice with non-zero startIndex")
+    func isSTUNOnSlicedData() {
+        let encoded = STUNMessage(messageType: .bindingRequest).encode()
+        var prefixed = Data([0xEE])
+        prefixed.append(encoded)
+        let slice = prefixed.dropFirst()
+        #expect(slice.startIndex == 1)
+        #expect(STUNMessage.isSTUN(slice))
+    }
+
+    @Test("MESSAGE-INTEGRITY verifies on a sliced Data")
+    func integrityVerifiesOnSlicedData() {
+        let key = Data("supersecretpassword12345".utf8)
+        let encoded = STUNMessage.bindingRequest(username: "user:remote")
+            .encodeWithIntegrity(key: key)
+
+        var prefixed = Data([0xAA, 0xBB])
+        prefixed.append(encoded)
+        let slice = prefixed.dropFirst(2)
+        #expect(slice.startIndex == 2)
+
+        #expect(MessageIntegrity.verifyWithResult(message: slice, key: key) == .valid)
+        #expect(STUNFingerprint.verify(message: slice))
+    }
+
     @Test("Attribute padding")
     func attributePadding() throws {
         // Username with odd length should be padded

@@ -92,4 +92,51 @@ struct ICELiteTests {
         let result = agent.processSTUN(data: data, sourceAddress: Data([0, 0, 0, 0]), sourcePort: 0)
         #expect(result == nil)
     }
+
+    // MARK: - Finding 12: remote ufrag is asserted when known
+
+    @Test("Binding request with the wrong remote ufrag is rejected")
+    func wrongRemoteUfragRejected() throws {
+        let agent = ICELiteAgent()
+        let remoteUfrag = "knownRemote"
+        let remotePassword = "remotePassword456789012345"
+        agent.setRemoteCredentials(ufrag: remoteUfrag, password: remotePassword)
+
+        let key = agent.credentials.stunKey
+        // USERNAME = "<peerUfragWeExpectAsRemote>:<ourLocalUfrag>". The sender
+        // here uses the WRONG remote half ("wrongRemote") but the correct local
+        // half — must be rejected once the remote ufrag is known.
+        let username = "wrongRemote:\(agent.credentials.localUfrag)"
+        let msg = STUNMessage.bindingRequest(username: username, iceControlling: 1)
+        let encoded = msg.encodeWithIntegrity(key: key)
+
+        let response = agent.processSTUN(
+            data: encoded, sourceAddress: Data([192, 168, 1, 1]), sourcePort: 5000)
+
+        // An error response is returned (not a success), and the peer is not
+        // validated.
+        let errorResp = try #require(response)
+        let decoded = try STUNMessage.decode(from: errorResp)
+        #expect(decoded.messageType == .bindingErrorResponse)
+        #expect(!agent.isPeerValidated(address: Data([192, 168, 1, 1]), port: 5000))
+    }
+
+    @Test("Binding request with the correct remote ufrag is accepted")
+    func correctRemoteUfragAccepted() throws {
+        let agent = ICELiteAgent()
+        let remoteUfrag = "knownRemote"
+        agent.setRemoteCredentials(ufrag: remoteUfrag, password: "remotePassword456789012345")
+
+        let key = agent.credentials.stunKey
+        let username = "\(remoteUfrag):\(agent.credentials.localUfrag)"
+        let msg = STUNMessage.bindingRequest(username: username, iceControlling: 1)
+        let encoded = msg.encodeWithIntegrity(key: key)
+
+        let response = agent.processSTUN(
+            data: encoded, sourceAddress: Data([192, 168, 1, 2]), sourcePort: 6000)
+        let resp = try #require(response)
+        let decoded = try STUNMessage.decode(from: resp)
+        #expect(decoded.messageType == .bindingSuccessResponse)
+        #expect(agent.isPeerValidated(address: Data([192, 168, 1, 2]), port: 6000))
+    }
 }

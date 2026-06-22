@@ -62,12 +62,13 @@ struct DataChannelBenchmarks {
     // MARK: - Channel Manager
 
     @Test("Benchmark: Channel open")
-    func benchmarkChannelOpen() {
-        let manager = DataChannelManager(isInitiator: true)
+    func benchmarkChannelOpen() throws {
+        // Allow enough stream IDs for warmup + measured iterations.
+        let manager = DataChannelManager(isInitiator: true, maxChannels: .max)
 
         var i = 0
-        let result = benchmark("DataChannelManager.openChannel", iterations: 10000) {
-            _ = manager.openChannel(label: "channel-\(i)")
+        let result = try benchmark("DataChannelManager.openChannel", iterations: 10000) {
+            _ = try manager.openChannel(label: "channel-\(i)")
             i += 1
         }
         print(result)
@@ -75,10 +76,17 @@ struct DataChannelBenchmarks {
 
     @Test("Benchmark: Process incoming DCEP")
     func benchmarkProcessDCEP() throws {
-        let manager = DataChannelManager(isInitiator: false)
+        // Raise resource caps high enough for the measured iteration count
+        // since this benchmark never drains pendingIncoming.
+        let manager = DataChannelManager(
+            isInitiator: false,
+            maxChannels: .max,
+            maxPendingIncoming: .max
+        )
         let open = DCEPOpen(channelType: .reliable, label: "test")
         let encoded = open.encode()
 
+        // Incoming OPENs must use even stream IDs (responder opens odd).
         var streamID: UInt16 = 0
         let result = try benchmark("DataChannelManager.processIncomingDCEP", iterations: 10000) {
             _ = try manager.processIncomingDCEP(streamID: streamID, data: encoded)
@@ -88,12 +96,12 @@ struct DataChannelBenchmarks {
     }
 
     @Test("Benchmark: Channel lookup")
-    func benchmarkChannelLookup() {
+    func benchmarkChannelLookup() throws {
         let manager = DataChannelManager(isInitiator: true)
 
         // Create 100 channels
         for i in 0..<100 {
-            _ = manager.openChannel(label: "channel-\(i)")
+            _ = try manager.openChannel(label: "channel-\(i)")
         }
 
         let result = benchmark("DataChannelManager.channel(id:)", iterations: 100000) {

@@ -124,6 +124,53 @@ struct SCTPPacketTests {
         #expect(!tampered.validate(secretKey: secretKey))
     }
 
+    // MARK: - Finding 1: zero-length chunk must not loop / OOM
+
+    @Test("Zero-length chunk is rejected by SCTPChunk.decode")
+    func zeroLengthChunkRejected() {
+        // type=0, flags=0, length=0
+        let bytes = Data([0x00, 0x00, 0x00, 0x00])
+        #expect(throws: SCTPError.self) {
+            _ = try SCTPChunk.decode(from: bytes)
+        }
+    }
+
+    @Test("Packet with a zero-length chunk terminates without hanging")
+    func zeroLengthChunkInPacketTerminates() {
+        // 12-byte SCTP common header + 4-byte zero-length chunk = 16 bytes.
+        // Verification tag 0 so this isn't rejected as an INIT mismatch first.
+        var packet = Data()
+        packet.append(contentsOf: [0x13, 0x88, 0x13, 0x88]) // ports
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // verification tag
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // checksum placeholder
+        packet.append(contentsOf: [0x00, 0x00, 0x00, 0x00]) // chunk: type/flags/len=0
+
+        // Must throw (malformed) rather than loop forever building chunks.
+        #expect(throws: SCTPError.self) {
+            _ = try SCTPPacket.decode(from: packet, validateChecksum: false)
+        }
+    }
+
+    // MARK: - Finding 14: CRC-32C is mandatory in the default decode path
+
+    @Test("Default decode rejects a packet with a corrupt CRC-32C")
+    func decodeRejectsBadChecksum() throws {
+        let chunk = SCTPChunk(chunkType: SCTPChunkType.cookieAck.rawValue, value: Data())
+        let packet = SCTPPacket(
+            sourcePort: 5000, destinationPort: 5000,
+            verificationTag: 0xABCD1234, chunks: [chunk])
+        var encoded = packet.encode()
+
+        // Flip a payload bit AFTER the checksum field so the stored CRC no
+        // longer matches. The default decode path must reject it.
+        let flipIndex = encoded.startIndex + 12
+        encoded[flipIndex] ^= 0xFF
+
+        #expect(throws: SCTPError.self) {
+            _ = try SCTPPacket.decode(from: encoded)
+        }
+    }
+
     @Test("SCTP cookie rejects future timestamp")
     func sctpCookieRejectsFutureTimestamp() throws {
         let secretKey = Data("01234567890123456789012345678901".utf8)

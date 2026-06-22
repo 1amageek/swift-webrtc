@@ -245,6 +245,13 @@ public struct SCTPCookie: Sendable, Equatable {
         return Data(mac)
     }
 
+    /// Current monotonic timestamp in milliseconds, on the same clock used for
+    /// cookie creation/validation. Exposed so the association's consumed-cookie
+    /// cache evicts entries on the identical time base.
+    public static func nowMilliseconds() -> UInt64 {
+        currentTimestampMilliseconds()
+    }
+
     private static func currentTimestampMilliseconds() -> UInt64 {
         UInt64(ProcessInfo.processInfo.systemUptime * 1000)
     }

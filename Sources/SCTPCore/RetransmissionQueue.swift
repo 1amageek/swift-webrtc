@@ -52,6 +52,11 @@ public struct RetransmissionQueue: Sendable {
     /// Maximum retransmissions before failure
     private let maxRetransmit: Int = 10
 
+    /// Hard ceiling on bytes held in the retransmission queue. Sends are
+    /// refused (typed backpressure) once this is reached so a peer that never
+    /// SACKs cannot make the queue grow without bound.
+    private let maxBytesInFlight: Int = 1 * 1024 * 1024 // 1 MiB
+
     /// Smoothed round-trip time
     private var srtt: Duration?
 
@@ -78,14 +83,28 @@ public struct RetransmissionQueue: Sendable {
         self.ssthresh = 65535
     }
 
-    /// Add a chunk to the retransmission queue
+    /// Add a chunk to the retransmission queue, enforcing the send-window cap.
     /// - Parameters:
     ///   - chunk: The DATA chunk to track
     ///   - sentTime: When the chunk was sent
-    public mutating func enqueue(_ chunk: SCTPDataChunk, sentTime: ContinuousClock.Instant = .now) {
+    /// - Throws: `SCTPError.sendQueueFull` when admitting this chunk would push
+    ///   the bytes-in-flight past `maxBytesInFlight` (backpressure). A chunk
+    ///   already present (same TSN) is treated as a re-send and never rejected.
+    public mutating func enqueue(_ chunk: SCTPDataChunk, sentTime: ContinuousClock.Instant = .now) throws {
+        // Re-enqueueing an already-tracked TSN must not double-count bytes.
+        if pending[chunk.tsn] != nil {
+            pending[chunk.tsn] = PendingChunk(dataChunk: chunk, sentTime: sentTime)
+            return
+        }
+
+        let (projected, overflow) = bytesInFlight.addingReportingOverflow(chunk.userData.count)
+        guard !overflow, projected <= maxBytesInFlight else {
+            throw SCTPError.sendQueueFull(bytesInFlight: bytesInFlight, limit: maxBytesInFlight)
+        }
+
         let pendingChunk = PendingChunk(dataChunk: chunk, sentTime: sentTime)
         pending[chunk.tsn] = pendingChunk
-        bytesInFlight += chunk.userData.count
+        bytesInFlight = projected
 
         if let highest = highestSentTSN {
             if TSNTracker.isLessThan(highest, chunk.tsn) {
@@ -116,7 +135,12 @@ public struct RetransmissionQueue: Sendable {
 
         for tsn in toRemove {
             if let chunk = pending.removeValue(forKey: tsn) {
-                bytesInFlight -= chunk.dataChunk.userData.count
+                // Guard against underflow: only ever subtract bytes we are
+                // certain are still counted. removeValue guarantees each chunk
+                // is accounted once, but clamp defensively so a logic error or
+                // crafted SACK can never wrap bytesInFlight to a huge value.
+                let (remaining, overflow) = bytesInFlight.subtractingReportingOverflow(chunk.dataChunk.userData.count)
+                bytesInFlight = overflow ? 0 : max(0, remaining)
                 acknowledged = true
 
                 // Update RTT if this was the first transmission
@@ -177,11 +201,14 @@ public struct RetransmissionQueue: Sendable {
     /// - Parameter now: Current time
     /// - Returns: Chunks to retransmit, or nil if max retransmits exceeded
     public mutating func pendingRetransmissions(now: ContinuousClock.Instant = .now) -> Result<[SCTPDataChunk], RetransmissionError> {
-        var toRetransmit: [SCTPDataChunk] = []
+        // 1. Identify candidates (RTO expired or fast-retransmit marked)
+        //    without mutating yet. If any candidate has already hit the
+        //    retransmit ceiling, the association must abort (RFC 4960 §8.2).
+        var candidateTSNs: [UInt32] = []
         var timerExpired = false
         var fastRetransmit = false
 
-        for (tsn, var chunk) in pending {
+        for (tsn, chunk) in pending {
             let elapsed = now - chunk.lastSentTime
             let rtoExpired = elapsed >= rto
 
@@ -189,40 +216,59 @@ public struct RetransmissionQueue: Sendable {
                 if chunk.retransmitCount >= maxRetransmit {
                     return .failure(.maxRetransmitsExceeded(tsn: tsn))
                 }
-
                 if rtoExpired {
                     timerExpired = true
                 } else {
                     fastRetransmit = true
                 }
-
-                chunk.retransmitCount += 1
-                chunk.lastSentTime = now
-                chunk.markedForRetransmit = false
-                chunk.missIndications = 0
-                pending[tsn] = chunk
-
-                toRetransmit.append(chunk.dataChunk)
+                candidateTSNs.append(tsn)
             }
         }
 
-        // Apply backoff and congestion response once per timeout event,
-        // not once per expired chunk (RFC 4960 §6.3.3 E2, §7.2.3).
+        // 2. Apply backoff and congestion response once per event, not once per
+        //    expired chunk (RFC 4960 §6.3.3 E2, §7.2.3, §7.2.4). This runs
+        //    before burst selection so the (possibly collapsed) cwnd bounds it.
         if timerExpired {
             rto = min(rto * 2, maxRTO)
             ssthresh = max(cwnd / 2, 4 * 1460)
             cwnd = 1460
         } else if fastRetransmit {
-            // Fast retransmit halves the window without collapsing to one MTU
-            // and does not back off the RTO (RFC 4960 §7.2.4).
             ssthresh = max(cwnd / 2, 4 * 1460)
             cwnd = ssthresh
         }
 
-        // Sort by TSN for proper ordering
-        toRetransmit.sort { TSNTracker.isLessThan($0.tsn, $1.tsn) }
+        guard !candidateTSNs.isEmpty else { return .success([]) }
 
-        return .success(toRetransmit)
+        // Retransmit in TSN order (oldest first)
+        candidateTSNs.sort { TSNTracker.isLessThan($0, $1) }
+
+        // 3. Select up to cwnd bytes (always at least one chunk so the lowest
+        //    outstanding TSN makes forward progress even when cwnd < chunk
+        //    size), and mutate ONLY the chunks actually retransmitted. Chunks
+        //    deferred for budget reasons keep their old lastSentTime so the
+        //    next tick re-selects them immediately rather than after a full RTO.
+        var burst: [SCTPDataChunk] = []
+        var budget = 0
+        for tsn in candidateTSNs {
+            guard var chunk = pending[tsn] else { continue }
+            let size = chunk.dataChunk.userData.count
+            if !burst.isEmpty {
+                let (next, overflow) = budget.addingReportingOverflow(size)
+                if overflow || next > cwnd { break }
+                budget = next
+            } else {
+                budget = size
+            }
+
+            chunk.retransmitCount += 1
+            chunk.lastSentTime = now
+            chunk.markedForRetransmit = false
+            chunk.missIndications = 0
+            pending[tsn] = chunk
+            burst.append(chunk.dataChunk)
+        }
+
+        return .success(burst)
     }
 
     /// Mark a chunk for fast retransmit (3 duplicate SACKs)

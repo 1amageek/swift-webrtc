@@ -13,6 +13,7 @@ public enum ICEValidationError: Error, Sendable {
     case missingUsername
     case invalidUsernameFormat
     case localUfragMismatch
+    case remoteUfragMismatch
     case missingMessageIntegrity
     case invalidMessageIntegrity
     case fingerprintVerificationFailed
@@ -78,13 +79,17 @@ public final class ICELiteAgent: Sendable {
             return nil
         }
 
-        let (key, localUfrag) = agentState.withLock { s in
-            (s.credentials.stunKey, s.credentials.localUfrag)
+        let (key, localUfrag, remoteUfrag) = agentState.withLock { s in
+            (s.credentials.stunKey, s.credentials.localUfrag, s.credentials.remoteUfrag)
         }
 
         // P0.3: Validate USERNAME attribute
         do {
-            try validateUsername(message: message, expectedLocalUfrag: localUfrag)
+            try validateUsername(
+                message: message,
+                expectedLocalUfrag: localUfrag,
+                expectedRemoteUfrag: remoteUfrag
+            )
         } catch let error as ICEValidationError {
             return buildErrorResponse(
                 transactionID: message.transactionID,
@@ -179,7 +184,11 @@ public final class ICELiteAgent: Sendable {
 
     // MARK: - Private validation helpers
 
-    private func validateUsername(message: STUNMessage, expectedLocalUfrag: String) throws {
+    private func validateUsername(
+        message: STUNMessage,
+        expectedLocalUfrag: String,
+        expectedRemoteUfrag: String?
+    ) throws {
         // P0.3: USERNAME is required for connectivity checks
         guard let usernameAttr = message.attribute(ofType: .username) else {
             throw ICEValidationError.missingUsername
@@ -189,10 +198,10 @@ public final class ICELiteAgent: Sendable {
             throw ICEValidationError.invalidUsernameFormat
         }
 
-        // RFC 8445: USERNAME format is "remoteUfrag:localUfrag"
-        // From our perspective as the receiving server:
-        // - The first part is the remote peer's ufrag (which we may have set via SDP)
-        // - The second part must match our localUfrag
+        // RFC 8445: the sender builds USERNAME as "<peer's ufrag>:<own ufrag>".
+        // From our (receiving server) perspective the message carries
+        // "<ourUfrag>:<peerUfrag>": the FIRST part must match our localUfrag,
+        // the SECOND part is the peer's (remote) ufrag.
         let parts = username.split(separator: ":", maxSplits: 1)
         guard parts.count == 2 else {
             throw ICEValidationError.invalidUsernameFormat
@@ -201,6 +210,16 @@ public final class ICELiteAgent: Sendable {
         let receivedLocalUfrag = String(parts[1])
         guard receivedLocalUfrag == expectedLocalUfrag else {
             throw ICEValidationError.localUfragMismatch
+        }
+
+        // When the peer's ufrag is known from signaling, assert the other half
+        // too instead of accepting any value. Without this, only our own half
+        // was validated, allowing a check from an unrelated peer to pass.
+        if let expectedRemoteUfrag {
+            let receivedRemoteUfrag = String(parts[0])
+            guard receivedRemoteUfrag == expectedRemoteUfrag else {
+                throw ICEValidationError.remoteUfragMismatch
+            }
         }
     }
 
@@ -216,6 +235,8 @@ public final class ICELiteAgent: Sendable {
             (STUNErrorCode.badRequest.rawValue, "Invalid USERNAME format")
         case .localUfragMismatch:
             (STUNErrorCode.unauthorized.rawValue, "USERNAME mismatch")
+        case .remoteUfragMismatch:
+            (STUNErrorCode.unauthorized.rawValue, "Remote ufrag mismatch")
         case .missingMessageIntegrity:
             (STUNErrorCode.unauthorized.rawValue, "Missing MESSAGE-INTEGRITY")
         case .invalidMessageIntegrity:

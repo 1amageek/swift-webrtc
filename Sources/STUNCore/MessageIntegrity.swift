@@ -35,7 +35,10 @@ public enum MessageIntegrity: Sendable {
     ///   - message: The complete STUN message bytes
     ///   - key: The HMAC key
     /// - Returns: IntegrityResult indicating valid, invalid, or missing
-    public static func verifyWithResult(message: Data, key: Data) -> IntegrityResult {
+    public static func verifyWithResult(message input: Data, key: Data) -> IntegrityResult {
+        // Normalize to a zero-based buffer: the scan below uses absolute
+        // offsets and would trap/misparse on a Data slice.
+        let message = input.startIndex == 0 ? input : Data(input)
         guard message.count >= stunHeaderSize else { return .missing }
 
         // Find MESSAGE-INTEGRITY attribute

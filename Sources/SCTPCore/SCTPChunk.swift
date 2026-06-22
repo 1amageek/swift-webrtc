@@ -77,6 +77,14 @@ public struct SCTPChunk: Sendable {
         let flags = data[base + 1]
         let length = UInt16(data[base + 2]) << 8 | UInt16(data[base + 3])
 
+        // RFC 4960 §3.2: the Chunk Length includes the 4-byte chunk header, so
+        // it must be at least 4. A declared length below 4 is malformed and, if
+        // accepted, would cause the packet-level chunk loop to never advance
+        // (padded length 0) — an unbounded loop / OOM on a single packet.
+        guard length >= 4 else {
+            throw SCTPError.invalidFormat("Chunk length \(length) below minimum of 4")
+        }
+
         guard data.count >= offset + Int(length) else {
             throw SCTPError.insufficientData(expected: offset + Int(length), actual: data.count)
         }

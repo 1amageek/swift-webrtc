@@ -74,6 +74,15 @@ public struct FragmentAssembler: Sendable {
     /// Hard cap on buffered out-of-order messages per stream
     private let maxBufferedMessagesPerStream: Int = 1024
 
+    /// Hard ceiling on total payload bytes held across `pendingFragments`
+    /// and `orderedBuffer`. Without this a peer can exhaust memory by sending
+    /// many large incomplete fragments or out-of-order messages while staying
+    /// under the per-group and per-stream count caps.
+    private let maxBufferedBytes: Int
+
+    /// Default reassembly/reorder byte ceiling (16 MiB)
+    public static let defaultMaxBufferedBytes: Int = 16 * 1024 * 1024
+
     /// Maximum age for fragments (in terms of TSN distance)
     private let maxFragmentAge: UInt32 = 65535
 
@@ -82,6 +91,16 @@ public struct FragmentAssembler: Sendable {
         self.unorderedKeyIndex = [:]
         self.expectedSequence = [:]
         self.orderedBuffer = [:]
+        self.maxBufferedBytes = Self.defaultMaxBufferedBytes
+    }
+
+    /// Configurable initializer (primarily for tests exercising the byte cap).
+    init(maxBufferedBytes: Int) {
+        self.pendingFragments = [:]
+        self.unorderedKeyIndex = [:]
+        self.expectedSequence = [:]
+        self.orderedBuffer = [:]
+        self.maxBufferedBytes = maxBufferedBytes
     }
 
     /// Process a DATA chunk and return any complete messages
@@ -143,6 +162,15 @@ public struct FragmentAssembler: Sendable {
         // opens unbounded incomplete fragment groups is violating flow control.
         if pendingFragments[key] == nil && pendingFragments.count >= maxPendingFragments {
             if isUnordered {
+                unorderedKeyIndex.removeValue(forKey: indexKey)
+            }
+            throw SCTPError.receiveBufferExceeded(streamID: chunk.streamIdentifier)
+        }
+
+        // Enforce the total byte ceiling before admitting this fragment's
+        // payload. Surface the overflow rather than silently dropping data.
+        guard bufferedBytes + chunk.userData.count <= maxBufferedBytes else {
+            if isUnordered && pendingFragments[key] == nil {
                 unorderedKeyIndex.removeValue(forKey: indexKey)
             }
             throw SCTPError.receiveBufferExceeded(streamID: chunk.streamIdentifier)
@@ -241,6 +269,10 @@ public struct FragmentAssembler: Sendable {
             // Out of order - buffer for later
             var streamBuffer = orderedBuffer[streamID] ?? [:]
             guard streamBuffer.count < maxBufferedMessagesPerStream else {
+                throw SCTPError.receiveBufferExceeded(streamID: streamID)
+            }
+            // Enforce the total byte ceiling before buffering this message.
+            guard bufferedBytes + message.data.count <= maxBufferedBytes else {
                 throw SCTPError.receiveBufferExceeded(streamID: streamID)
             }
             streamBuffer[seqNum] = message

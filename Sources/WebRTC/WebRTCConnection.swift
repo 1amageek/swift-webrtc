@@ -117,16 +117,28 @@ public final class WebRTCConnection: Sendable {
         )
     }
 
-    /// Create a server-side connection
+    /// Create a server-side connection.
+    ///
+    /// The server always requires the client to present a certificate and prove
+    /// possession of its private key (mutual DTLS authentication). The verified
+    /// remote certificate's fingerprint is available via `remoteFingerprint` after
+    /// the handshake so an upper layer (e.g. libp2p WebRTC Direct) can bind it to
+    /// the peer identity.
+    ///
+    /// - Parameter remoteFingerprint: When the dialer's certificate fingerprint is
+    ///   known ahead of time (e.g. from signaling / a `/certhash` multiaddr), pass it
+    ///   to have the handshake fail on mismatch. Pass `nil` when the identity is bound
+    ///   by a subsequent layer instead.
     public static func asServer(
         certificate: DTLSCertificate,
+        remoteFingerprint expectedFingerprint: CertificateFingerprint? = nil,
         sendHandler: @escaping SendHandler,
         logger: Logger = Logger(label: "webrtc.connection")
     ) -> WebRTCConnection {
         WebRTCConnection(
             certificate: certificate,
             isClient: false,
-            expectedFingerprint: nil,
+            expectedFingerprint: expectedFingerprint,
             sendHandler: sendHandler,
             logger: logger
         )
@@ -140,7 +152,14 @@ public final class WebRTCConnection: Sendable {
         logger: Logger
     ) {
         self.localFingerprint = certificate.fingerprint
-        self.dtlsConnection = DTLSConnection(certificate: certificate)
+        // The DTLS server (this endpoint when !isClient) MUST require the client to
+        // present a certificate and prove possession of its private key. Otherwise an
+        // attacker could complete the handshake presenting a victim's (public) WebRTC
+        // certificate without holding its key — full inbound peer impersonation.
+        self.dtlsConnection = DTLSConnection(
+            certificate: certificate,
+            requireClientCertificate: !isClient
+        )
         self.expectedFingerprint = expectedFingerprint
         self.sendHandler = sendHandler
         self.logger = logger
@@ -292,8 +311,8 @@ public final class WebRTCConnection: Sendable {
             guard state.stateMachine.isConnected else {
                 throw WebRTCError.invalidState("Cannot open data channel in state \(state.stateMachine.state)")
             }
-            let (channel, dcepData) = state.channelManager.openChannel(label: label, ordered: ordered)
-            let sctpPacket = state.sctpAssociation.sendData(
+            let (channel, dcepData) = try state.channelManager.openChannel(label: label, ordered: ordered)
+            let sctpPacket = try state.sctpAssociation.sendData(
                 streamID: channel.id,
                 payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
                 data: dcepData
@@ -323,7 +342,7 @@ public final class WebRTCConnection: Sendable {
             guard state.stateMachine.isConnected else {
                 throw WebRTCError.invalidState("Cannot send data in state \(state.stateMachine.state)")
             }
-            return state.sctpAssociation.sendData(
+            return try state.sctpAssociation.sendData(
                 streamID: channelID,
                 payloadProtocolIdentifier: ppid,
                 data: data
@@ -543,8 +562,8 @@ public final class WebRTCConnection: Sendable {
                     try state.channelManager.processIncomingDCEP(streamID: streamID, data: payload)
                 }
                 if let response {
-                    let sctpPacket = connState.withLock { state in
-                        state.sctpAssociation.sendData(
+                    let sctpPacket = try connState.withLock { state in
+                        try state.sctpAssociation.sendData(
                             streamID: streamID,
                             payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
                             data: response

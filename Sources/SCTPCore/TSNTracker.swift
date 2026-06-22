@@ -13,8 +13,11 @@ public struct TSNTracker: Sendable {
     /// Cumulative TSN acknowledgment (highest contiguous TSN received)
     private(set) public var cumulativeTSN: UInt32
 
-    /// TSNs received above cumulative (for gap blocks)
-    private var receivedAboveCumulative: Set<UInt32>
+    /// TSNs received above cumulative, kept sorted in serial-number order
+    /// relative to `cumulativeTSN`. Maintaining sorted insertion order avoids
+    /// re-sorting the whole structure on every SACK and bounds the work per
+    /// SACK to a single linear scan of the (capped) entries.
+    private var receivedAboveCumulative: [UInt32]
 
     /// Recently received duplicate TSNs
     private var duplicates: [UInt32]
@@ -24,6 +27,13 @@ public struct TSNTracker: Sendable {
 
     /// Maximum gap tracking window size
     private let windowSize: UInt32 = 65535
+
+    /// Hard cap on sparse out-of-order TSNs held above the cumulative ack.
+    /// RFC 4960 places no protocol limit here, but an unbounded set lets a peer
+    /// that withholds one TSN force us to retain tens of thousands of entries.
+    /// Beyond the cap we stop admitting new out-of-order TSNs (they will be
+    /// retransmitted by the peer once the gap is filled).
+    private let maxOutOfOrderTSNs: Int = 512
 
     /// Initialize with the peer's initial TSN
     /// - Parameter initialTSN: The initial TSN from INIT/INIT-ACK (first expected TSN)
@@ -52,7 +62,7 @@ public struct TSNTracker: Sendable {
         }
 
         // Check if already received above cumulative
-        if receivedAboveCumulative.contains(tsn) {
+        if let pos = sortedIndex(of: tsn), pos.found {
             addDuplicate(tsn)
             return false
         }
@@ -62,14 +72,23 @@ public struct TSNTracker: Sendable {
             // Advance cumulative
             cumulativeTSN = tsn
 
-            // Check if we can advance further with buffered TSNs
-            while receivedAboveCumulative.contains(cumulativeTSN &+ 1) {
-                receivedAboveCumulative.remove(cumulativeTSN &+ 1)
+            // Check if we can advance further with the buffered TSNs at the
+            // front of the sorted array (they start just above cumulative).
+            while let next = receivedAboveCumulative.first, next == cumulativeTSN &+ 1 {
+                receivedAboveCumulative.removeFirst()
                 cumulativeTSN = cumulativeTSN &+ 1
             }
         } else {
-            // Out of order - buffer it
-            receivedAboveCumulative.insert(tsn)
+            // Out of order — buffer it, subject to the cap. Surfacing an error
+            // here would be wrong (a gap is normal), so we drop the new entry;
+            // the peer retransmits it once the gap is filled.
+            guard receivedAboveCumulative.count < maxOutOfOrderTSNs else {
+                return false
+            }
+            guard let pos = sortedIndex(of: tsn) else {
+                return false
+            }
+            receivedAboveCumulative.insert(tsn, at: pos.index)
         }
 
         return true
@@ -78,30 +97,23 @@ public struct TSNTracker: Sendable {
     /// Get gap ack blocks for SACK.
     /// Gap blocks are offsets from cumulative TSN.
     ///
-    /// Computed on demand. SACKs are generated once per received packet,
-    /// and any new TSN changes the gap structure, so caching across calls
-    /// can never hit — computing directly is both simpler and faster.
+    /// Computed on demand from the already-sorted out-of-order list, so no
+    /// per-SACK re-sort is needed. SACKs are generated once per received
+    /// packet, and any new TSN changes the gap structure, so caching across
+    /// calls can never hit.
     public var gapBlocks: [(start: UInt16, end: UInt16)] {
         computeGapBlocks()
     }
 
-    /// Compute gap blocks from scratch
+    /// Compute gap blocks from the maintained sorted list (no re-sort).
     private func computeGapBlocks() -> [(start: UInt16, end: UInt16)] {
         guard !receivedAboveCumulative.isEmpty else { return [] }
-
-        // Sort received TSNs
-        let sorted = receivedAboveCumulative.sorted { a, b in
-            // Use signed comparison for TSN wrap-around
-            let diffA = Int32(bitPattern: a &- cumulativeTSN)
-            let diffB = Int32(bitPattern: b &- cumulativeTSN)
-            return diffA < diffB
-        }
 
         var blocks: [(start: UInt16, end: UInt16)] = []
         var currentStart: UInt32?
         var currentEnd: UInt32?
 
-        for tsn in sorted {
+        for tsn in receivedAboveCumulative {
             let offset = tsn &- cumulativeTSN
             guard offset > 0 && offset <= UInt32(UInt16.max) else { continue }
 
@@ -136,6 +148,31 @@ public struct TSNTracker: Sendable {
         }
 
         return blocks
+    }
+
+    /// Binary-search `receivedAboveCumulative` for `tsn` using serial-number
+    /// ordering relative to `cumulativeTSN`.
+    /// - Returns: the insertion index and whether an exact match was found,
+    ///   or nil if `tsn` is not above the cumulative ack (caller treats this
+    ///   as out of window).
+    private func sortedIndex(of tsn: UInt32) -> (index: Int, found: Bool)? {
+        let target = tsn &- cumulativeTSN
+        guard target > 0 else { return nil }
+
+        var low = 0
+        var high = receivedAboveCumulative.count
+        while low < high {
+            let mid = (low + high) / 2
+            let midOffset = receivedAboveCumulative[mid] &- cumulativeTSN
+            if midOffset == target {
+                return (mid, true)
+            } else if midOffset < target {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return (low, false)
     }
 
     /// Get and clear duplicate TSNs for SACK

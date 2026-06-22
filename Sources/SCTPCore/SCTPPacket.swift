@@ -104,7 +104,14 @@ public struct SCTPPacket: Sendable {
         while offset + 4 <= data.count {
             let chunk = try SCTPChunk.decode(from: data, at: offset)
             chunks.append(chunk)
+            // SCTPChunk.decode rejects length < 4, so paddedLength is always
+            // >= 4. Re-assert the loop's progress invariant locally so this
+            // loop can never spin without consuming bytes, regardless of how
+            // the chunk was constructed.
             let paddedLength = (Int(chunk.length) + 3) & ~3
+            guard paddedLength >= 4 else {
+                throw SCTPError.invalidFormat("Chunk padded length \(paddedLength) does not advance parser")
+            }
             offset += paddedLength
         }
 
@@ -333,4 +340,6 @@ public enum SCTPError: Error, Sendable {
     case associationAborted
     case invalidState(String)
     case receiveBufferExceeded(streamID: UInt16)
+    case invalidStreamIdentifier(streamID: UInt16, negotiated: UInt16)
+    case sendQueueFull(bytesInFlight: Int, limit: Int)
 }

@@ -149,7 +149,9 @@ public struct STUNMessage: Sendable {
     /// Check if this is a STUN message (first two bits are 0)
     public static func isSTUN(_ data: Data) -> Bool {
         guard data.count >= stunHeaderSize else { return false }
-        return data[0] & 0xC0 == 0
+        // Index relative to startIndex: the caller may pass a Data slice
+        // (non-zero startIndex), and `data[0]` would otherwise trap or misread.
+        return data[data.startIndex] & 0xC0 == 0
     }
 
     // MARK: - Encoding
@@ -265,7 +267,12 @@ public struct STUNMessage: Sendable {
     // MARK: - Decoding
 
     /// Decode a STUN message from wire format
-    public static func decode(from data: Data) throws -> STUNMessage {
+    public static func decode(from input: Data) throws -> STUNMessage {
+        // Normalize to a zero-based buffer: the body below indexes with
+        // absolute offsets (`data[0]`, `data[8..<20]`, attribute loop), which
+        // would trap or misparse on a Data slice whose startIndex != 0.
+        let data = input.startIndex == 0 ? input : Data(input)
+
         guard data.count >= stunHeaderSize else {
             throw STUNError.insufficientData(expected: stunHeaderSize, actual: data.count)
         }
