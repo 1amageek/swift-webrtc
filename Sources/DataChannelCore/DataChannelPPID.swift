@@ -2,8 +2,6 @@
 ///
 /// PPID values for SCTP DATA chunks in WebRTC context.
 
-import Foundation
-
 /// Payload Protocol Identifiers for WebRTC Data Channels
 public enum DataChannelPPID: UInt32, Sendable {
     /// WebRTC DCEP (Data Channel Establishment Protocol)

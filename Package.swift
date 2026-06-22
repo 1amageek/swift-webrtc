@@ -26,6 +26,7 @@ let package = Package(
         .library(name: "STUNCore", targets: ["STUNCore"]),
         .library(name: "ICELite", targets: ["ICELite"]),
         .library(name: "SCTPCore", targets: ["SCTPCore"]),
+        .library(name: "DataChannelCore", targets: ["DataChannelCore"]),
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
@@ -65,9 +66,19 @@ let package = Package(
             ],
             path: "Sources/SCTPCore"
         ),
+        // ---- Embedded-clean DCEP wire codec (dual-build: host + Embedded) ----
+        .target(
+            name: "DataChannelCore",
+            dependencies: [
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
+            path: "Sources/DataChannelCore",
+            swiftSettings: coreSettings
+        ),
+        // ---- Foundation adapter: keeps the existing Data-based DCEP API ----
         .target(
             name: "DataChannel",
-            dependencies: ["SCTPCore"],
+            dependencies: ["SCTPCore", "DataChannelCore"],
             path: "Sources/DataChannel"
         ),
         .target(

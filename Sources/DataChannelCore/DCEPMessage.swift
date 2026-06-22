@@ -2,7 +2,7 @@
 ///
 /// DCEP messages for opening data channels over SCTP.
 
-import Foundation
+import P2PCoreBytes
 
 /// DCEP message type
 public enum DCEPMessageType: UInt8, Sendable {
@@ -20,7 +20,33 @@ public enum DCEPChannelType: UInt8, Sendable {
     case partialReliableTimedUnordered = 0x82
 }
 
-/// DCEP DATA_CHANNEL_OPEN message
+/// Strictly validate a UTF-8 byte sequence, returning `nil` on any malformed
+/// scalar.
+///
+/// `String(decoding:as:)` lossily substitutes U+FFFD for invalid input, which
+/// would silently accept malformed labels. RFC 8832 requires labels/protocols
+/// to be valid UTF-8, so this validates explicitly and rejects on error.
+func validatedUTF8String(_ bytes: [UInt8]) -> String? {
+    var decoder = Unicode.UTF8()
+    var iterator = bytes.makeIterator()
+    var scalars = String.UnicodeScalarView()
+    decodeLoop: while true {
+        switch decoder.decode(&iterator) {
+        case .scalarValue(let scalar):
+            scalars.append(scalar)
+        case .emptyInput:
+            break decodeLoop
+        case .error:
+            return nil
+        }
+    }
+    return String(scalars)
+}
+
+/// DCEP DATA_CHANNEL_OPEN message.
+///
+/// The Embedded-clean core encodes/decodes over `[UInt8]`. The `DataChannel`
+/// adapter restores the `Data`-based `encode()`/`decode(from:Data)` surface.
 public struct DCEPOpen: Sendable {
     public let channelType: DCEPChannelType
     public let priority: UInt16
@@ -43,11 +69,12 @@ public struct DCEPOpen: Sendable {
     }
 
     /// Encode to wire format
-    public func encode() -> Data {
-        let labelData = Data(label.utf8)
-        let protocolData = Data(protocol_.utf8)
+    public func encodeBytes() -> [UInt8] {
+        let labelData = Array(label.utf8)
+        let protocolData = Array(protocol_.utf8)
 
-        var data = Data(capacity: 12 + labelData.count + protocolData.count)
+        var data = [UInt8]()
+        data.reserveCapacity(12 + labelData.count + protocolData.count)
         data.append(DCEPMessageType.dataChannelOpen.rawValue)
         data.append(channelType.rawValue)
         data.append(UInt8(priority >> 8))
@@ -65,25 +92,25 @@ public struct DCEPOpen: Sendable {
         data.append(UInt8(protoLen >> 8))
         data.append(UInt8(protoLen & 0xFF))
 
-        data.append(labelData)
-        data.append(protocolData)
+        data.append(contentsOf: labelData)
+        data.append(contentsOf: protocolData)
 
         return data
     }
 
     /// Decode from wire format
-    public static func decode(from data: Data) throws -> DCEPOpen {
+    public static func decode(from data: [UInt8]) throws(DataChannelWireError) -> DCEPOpen {
         guard data.count >= 12 else {
-            throw DataChannelError.invalidFormat("DCEP Open too short")
+            throw .decode(.invalidFormat("DCEP Open too short"))
         }
         guard data[0] == DCEPMessageType.dataChannelOpen.rawValue else {
-            throw DataChannelError.invalidFormat("Not a DCEP Open message")
+            throw .decode(.invalidFormat("Not a DCEP Open message"))
         }
 
         // RFC 8832 §5.1: unknown channel types must not be silently coerced —
         // accepting one as "reliable" would change delivery semantics
         guard let channelType = DCEPChannelType(rawValue: data[1]) else {
-            throw DataChannelError.invalidFormat("Unknown DCEP channel type: \(data[1])")
+            throw .decode(.invalidFormat("Unknown DCEP channel type: \(data[1])"))
         }
         let priority = UInt16(data[2]) << 8 | UInt16(data[3])
         let reliability = UInt32(data[4]) << 24 | UInt32(data[5]) << 16 | UInt32(data[6]) << 8 | UInt32(data[7])
@@ -91,15 +118,15 @@ public struct DCEPOpen: Sendable {
         let protoLen = Int(UInt16(data[10]) << 8 | UInt16(data[11]))
 
         guard data.count >= 12 + labelLen + protoLen else {
-            throw DataChannelError.invalidFormat("DCEP Open data too short for label/protocol")
+            throw .decode(.invalidFormat("DCEP Open data too short for label/protocol"))
         }
 
         // RFC 8832: Label and protocol MUST be valid UTF-8
-        guard let label = String(data: Data(data[12..<12 + labelLen]), encoding: .utf8) else {
-            throw DataChannelError.invalidFormat("Label is not valid UTF-8")
+        guard let label = validatedUTF8String(Array(data[12..<12 + labelLen])) else {
+            throw .decode(.invalidFormat("Label is not valid UTF-8"))
         }
-        guard let proto = String(data: Data(data[12 + labelLen..<12 + labelLen + protoLen]), encoding: .utf8) else {
-            throw DataChannelError.invalidFormat("Protocol is not valid UTF-8")
+        guard let proto = validatedUTF8String(Array(data[12 + labelLen..<12 + labelLen + protoLen])) else {
+            throw .decode(.invalidFormat("Protocol is not valid UTF-8"))
         }
 
         return DCEPOpen(
@@ -112,36 +139,18 @@ public struct DCEPOpen: Sendable {
     }
 }
 
-/// DCEP DATA_CHANNEL_ACK message
+/// DCEP DATA_CHANNEL_ACK message.
 public struct DCEPAck: Sendable {
     public init() {}
 
-    public func encode() -> Data {
-        Data([DCEPMessageType.dataChannelAck.rawValue])
+    public func encodeBytes() -> [UInt8] {
+        [DCEPMessageType.dataChannelAck.rawValue]
     }
 
-    public static func decode(from data: Data) throws -> DCEPAck {
+    public static func decode(from data: [UInt8]) throws(DataChannelWireError) -> DCEPAck {
         guard data.count >= 1, data[0] == DCEPMessageType.dataChannelAck.rawValue else {
-            throw DataChannelError.invalidFormat("Not a DCEP Ack message")
+            throw .decode(.invalidFormat("Not a DCEP Ack message"))
         }
         return DCEPAck()
     }
-}
-
-/// Data channel errors
-public enum DataChannelError: Error, Sendable {
-    case invalidFormat(String)
-    case channelClosed
-    case notReady
-    /// A DATA_CHANNEL_ACK arrived on a stream with no channel awaiting an ACK
-    case unexpectedAck(streamID: UInt16)
-    /// An incoming OPEN used a stream ID whose parity is reserved for the local
-    /// side (RFC 8832 §6 even/odd partitioning)
-    case streamParityViolation(streamID: UInt16)
-    /// Too many channels open / pending (resource exhaustion guard)
-    case tooManyChannels(limit: Int)
-    /// Label or protocol field exceeds the configured maximum length
-    case labelOrProtocolTooLong(limit: Int)
-    /// No more usable stream IDs of the local parity remain
-    case streamIDsExhausted
 }
