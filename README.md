@@ -11,13 +11,13 @@ UDP → STUN / ICE Lite → DTLS 1.2 → SCTP → Data Channels
 ## Requirements
 
 - Swift 6.2+
-- macOS 15+ / iOS 18+ / tvOS 18+ / watchOS 11+ / visionOS 2+
+- macOS 26+ / iOS 26+ / tvOS 26+ / watchOS 26+ / visionOS 26+
 
 ## Installation
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "0.0.1"),
+    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "1.5.0"),
 ]
 ```
 
@@ -30,7 +30,7 @@ The library is split into independent modules:
 | **STUNCore** | STUN message encoding/decoding, MESSAGE-INTEGRITY, FINGERPRINT | [RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389) |
 | **ICELite** | ICE Lite agent for server-side connectivity checks | [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445) |
 | **SCTPCore** | SCTP association, chunk encoding/decoding, stream management | [RFC 4960](https://datatracker.ietf.org/doc/html/rfc4960) |
-| **DataChannel** | Data channel lifecycle, DCEP (open/ack) messages | [RFC 8831](https://datatracker.ietf.org/doc/html/rfc8831) |
+| **DataChannel** | Data channel lifecycle, DCEP (open/ack) messages | [RFC 8831](https://datatracker.ietf.org/doc/html/rfc8831), [RFC 8832](https://datatracker.ietf.org/doc/html/rfc8832) |
 | **WebRTC** | Top-level API integrating all layers | — |
 
 DTLS is provided by [swift-tls](https://github.com/1amageek/swift-tls).
@@ -65,23 +65,58 @@ try connection.send(payload, on: channel.id)
 
 ### Server
 
+The listener accepts connections as the transport feeds incoming datagrams
+(`listener.acceptConnection(peerID:sendHandler:)` starts each connection's DTLS
+handshake). Consume accepted connections from the `connections` stream:
+
 ```swift
 let listener = try endpoint.listen()
 
 for await connection in listener.connections {
-    try connection.start()
-
-    for await channel in connection.incomingChannels {
-        print("Channel opened: \(channel.label)")
+    // Handle each connection concurrently so the accept loop keeps running.
+    Task {
+        for await channel in connection.incomingChannels {
+            print("Channel opened: \(channel.label)")
+        }
+        // The verified remote certificate fingerprint is available after the
+        // mutual DTLS handshake completes.
+        if let remote = connection.remoteFingerprint {
+            print("Authenticated peer: \(remote.sdpFormat)")
+        }
     }
 }
 ```
+
+> The server **requires** the client to present a certificate and prove
+> possession of its private key (mutual DTLS authentication). Pass a known
+> dialer fingerprint to `WebRTCConnection.asServer(certificate:remoteFingerprint:sendHandler:logger:)`
+> to fail the handshake on mismatch, or read the verified `remoteFingerprint` /
+> `remoteCertificateDER` afterwards to bind the peer identity in an upper layer.
 
 ## Design
 
 - **Transport-agnostic** — Callers provide a `SendHandler` closure and feed incoming bytes via `receive(_:)`. This allows integration with any UDP transport.
 - **Sendable** — All public types conform to `Sendable`. Thread safety is achieved using `Mutex<T>`.
 - **Modular** — Each protocol layer is a standalone library that can be used independently.
+
+## Security
+
+- **Mutual DTLS authentication** — The server requires the client to present a
+  certificate and prove possession of its private key, preventing inbound peer
+  impersonation. The verified remote fingerprint is exposed via
+  `remoteFingerprint` / `remoteCertificateDER` after the handshake.
+- **SCTP hardening** — Zero-length-chunk DoS is rejected (the chunk parser
+  always advances), reassembly and out-of-order buffers are byte-bounded,
+  COOKIE-ECHO replay is rejected, the negotiated inbound stream count is
+  enforced, retransmissions are bounded (the association aborts after the
+  maximum), and spoofed / reflected-tag ABORTs are discarded per RFC 4960 §8.5.
+- **STUN parsing** — Decoding and `isSTUN()` are safe for sliced `Data` (a
+  non-zero `startIndex` no longer traps or misreads).
+- **Throwing APIs** — Operations that can fail surface errors explicitly:
+  `SCTPAssociation.sendData` throws on send-queue backpressure, and DataChannel
+  `openChannel` throws on stream-ID exhaustion / resource caps. DCEP handling
+  rejects stray ACKs, parity violations, and idempotently re-ACKs duplicate
+  OPENs.
 
 ## Benchmarks
 
