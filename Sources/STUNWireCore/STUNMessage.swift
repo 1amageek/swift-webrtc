@@ -13,7 +13,7 @@
 ///  |                                                               |
 ///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-import Foundation
+import P2PCoreBytes
 
 /// STUN message type (method + class encoded in 14 bits)
 public struct STUNMessageType: Sendable, Equatable, Hashable {
@@ -62,7 +62,11 @@ public struct STUNMessageType: Sendable, Equatable, Hashable {
     public static let bindingIndication = STUNMessageType(method: .binding, class: .indication)
 }
 
-/// A STUN message
+/// A STUN message.
+///
+/// The Embedded-clean core encodes/decodes over `[UInt8]`/`P2PCoreBytes`. The
+/// `STUNCore` adapter restores the `Data`-based public surface, the
+/// crypto-backed `encodeWithIntegrity`, and the defaulted convenience inits.
 public struct STUNMessage: Sendable {
     /// Message type
     public let messageType: STUNMessageType
@@ -75,7 +79,7 @@ public struct STUNMessage: Sendable {
 
     public init(
         messageType: STUNMessageType,
-        transactionID: TransactionID = .random(),
+        transactionID: TransactionID,
         attributes: [STUNAttribute] = []
     ) {
         self.messageType = messageType
@@ -83,42 +87,10 @@ public struct STUNMessage: Sendable {
         self.attributes = attributes
     }
 
-    /// Create a Binding Request
-    public static func bindingRequest(
-        username: String? = nil,
-        priority: UInt32? = nil,
-        useCandidate: Bool = false,
-        iceControlling: UInt64? = nil,
-        iceControlled: UInt64? = nil
-    ) -> STUNMessage {
-        var attrs: [STUNAttribute] = []
-
-        if let username {
-            attrs.append(.username(username))
-        }
-        if let priority {
-            attrs.append(.priority(priority))
-        }
-        if useCandidate {
-            attrs.append(.useCandidate())
-        }
-        if let tiebreaker = iceControlling {
-            attrs.append(.iceControlling(tiebreaker: tiebreaker))
-        }
-        if let tiebreaker = iceControlled {
-            attrs.append(.iceControlled(tiebreaker: tiebreaker))
-        }
-
-        return STUNMessage(
-            messageType: .bindingRequest,
-            attributes: attrs
-        )
-    }
-
     /// Create a Binding Success Response
     public static func bindingSuccessResponse(
         transactionID: TransactionID,
-        address: Data,
+        address: [UInt8],
         port: UInt16
     ) -> STUNMessage {
         STUNMessage(
@@ -147,20 +119,19 @@ public struct STUNMessage: Sendable {
     }
 
     /// Check if this is a STUN message (first two bits are 0)
-    public static func isSTUN(_ data: Data) -> Bool {
+    public static func isSTUN(_ data: [UInt8]) -> Bool {
         guard data.count >= stunHeaderSize else { return false }
-        // Index relative to startIndex: the caller may pass a Data slice
-        // (non-zero startIndex), and `data[0]` would otherwise trap or misread.
-        return data[data.startIndex] & 0xC0 == 0
+        return data[0] & 0xC0 == 0
     }
 
     // MARK: - Encoding
 
     /// Encode the STUN message to wire format (without MESSAGE-INTEGRITY or FINGERPRINT)
-    public func encode() -> Data {
-        let attrData = encodeAttributes()
+    public func encodeBytes() -> [UInt8] {
+        let attrData = Self.encodeAttributes(attributes)
 
-        var data = Data(capacity: stunHeaderSize + attrData.count)
+        var data = [UInt8]()
+        data.reserveCapacity(stunHeaderSize + attrData.count)
 
         // Message type (2 bytes)
         data.append(UInt8(messageType.rawValue >> 8))
@@ -178,70 +149,17 @@ public struct STUNMessage: Sendable {
         data.append(UInt8(stunMagicCookie & 0xFF))
 
         // Transaction ID (12 bytes)
-        data.append(transactionID.bytes)
+        data.append(contentsOf: transactionID.byteValues)
 
         // Attributes
-        data.append(attrData)
+        data.append(contentsOf: attrData)
 
         return data
     }
 
-    /// Encode with MESSAGE-INTEGRITY and FINGERPRINT
-    /// - Parameter key: The HMAC-SHA1 key (ICE password)
-    /// - Returns: Encoded message with integrity and fingerprint
-    ///
-    /// Builds the wire format in a single buffer: the header length field is
-    /// first written to cover MESSAGE-INTEGRITY for the HMAC input, then
-    /// patched in place to also cover FINGERPRINT for the CRC input
-    /// (RFC 5389 §15.4, §15.5).
-    public func encodeWithIntegrity(key: Data) -> Data {
-        let attrData = encodeAttributes()
-
-        let integrityAttrSize = stunAttributeHeaderSize + 20 // HMAC-SHA1
-        let fingerprintAttrSize = stunAttributeHeaderSize + 4 // CRC-32
-
-        var data = Data(capacity: stunHeaderSize + attrData.count + integrityAttrSize + fingerprintAttrSize)
-
-        // Header — length covers attributes + MESSAGE-INTEGRITY
-        let lengthWithIntegrity = UInt16(attrData.count + integrityAttrSize)
-        data.append(UInt8(messageType.rawValue >> 8))
-        data.append(UInt8(messageType.rawValue & 0xFF))
-        data.append(UInt8(lengthWithIntegrity >> 8))
-        data.append(UInt8(lengthWithIntegrity & 0xFF))
-        data.append(UInt8(stunMagicCookie >> 24))
-        data.append(UInt8((stunMagicCookie >> 16) & 0xFF))
-        data.append(UInt8((stunMagicCookie >> 8) & 0xFF))
-        data.append(UInt8(stunMagicCookie & 0xFF))
-        data.append(transactionID.bytes)
-        data.append(attrData)
-
-        // MESSAGE-INTEGRITY over the buffer so far (value is 20 bytes,
-        // already 4-byte aligned — no padding needed)
-        let hmac = MessageIntegrity.compute(data: data, key: key)
-        data.append(UInt8(STUNAttributeType.messageIntegrity.rawValue >> 8))
-        data.append(UInt8(STUNAttributeType.messageIntegrity.rawValue & 0xFF))
-        data.append(0)
-        data.append(20)
-        data.append(hmac)
-
-        // Patch the length in place to also cover FINGERPRINT
-        let lengthWithFingerprint = UInt16(attrData.count + integrityAttrSize + fingerprintAttrSize)
-        data[2] = UInt8(lengthWithFingerprint >> 8)
-        data[3] = UInt8(lengthWithFingerprint & 0xFF)
-
-        // FINGERPRINT over the buffer so far (value is 4 bytes, aligned)
-        let fp = STUNFingerprint.compute(data: data)
-        data.append(UInt8(STUNAttributeType.fingerprint.rawValue >> 8))
-        data.append(UInt8(STUNAttributeType.fingerprint.rawValue & 0xFF))
-        data.append(0)
-        data.append(4)
-        data.append(fp)
-
-        return data
-    }
-
-    private func encodeAttributes() -> Data {
-        var data = Data()
+    /// Encode the attribute section (TLV with 4-byte padding) to wire bytes.
+    public static func encodeAttributes(_ attributes: [STUNAttribute]) -> [UInt8] {
+        var data = [UInt8]()
         for attr in attributes {
             // Type (2 bytes)
             data.append(UInt8(attr.type >> 8))
@@ -253,12 +171,12 @@ public struct STUNMessage: Sendable {
             data.append(UInt8(length & 0xFF))
 
             // Value
-            data.append(attr.value)
+            data.append(contentsOf: attr.value)
 
             // Padding to 4-byte boundary
             let padding = (4 - (attr.value.count % 4)) % 4
-            if padding > 0 {
-                data.append(Data(repeating: 0, count: padding))
+            for _ in 0..<padding {
+                data.append(0)
             }
         }
         return data
@@ -267,19 +185,14 @@ public struct STUNMessage: Sendable {
     // MARK: - Decoding
 
     /// Decode a STUN message from wire format
-    public static func decode(from input: Data) throws -> STUNMessage {
-        // Normalize to a zero-based buffer: the body below indexes with
-        // absolute offsets (`data[0]`, `data[8..<20]`, attribute loop), which
-        // would trap or misparse on a Data slice whose startIndex != 0.
-        let data = input.startIndex == 0 ? input : Data(input)
-
+    public static func decode(from data: [UInt8]) throws(STUNWireError) -> STUNMessage {
         guard data.count >= stunHeaderSize else {
-            throw STUNError.insufficientData(expected: stunHeaderSize, actual: data.count)
+            throw .decode(.insufficientData(expected: stunHeaderSize, actual: data.count))
         }
 
         // First two bits must be 0
         guard data[0] & 0xC0 == 0 else {
-            throw STUNError.invalidFormat("First two bits must be 0")
+            throw .decode(.invalidFormat("First two bits must be 0"))
         }
 
         let messageType = UInt16(data[0]) << 8 | UInt16(data[1])
@@ -287,14 +200,14 @@ public struct STUNMessage: Sendable {
         let magicCookie = UInt32(data[4]) << 24 | UInt32(data[5]) << 16 | UInt32(data[6]) << 8 | UInt32(data[7])
 
         guard magicCookie == stunMagicCookie else {
-            throw STUNError.invalidMagicCookie(magicCookie)
+            throw .decode(.invalidMagicCookie(magicCookie))
         }
 
         guard data.count >= stunHeaderSize + messageLength else {
-            throw STUNError.insufficientData(expected: stunHeaderSize + messageLength, actual: data.count)
+            throw .decode(.insufficientData(expected: stunHeaderSize + messageLength, actual: data.count))
         }
 
-        let transactionID = TransactionID(bytes: Data(data[8..<20]))
+        let transactionID = TransactionID(byteValues: Array(data[8..<20]))
 
         // Parse attributes
         var attributes: [STUNAttribute] = []
@@ -307,10 +220,10 @@ public struct STUNMessage: Sendable {
             offset += stunAttributeHeaderSize
 
             guard offset + attrLength <= end else {
-                throw STUNError.invalidFormat("Attribute extends beyond message")
+                throw .decode(.invalidFormat("Attribute extends beyond message"))
             }
 
-            let attrValue = Data(data[offset..<offset + attrLength])
+            let attrValue = Array(data[offset..<offset + attrLength])
             attributes.append(STUNAttribute(type: attrType, value: attrValue))
 
             // Skip padding
@@ -324,13 +237,4 @@ public struct STUNMessage: Sendable {
             attributes: attributes
         )
     }
-}
-
-/// STUN errors
-public enum STUNError: Error, Sendable {
-    case insufficientData(expected: Int, actual: Int)
-    case invalidFormat(String)
-    case invalidMagicCookie(UInt32)
-    case integrityCheckFailed
-    case fingerprintCheckFailed
 }

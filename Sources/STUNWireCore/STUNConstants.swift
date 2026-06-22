@@ -1,7 +1,5 @@
 /// STUN Constants (RFC 5389)
 
-import Foundation
-
 /// STUN magic cookie value
 public let stunMagicCookie: UInt32 = 0x2112A442
 

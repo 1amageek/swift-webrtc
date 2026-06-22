@@ -1,6 +1,19 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
+// Embedded toggle controls the experimental Embedded feature + WMO for the
+// Embedded-clean cores. Lifetimes is enabled in BOTH modes because Span-returning
+// members of the P2PCoreBytes dependency require @_lifetime.
+let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
+
+let coreSettings: [SwiftSetting] = {
+    var s: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
+    if embeddedEnabled {
+        s += [.enableExperimentalFeature("Embedded"), .unsafeFlags(["-wmo"])]
+    }
+    return s
+}()
+
 let package = Package(
     name: "swift-webrtc",
     platforms: [
@@ -9,6 +22,7 @@ let package = Package(
     ],
     products: [
         .library(name: "WebRTC", targets: ["WebRTC"]),
+        .library(name: "STUNWireCore", targets: ["STUNWireCore"]),
         .library(name: "STUNCore", targets: ["STUNCore"]),
         .library(name: "ICELite", targets: ["ICELite"]),
         .library(name: "SCTPCore", targets: ["SCTPCore"]),
@@ -18,11 +32,23 @@ let package = Package(
         .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
+        .package(path: "../swift-p2p-core"),
     ],
     targets: [
+        // ---- Embedded-clean STUN wire codec (dual-build: host + Embedded) ----
+        .target(
+            name: "STUNWireCore",
+            dependencies: [
+                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+            ],
+            path: "Sources/STUNWireCore",
+            swiftSettings: coreSettings
+        ),
+        // ---- Foundation adapter: keeps the existing Data-based STUN API ----
         .target(
             name: "STUNCore",
             dependencies: [
+                "STUNWireCore",
                 .product(name: "Crypto", package: "swift-crypto"),
             ],
             path: "Sources/STUNCore"

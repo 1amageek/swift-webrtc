@@ -2,9 +2,7 @@
 ///
 /// CRC-32 of the STUN message XOR'd with 0x5354554E.
 
-import Foundation
-
-/// FINGERPRINT computation and verification
+/// FINGERPRINT computation and verification (pure CRC-32, no crypto seam).
 public enum STUNFingerprint: Sendable {
 
     /// XOR constant for STUN fingerprint
@@ -13,10 +11,10 @@ public enum STUNFingerprint: Sendable {
     /// Compute FINGERPRINT value
     /// - Parameter data: The STUN message bytes (with adjusted length)
     /// - Returns: 4-byte fingerprint
-    public static func compute(data: Data) -> Data {
+    public static func compute(data: [UInt8]) -> [UInt8] {
         let crc = crc32(data)
         let fingerprint = crc ^ xorConstant
-        var result = Data(count: 4)
+        var result = [UInt8](repeating: 0, count: 4)
         result[0] = UInt8(fingerprint >> 24)
         result[1] = UInt8((fingerprint >> 16) & 0xFF)
         result[2] = UInt8((fingerprint >> 8) & 0xFF)
@@ -27,10 +25,7 @@ public enum STUNFingerprint: Sendable {
     /// Verify FINGERPRINT in a STUN message
     /// - Parameter message: The complete STUN message bytes
     /// - Returns: True if fingerprint check passes
-    public static func verify(message input: Data) -> Bool {
-        // Normalize to a zero-based buffer: the offsets below are absolute and
-        // would trap/misparse on a Data slice.
-        let message = input.startIndex == 0 ? input : Data(input)
+    public static func verify(message: [UInt8]) -> Bool {
         guard message.count >= stunHeaderSize + stunAttributeHeaderSize + 4 else {
             return false
         }
@@ -43,11 +38,10 @@ public enum STUNFingerprint: Sendable {
             return false
         }
 
-        let receivedFP = Data(message[fpOffset + stunAttributeHeaderSize..<fpOffset + stunAttributeHeaderSize + 4])
+        let receivedFP = Array(message[fpOffset + stunAttributeHeaderSize..<fpOffset + stunAttributeHeaderSize + 4])
 
         // Compute over message up to (but not including) FINGERPRINT attribute
-        let dataToHash = Data(message[0..<fpOffset])
-        var adjustedMsg = dataToHash
+        var adjustedMsg = Array(message[0..<fpOffset])
         // Adjust length to include FINGERPRINT
         let adjustedLength = UInt16(fpOffset - stunHeaderSize + stunAttributeHeaderSize + 4)
         adjustedMsg[2] = UInt8(adjustedLength >> 8)
@@ -77,14 +71,12 @@ public enum STUNFingerprint: Sendable {
     }()
 
     /// Compute CRC-32
-    private static func crc32(_ data: Data) -> UInt32 {
-        data.withUnsafeBytes { buffer in
-            var crc: UInt32 = 0xFFFFFFFF
-            for byte in buffer {
-                let index = Int((crc ^ UInt32(byte)) & 0xFF)
-                crc = (crc >> 8) ^ crc32Table[index]
-            }
-            return crc ^ 0xFFFFFFFF
+    private static func crc32(_ data: [UInt8]) -> UInt32 {
+        var crc: UInt32 = 0xFFFFFFFF
+        for byte in data {
+            let index = Int((crc ^ UInt32(byte)) & 0xFF)
+            crc = (crc >> 8) ^ crc32Table[index]
         }
+        return crc ^ 0xFFFFFFFF
     }
 }
