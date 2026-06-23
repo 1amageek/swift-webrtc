@@ -42,6 +42,7 @@ let package = Package(
             name: "STUNWireCore",
             dependencies: [
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
             path: "Sources/STUNWireCore",
             swiftSettings: coreSettings
@@ -65,6 +66,7 @@ let package = Package(
             name: "SCTPWireCore",
             dependencies: [
                 .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
             ],
             path: "Sources/SCTPWireCore",
             swiftSettings: coreSettings
