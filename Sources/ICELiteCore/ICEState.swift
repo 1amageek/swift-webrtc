@@ -1,8 +1,6 @@
-/// ICE State (RFC 8445)
+/// ICE State (RFC 8445) — Embedded-clean.
 
-import Foundation
-
-/// ICE connection state
+/// ICE connection state.
 public enum ICEState: Sendable, Equatable {
     /// Initial state
     case new

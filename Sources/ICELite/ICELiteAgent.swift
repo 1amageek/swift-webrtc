@@ -1,33 +1,34 @@
-/// ICE Lite Agent (RFC 8445 — Lite implementation)
+/// ICE Lite Agent (RFC 8445 — Lite implementation) — Foundation adapter.
 ///
 /// ICE Lite is a minimal ICE implementation suitable for server-side deployments.
-/// It only responds to connectivity checks (no active checking or candidate gathering).
-/// ICE Lite always acts as the controlled agent.
+/// It only responds to connectivity checks (no active checking or candidate
+/// gathering) and always acts as the controlled agent.
+///
+/// The connectivity-check decision logic and state machine live in the
+/// Embedded-clean `ICELiteCore`. This adapter holds that value behind a `Mutex`
+/// (the proven caller-locked pattern), performs the wire decode and the crypto
+/// checks (FINGERPRINT / MESSAGE-INTEGRITY) the core asks for, and builds the
+/// `Data` STUN responses. The decision is fail-closed: the core returns
+/// `.reject` on any validation failure and this adapter answers with a STUN
+/// error response, never a success.
 
 import Foundation
 import Synchronization
 import STUNCore
+// Re-export the Embedded-clean core so existing call sites keep using
+// `ICELite.ICEState` / `ICELite.ICEValidationError` (incl. enum-case usage in
+// default arguments) unchanged, matching the SCTPWireCompat `@_exported` pattern.
+@_exported import ICELiteCore
 
-/// ICE validation errors
-public enum ICEValidationError: Error, Sendable {
-    case missingUsername
-    case invalidUsernameFormat
-    case localUfragMismatch
-    case remoteUfragMismatch
-    case missingMessageIntegrity
-    case invalidMessageIntegrity
-    case fingerprintVerificationFailed
-    case roleConflict
-}
-
-/// ICE Lite agent for server-side connectivity checks
+/// ICE Lite agent for server-side connectivity checks.
 public final class ICELiteAgent: Sendable {
     private let agentState: Mutex<AgentState>
 
     private struct AgentState: Sendable {
-        var state: ICEState = .new
+        /// The pure state machine (state + ufrags + validated peers).
+        var core: ICELiteStateMachine
+        /// Full credentials, including the password/key the core does not hold.
         var credentials: ICECredentials
-        var validatedPeers: Set<String> = [] // "ip:port" of validated peers
     }
 
     /// ICE credentials
@@ -37,11 +38,15 @@ public final class ICELiteAgent: Sendable {
 
     /// Current ICE state
     public var state: ICEState {
-        agentState.withLock { $0.state }
+        agentState.withLock { $0.core.state }
     }
 
     public init(credentials: ICECredentials = ICECredentials()) {
-        self.agentState = Mutex(AgentState(credentials: credentials))
+        let core = ICELiteStateMachine(
+            localUfrag: credentials.localUfrag,
+            remoteUfrag: credentials.remoteUfrag
+        )
+        self.agentState = Mutex(AgentState(core: core, credentials: credentials))
     }
 
     /// Set remote credentials (from SDP exchange)
@@ -49,9 +54,7 @@ public final class ICELiteAgent: Sendable {
         agentState.withLock { s in
             s.credentials.remoteUfrag = ufrag
             s.credentials.remotePassword = password
-            if s.state == .new {
-                s.state = .checking
-            }
+            s.core.setRemoteUfrag(ufrag)
         }
     }
 
@@ -75,153 +78,80 @@ public final class ICELiteAgent: Sendable {
             return nil
         }
 
-        guard message.messageType == .bindingRequest else {
+        let key = agentState.withLock { $0.credentials.stunKey }
+
+        // Extract the facts the core decides on. USERNAME is decoded here (wire);
+        // FINGERPRINT and MESSAGE-INTEGRITY are verified here (crypto) and the
+        // *results* are handed to the core.
+        let usernameAttr = message.attribute(ofType: .username)
+        let hasUsername = usernameAttr != nil
+        let username: String? = usernameAttr.flatMap { String(data: $0.value, encoding: .utf8) }
+
+        let hasFingerprint = message.attribute(ofType: .fingerprint) != nil
+        let fingerprintValid = hasFingerprint ? STUNFingerprint.verify(message: data) : false
+
+        let integrity = MessageIntegrity.verifyWithResult(message: data, key: key)
+
+        let hasIceControlled = message.attribute(ofType: .iceControlled) != nil
+
+        let input = ICECheckInput(
+            messageType: message.messageType,
+            username: username,
+            hasUsername: hasUsername,
+            hasFingerprint: hasFingerprint,
+            fingerprintValid: fingerprintValid,
+            integrity: integrity,
+            hasIceControlled: hasIceControlled
+        )
+
+        let peerKey = addressKey(address: sourceAddress, port: sourcePort)
+
+        // Ask the core for the verdict and, on accept, mark the peer validated —
+        // both under the same lock so the decision and the state update are atomic.
+        let verdict: ICECheckVerdict = agentState.withLock { s in
+            let v = s.core.verdict(for: input)
+            if case .accept = v {
+                s.core.markValidated(peerKey: peerKey)
+            }
+            return v
+        }
+
+        switch verdict {
+        case .ignore:
             return nil
-        }
-
-        let (key, localUfrag, remoteUfrag) = agentState.withLock { s in
-            (s.credentials.stunKey, s.credentials.localUfrag, s.credentials.remoteUfrag)
-        }
-
-        // P0.3: Validate USERNAME attribute
-        do {
-            try validateUsername(
-                message: message,
-                expectedLocalUfrag: localUfrag,
-                expectedRemoteUfrag: remoteUfrag
-            )
-        } catch let error as ICEValidationError {
+        case .reject(let error):
             return buildErrorResponse(
                 transactionID: message.transactionID,
                 error: error,
                 key: key
             )
-        } catch {
-            return nil
-        }
-
-        // P0.4: Validate FINGERPRINT if present
-        if message.attribute(ofType: .fingerprint) != nil {
-            guard STUNFingerprint.verify(message: data) else {
-                return buildErrorResponse(
-                    transactionID: message.transactionID,
-                    error: .fingerprintVerificationFailed,
-                    key: key
-                )
-            }
-        }
-
-        // P0.5: Verify MESSAGE-INTEGRITY (required)
-        let integrityResult = MessageIntegrity.verifyWithResult(message: data, key: key)
-        switch integrityResult {
-        case .missing:
-            return buildErrorResponse(
+        case .accept:
+            let response = STUNMessage.bindingSuccessResponse(
                 transactionID: message.transactionID,
-                error: .missingMessageIntegrity,
-                key: key
+                address: sourceAddress,
+                port: sourcePort
             )
-        case .invalid:
-            return buildErrorResponse(
-                transactionID: message.transactionID,
-                error: .invalidMessageIntegrity,
-                key: key
-            )
-        case .valid:
-            break // Continue processing
+            return response.encodeWithIntegrity(key: key)
         }
-
-        // P1.1: Role conflict detection
-        // ICE Lite is always controlled. If we receive ICE-CONTROLLED, it's a conflict.
-        if message.attribute(ofType: .iceControlled) != nil {
-            return buildErrorResponse(
-                transactionID: message.transactionID,
-                error: .roleConflict,
-                key: key
-            )
-        }
-
-        // Mark peer as validated
-        let peerKey = addressKey(address: sourceAddress, port: sourcePort)
-        agentState.withLock { s in
-            s.validatedPeers.insert(peerKey)
-            if s.state == .checking || s.state == .new {
-                s.state = .connected
-            }
-        }
-
-        // Build success response
-        let response = STUNMessage.bindingSuccessResponse(
-            transactionID: message.transactionID,
-            address: sourceAddress,
-            port: sourcePort
-        )
-
-        return response.encodeWithIntegrity(key: key)
     }
 
     /// Whether a peer at the given address has been validated
     public func isPeerValidated(address: Data, port: UInt16) -> Bool {
         let key = addressKey(address: address, port: port)
-        return agentState.withLock { $0.validatedPeers.contains(key) }
+        return agentState.withLock { $0.core.isValidated(peerKey: key) }
     }
 
     /// Complete ICE processing
     public func complete() {
-        agentState.withLock { s in
-            if s.state == .connected {
-                s.state = .completed
-            }
-        }
+        agentState.withLock { $0.core.complete() }
     }
 
     /// Close the ICE agent
     public func close() {
-        agentState.withLock { s in
-            s.state = .closed
-            s.validatedPeers.removeAll()
-        }
+        agentState.withLock { $0.core.close() }
     }
 
-    // MARK: - Private validation helpers
-
-    private func validateUsername(
-        message: STUNMessage,
-        expectedLocalUfrag: String,
-        expectedRemoteUfrag: String?
-    ) throws {
-        // P0.3: USERNAME is required for connectivity checks
-        guard let usernameAttr = message.attribute(ofType: .username) else {
-            throw ICEValidationError.missingUsername
-        }
-
-        guard let username = String(data: usernameAttr.value, encoding: .utf8) else {
-            throw ICEValidationError.invalidUsernameFormat
-        }
-
-        // RFC 8445: the sender builds USERNAME as "<peer's ufrag>:<own ufrag>".
-        // From our (receiving server) perspective the message carries
-        // "<ourUfrag>:<peerUfrag>": the FIRST part must match our localUfrag,
-        // the SECOND part is the peer's (remote) ufrag.
-        let parts = username.split(separator: ":", maxSplits: 1)
-        guard parts.count == 2 else {
-            throw ICEValidationError.invalidUsernameFormat
-        }
-
-        let receivedLocalUfrag = String(parts[1])
-        guard receivedLocalUfrag == expectedLocalUfrag else {
-            throw ICEValidationError.localUfragMismatch
-        }
-
-        // When the peer's ufrag is known from signaling, assert the other half
-        // too instead of accepting any value. Without this, only our own half
-        // was validated, allowing a check from an unrelated peer to pass.
-        if let expectedRemoteUfrag {
-            let receivedRemoteUfrag = String(parts[0])
-            guard receivedRemoteUfrag == expectedRemoteUfrag else {
-                throw ICEValidationError.remoteUfragMismatch
-            }
-        }
-    }
+    // MARK: - Private helpers
 
     private func buildErrorResponse(
         transactionID: TransactionID,

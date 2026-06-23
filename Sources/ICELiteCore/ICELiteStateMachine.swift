@@ -1,0 +1,203 @@
+/// Embedded-clean ICE Lite state machine (RFC 8445 — Lite implementation).
+///
+/// ICE Lite is a minimal, server-side ICE implementation: it only responds to
+/// connectivity checks (no active checking or candidate gathering) and always
+/// acts as the controlled agent.
+///
+/// This core is a pure value type holding the ICE state, the decision-relevant
+/// credential fields, and the validated-peer set. It owns ALL connectivity-check
+/// decisions and state transitions; it performs no crypto and no wire codec. The
+/// `ICELite` adapter decodes the STUN message, runs the crypto checks
+/// (FINGERPRINT / MESSAGE-INTEGRITY) it is told to, then feeds the resulting
+/// facts here for the decision. The verdict is fail-closed: any validation
+/// failure yields `.reject(error)`, never `.accept`.
+///
+/// Following the proven caller-locked pattern, the adapter (`ICELiteAgent`) holds
+/// this value behind a `Mutex` and mutates it under the lock. ICE Lite is not
+/// time-bound, so no clock is injected.
+
+import STUNWireCore
+
+/// The verdict the core returns for an inbound connectivity check.
+public enum ICECheckVerdict: Sendable, Equatable {
+    /// The check passed; build a binding success response and the peer is
+    /// validated.
+    case accept
+    /// The check failed; build a binding error response for `error`.
+    case reject(ICEValidationError)
+    /// Not a connectivity check we handle; produce no response.
+    case ignore
+}
+
+/// The facts the adapter extracts from a decoded STUN message before asking the
+/// core for a verdict. Crypto results (`fingerprint`, `integrity`) are computed
+/// adapter-side and passed in; the core decides what they mean.
+public struct ICECheckInput: Sendable, Equatable {
+    /// The message type (only `.bindingRequest` is processed as a check).
+    public let messageType: STUNMessageType
+    /// The decoded USERNAME attribute value as a UTF-8 string, if present and
+    /// decodable; `nil` if the attribute is absent or not valid UTF-8.
+    public let username: String?
+    /// Whether a USERNAME attribute was present at all (distinguishes "absent"
+    /// from "present but not UTF-8").
+    public let hasUsername: Bool
+    /// Whether a FINGERPRINT attribute was present.
+    public let hasFingerprint: Bool
+    /// If a FINGERPRINT was present, whether it verified (adapter-computed).
+    public let fingerprintValid: Bool
+    /// The MESSAGE-INTEGRITY verification result (adapter-computed via the seam).
+    public let integrity: IntegrityResult
+    /// Whether an ICE-CONTROLLED attribute was present (a role conflict for a
+    /// Lite agent, which is always controlled).
+    public let hasIceControlled: Bool
+
+    public init(
+        messageType: STUNMessageType,
+        username: String?,
+        hasUsername: Bool,
+        hasFingerprint: Bool,
+        fingerprintValid: Bool,
+        integrity: IntegrityResult,
+        hasIceControlled: Bool
+    ) {
+        self.messageType = messageType
+        self.username = username
+        self.hasUsername = hasUsername
+        self.hasFingerprint = hasFingerprint
+        self.fingerprintValid = fingerprintValid
+        self.integrity = integrity
+        self.hasIceControlled = hasIceControlled
+    }
+}
+
+/// Pure ICE Lite state machine value type.
+public struct ICELiteStateMachine: Sendable, Equatable {
+    /// Current ICE state.
+    public private(set) var state: ICEState
+
+    /// Local username fragment (used to validate the USERNAME's local half).
+    public let localUfrag: String
+
+    /// Remote username fragment, once known from signaling. When set, the
+    /// USERNAME's remote half is asserted too.
+    public private(set) var remoteUfrag: String?
+
+    /// Validated peer keys ("address:port"), supplied by the adapter.
+    public private(set) var validatedPeers: Set<String>
+
+    public init(
+        localUfrag: String,
+        remoteUfrag: String? = nil,
+        state: ICEState = .new
+    ) {
+        self.localUfrag = localUfrag
+        self.remoteUfrag = remoteUfrag
+        self.state = state
+        self.validatedPeers = []
+    }
+
+    // MARK: - State transitions (caller-locked; adapter holds the Mutex)
+
+    /// Records the remote credentials' ufrag. Moves `.new` to `.checking`,
+    /// matching the historical agent behavior.
+    public mutating func setRemoteUfrag(_ ufrag: String) {
+        remoteUfrag = ufrag
+        if state == .new {
+            state = .checking
+        }
+    }
+
+    /// Completes ICE: `.connected` becomes `.completed`.
+    public mutating func complete() {
+        if state == .connected {
+            state = .completed
+        }
+    }
+
+    /// Closes the agent: state becomes `.closed` and the validated-peer set is
+    /// cleared.
+    public mutating func close() {
+        state = .closed
+        validatedPeers.removeAll()
+    }
+
+    // MARK: - Connectivity check decision (pure, fail-closed)
+
+    /// Decides the verdict for an inbound connectivity check from the
+    /// adapter-supplied facts. On `.accept`, the caller should mark `peerKey`
+    /// validated via ``markValidated(peerKey:)`` and build a success response.
+    ///
+    /// The check order mirrors the historical agent exactly:
+    /// 1. only `.bindingRequest` is a check (else `.ignore`);
+    /// 2. USERNAME present, UTF-8, well-formed, local half matches, and (when the
+    ///    remote ufrag is known) the remote half matches;
+    /// 3. FINGERPRINT, if present, must verify;
+    /// 4. MESSAGE-INTEGRITY must be present and valid;
+    /// 5. ICE-CONTROLLED present is a role conflict (Lite is always controlled).
+    public func verdict(for input: ICECheckInput) -> ICECheckVerdict {
+        guard input.messageType == .bindingRequest else {
+            return .ignore
+        }
+
+        // USERNAME validation.
+        guard input.hasUsername else {
+            return .reject(.missingUsername)
+        }
+        guard let username = input.username else {
+            return .reject(.invalidUsernameFormat)
+        }
+        // USERNAME is "<ourUfrag>:<peerUfrag>" from our receiving perspective.
+        let parts = username.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else {
+            return .reject(.invalidUsernameFormat)
+        }
+        let receivedLocalUfrag = String(parts[1])
+        guard receivedLocalUfrag == localUfrag else {
+            return .reject(.localUfragMismatch)
+        }
+        if let remoteUfrag {
+            let receivedRemoteUfrag = String(parts[0])
+            guard receivedRemoteUfrag == remoteUfrag else {
+                return .reject(.remoteUfragMismatch)
+            }
+        }
+
+        // FINGERPRINT (only if present).
+        if input.hasFingerprint {
+            guard input.fingerprintValid else {
+                return .reject(.fingerprintVerificationFailed)
+            }
+        }
+
+        // MESSAGE-INTEGRITY (required).
+        switch input.integrity {
+        case .missing:
+            return .reject(.missingMessageIntegrity)
+        case .invalid:
+            return .reject(.invalidMessageIntegrity)
+        case .valid:
+            break
+        }
+
+        // Role conflict: a Lite agent is always controlled.
+        if input.hasIceControlled {
+            return .reject(.roleConflict)
+        }
+
+        return .accept
+    }
+
+    /// Marks `peerKey` validated and advances `.new`/`.checking` to `.connected`.
+    /// Call this only after ``verdict(for:)`` returns `.accept`.
+    public mutating func markValidated(peerKey: String) {
+        validatedPeers.insert(peerKey)
+        if state == .checking || state == .new {
+            state = .connected
+        }
+    }
+
+    /// Whether `peerKey` has been validated.
+    public func isValidated(peerKey: String) -> Bool {
+        validatedPeers.contains(peerKey)
+    }
+}

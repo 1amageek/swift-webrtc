@@ -24,6 +24,7 @@ let package = Package(
         .library(name: "WebRTC", targets: ["WebRTC"]),
         .library(name: "STUNWireCore", targets: ["STUNWireCore"]),
         .library(name: "STUNCore", targets: ["STUNCore"]),
+        .library(name: "ICELiteCore", targets: ["ICELiteCore"]),
         .library(name: "ICELite", targets: ["ICELite"]),
         .library(name: "SCTPWireCore", targets: ["SCTPWireCore"]),
         .library(name: "SCTPCore", targets: ["SCTPCore"]),
@@ -56,9 +57,17 @@ let package = Package(
             ],
             path: "Sources/STUNCore"
         ),
+        // ---- Embedded-clean ICE Lite state machine (dual-build: host + Embedded) ----
+        .target(
+            name: "ICELiteCore",
+            dependencies: ["STUNWireCore"],
+            path: "Sources/ICELiteCore",
+            swiftSettings: coreSettings
+        ),
+        // ---- Foundation adapter: wire decode + crypto + Mutex over the core ----
         .target(
             name: "ICELite",
-            dependencies: ["STUNCore"],
+            dependencies: ["STUNCore", "ICELiteCore"],
             path: "Sources/ICELite"
         ),
         // ---- Embedded-clean SCTP wire codec (dual-build: host + Embedded) ----
