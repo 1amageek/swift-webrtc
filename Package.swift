@@ -32,7 +32,12 @@ let package = Package(
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.0"),
+        // Local path on the `embedded` branch: swift-tls's DTLS handshake/record
+        // is now cored (DTLSHandshakeCore / DTLSRecordCore), which makes the
+        // DTLSCore/DTLSRecord Foundation adapters consumed by WebRTC transitively
+        // Embedded-capable. The cored sources land after the released 1.3.0 tag,
+        // so this override is required until that work is tagged. NOT for release.
+        .package(path: "../swift-tls"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
         .package(path: "../swift-p2p-core"),
