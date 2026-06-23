@@ -2,8 +2,14 @@
 ///
 /// Tracks received TSNs for SACK generation and duplicate detection.
 /// Maintains cumulative TSN acknowledgment and gap blocks.
-
-import Foundation
+///
+/// ## Caller-locked value type
+///
+/// This is a pure value `struct` with `mutating` methods. It holds no
+/// `Synchronization.Mutex` / actor and no `ContinuousClock` / `Date` — the caller
+/// (the `SCTPCore` adapter's `SCTPAssociation`) owns synchronization and drives
+/// these methods under its own lock. The structure carries no notion of time, so
+/// no `nowMillis` is needed here.
 
 /// Tracks received TSNs for selective acknowledgment
 public struct TSNTracker: Sendable {

@@ -1,337 +1,124 @@
-/// Retransmission Queue (RFC 4960 Section 6.3)
+/// Retransmission Queue (RFC 4960 Section 6.3) — clock-seam adapter.
 ///
-/// Manages unacknowledged DATA chunks for retransmission.
-/// Implements T3-rtx timer logic and exponential backoff.
+/// This is the host-side adapter over the Embedded-clean value type
+/// `SCTPWireCore.RetransmissionState`. The core does all retransmission / RTO /
+/// RTT / congestion accounting in plain milliseconds; this wrapper restores the
+/// historical `ContinuousClock`/`Duration` surface that the SCTP state machine and
+/// the existing test suite bind to.
+///
+/// ## Clock seam
+///
+/// The core takes a monotonic `nowMillis: UInt64` parameter instead of reading a
+/// clock. This wrapper captures a fixed `ContinuousClock` epoch at init and
+/// converts each injected `ContinuousClock.Instant` to epoch-relative milliseconds
+/// before delegating, so the millisecond deltas the core reasons about match the
+/// `Duration` deltas callers pass. `Duration`-typed results (RTO) are converted
+/// back from the core's millis.
 
 import Foundation
 
-/// Pending chunk awaiting acknowledgment
-public struct PendingChunk: Sendable {
-    /// The DATA chunk
-    public let dataChunk: SCTPDataChunk
+/// Retransmission error surfaced by the queue's retransmission scan.
+///
+/// Re-exposes the core's ``SCTPWireCore/RetransmissionError`` under the historical
+/// adapter name so existing call sites keep catching it unchanged.
+public typealias RetransmissionError = SCTPWireCore.RetransmissionError
 
-    /// When the chunk was first sent
-    public let firstSentTime: ContinuousClock.Instant
+/// Pending chunk awaiting acknowledgment.
+///
+/// Re-exposes the core value type under the historical adapter name.
+public typealias PendingChunk = SCTPWireCore.PendingChunk
 
-    /// When the chunk was last sent
-    public var lastSentTime: ContinuousClock.Instant
-
-    /// Number of retransmissions
-    public var retransmitCount: Int
-
-    /// Whether this chunk has been marked for retransmission
-    public var markedForRetransmit: Bool
-
-    /// Miss indications from SACK gap reports (RFC 4960 §7.2.4)
-    public var missIndications: Int
-
-    public init(dataChunk: SCTPDataChunk, sentTime: ContinuousClock.Instant) {
-        self.dataChunk = dataChunk
-        self.firstSentTime = sentTime
-        self.lastSentTime = sentTime
-        self.retransmitCount = 0
-        self.markedForRetransmit = false
-        self.missIndications = 0
-    }
-}
-
-/// Retransmission queue for reliable delivery
+/// Retransmission queue for reliable delivery.
+///
+/// A thin caller-driven wrapper around ``SCTPWireCore/RetransmissionState`` that
+/// converts the historical `ContinuousClock`/`Duration` surface to and from the
+/// core's millisecond domain.
 public struct RetransmissionQueue: Sendable {
-    /// Pending chunks keyed by TSN
-    private var pending: [UInt32: PendingChunk]
+    /// The Embedded-clean accounting state.
+    private var state: RetransmissionState
 
-    /// Retransmission timeout (RTO) in milliseconds
-    private var rto: Duration
-
-    /// Minimum RTO
-    private let minRTO: Duration = .milliseconds(1000)
-
-    /// Maximum RTO
-    private let maxRTO: Duration = .milliseconds(60000)
-
-    /// Maximum retransmissions before failure
-    private let maxRetransmit: Int = 10
-
-    /// Hard ceiling on bytes held in the retransmission queue. Sends are
-    /// refused (typed backpressure) once this is reached so a peer that never
-    /// SACKs cannot make the queue grow without bound.
-    private let maxBytesInFlight: Int = 1 * 1024 * 1024 // 1 MiB
-
-    /// Smoothed round-trip time
-    private var srtt: Duration?
-
-    /// RTT variation
-    private var rttvar: Duration?
-
-    /// Highest TSN sent
-    private(set) public var highestSentTSN: UInt32?
-
-    /// Number of bytes in flight
-    private(set) public var bytesInFlight: Int
-
-    /// Congestion window (simplified)
-    private(set) public var cwnd: Int
-
-    /// Slow start threshold
-    private var ssthresh: Int
+    /// Monotonic epoch against which injected instants are measured. Captured at
+    /// init so the core's elapsed-millis arithmetic matches caller-supplied
+    /// `Duration` deltas.
+    private let epoch: ContinuousClock.Instant
 
     public init() {
-        self.pending = [:]
-        self.rto = .milliseconds(3000) // Initial RTO per RFC 4960
-        self.bytesInFlight = 0
-        self.cwnd = 4380 // Initial cwnd (3 * MTU, assuming 1460 MTU)
-        self.ssthresh = 65535
+        self.state = RetransmissionState()
+        self.epoch = ContinuousClock.now
+    }
+
+    /// Converts an instant to epoch-relative milliseconds (saturating).
+    private func millis(_ instant: ContinuousClock.Instant) -> UInt64 {
+        Self.durationToMillis(instant - epoch)
+    }
+
+    /// Converts a `Duration` to milliseconds (saturating, non-negative).
+    private static func durationToMillis(_ duration: Duration) -> UInt64 {
+        let components = duration.components
+        guard components.seconds > 0 || components.attoseconds > 0 else { return 0 }
+        let secondsMillis = UInt64(max(0, components.seconds)) &* 1000
+        let attoMillis = UInt64(max(0, components.attoseconds) / 1_000_000_000_000_000)
+        return secondsMillis &+ attoMillis
     }
 
     /// Add a chunk to the retransmission queue, enforcing the send-window cap.
-    /// - Parameters:
-    ///   - chunk: The DATA chunk to track
-    ///   - sentTime: When the chunk was sent
-    /// - Throws: `SCTPError.sendQueueFull` when admitting this chunk would push
-    ///   the bytes-in-flight past `maxBytesInFlight` (backpressure). A chunk
-    ///   already present (same TSN) is treated as a re-send and never rejected.
+    /// - Throws: `SCTPStateError.sendQueueFull` (typed backpressure), bridged to
+    ///   `SCTPError.sendQueueFull` at the association boundary.
     public mutating func enqueue(_ chunk: SCTPDataChunk, sentTime: ContinuousClock.Instant = .now) throws {
-        // Re-enqueueing an already-tracked TSN must not double-count bytes.
-        if pending[chunk.tsn] != nil {
-            pending[chunk.tsn] = PendingChunk(dataChunk: chunk, sentTime: sentTime)
-            return
-        }
-
-        let (projected, overflow) = bytesInFlight.addingReportingOverflow(chunk.userData.count)
-        guard !overflow, projected <= maxBytesInFlight else {
-            throw SCTPError.sendQueueFull(bytesInFlight: bytesInFlight, limit: maxBytesInFlight)
-        }
-
-        let pendingChunk = PendingChunk(dataChunk: chunk, sentTime: sentTime)
-        pending[chunk.tsn] = pendingChunk
-        bytesInFlight = projected
-
-        if let highest = highestSentTSN {
-            if TSNTracker.isLessThan(highest, chunk.tsn) {
-                highestSentTSN = chunk.tsn
-            }
-        } else {
-            highestSentTSN = chunk.tsn
+        do {
+            try state.enqueue(chunk, sentMillis: millis(sentTime))
+        } catch {
+            throw error.asSCTPError
         }
     }
 
-    /// Process a SACK acknowledgment
-    /// - Parameters:
-    ///   - cumulativeTSN: Cumulative TSN acknowledged
-    ///   - gapBlocks: Gap ack blocks
-    ///   - receivedTime: When the SACK was received
-    /// - Returns: True if any new data was acknowledged
+    /// Process a SACK acknowledgment.
+    /// - Returns: True if any new data was acknowledged.
+    @discardableResult
     public mutating func acknowledge(
         cumulativeTSN: UInt32,
         gapBlocks: [(start: UInt16, end: UInt16)],
         receivedTime: ContinuousClock.Instant = .now
     ) -> Bool {
-        var acknowledged = false
-
-        // Remove chunks up to cumulative TSN
-        let toRemove = pending.keys.filter { tsn in
-            TSNTracker.isLessThanOrEqual(tsn, cumulativeTSN)
-        }
-
-        for tsn in toRemove {
-            if let chunk = pending.removeValue(forKey: tsn) {
-                // Guard against underflow: only ever subtract bytes we are
-                // certain are still counted. removeValue guarantees each chunk
-                // is accounted once, but clamp defensively so a logic error or
-                // crafted SACK can never wrap bytesInFlight to a huge value.
-                let (remaining, overflow) = bytesInFlight.subtractingReportingOverflow(chunk.dataChunk.userData.count)
-                bytesInFlight = overflow ? 0 : max(0, remaining)
-                acknowledged = true
-
-                // Update RTT if this was the first transmission
-                if chunk.retransmitCount == 0 {
-                    updateRTT(sentTime: chunk.lastSentTime, receivedTime: receivedTime)
-                }
-            }
-        }
-
-        // Fast retransmit (RFC 4960 §7.2.4): chunks below the highest TSN
-        // covered by a gap block that were NOT gap-acknowledged accumulate
-        // miss indications; after 3 reports they are marked for fast
-        // retransmission.
-        if !gapBlocks.isEmpty {
-            var highestGapOffset: UInt32 = 0
-            for (start, end) in gapBlocks where start <= end {
-                if UInt32(end) > highestGapOffset {
-                    highestGapOffset = UInt32(end)
-                }
-            }
-            let highestGapAcked = cumulativeTSN &+ highestGapOffset
-
-            for (tsn, var chunk) in pending {
-                let offset = tsn &- cumulativeTSN
-                // Only TSNs after the cumulative ack and below the highest
-                // gap-acked TSN can be reported missing.
-                guard offset > 0, TSNTracker.isLessThan(tsn, highestGapAcked) else { continue }
-
-                let isGapAcked = gapBlocks.contains { block in
-                    block.start <= block.end &&
-                    offset >= UInt32(block.start) && offset <= UInt32(block.end)
-                }
-                if !isGapAcked {
-                    chunk.missIndications += 1
-                    if chunk.missIndications >= 3 {
-                        chunk.markedForRetransmit = true
-                    }
-                    pending[tsn] = chunk
-                }
-            }
-        }
-
-        // Update congestion window on acknowledgment
-        if acknowledged {
-            if bytesInFlight < ssthresh {
-                // Slow start
-                cwnd = min(cwnd + 1460, 65535)
-            } else {
-                // Congestion avoidance
-                cwnd = min(cwnd + 1460 * 1460 / cwnd, 65535)
-            }
-        }
-
-        return acknowledged
+        state.acknowledge(
+            cumulativeTSN: cumulativeTSN,
+            gapBlocks: gapBlocks,
+            receivedMillis: millis(receivedTime)
+        )
     }
 
-    /// Get chunks that need retransmission
-    /// - Parameter now: Current time
-    /// - Returns: Chunks to retransmit, or nil if max retransmits exceeded
-    public mutating func pendingRetransmissions(now: ContinuousClock.Instant = .now) -> Result<[SCTPDataChunk], RetransmissionError> {
-        // 1. Identify candidates (RTO expired or fast-retransmit marked)
-        //    without mutating yet. If any candidate has already hit the
-        //    retransmit ceiling, the association must abort (RFC 4960 §8.2).
-        var candidateTSNs: [UInt32] = []
-        var timerExpired = false
-        var fastRetransmit = false
-
-        for (tsn, chunk) in pending {
-            let elapsed = now - chunk.lastSentTime
-            let rtoExpired = elapsed >= rto
-
-            if rtoExpired || chunk.markedForRetransmit {
-                if chunk.retransmitCount >= maxRetransmit {
-                    return .failure(.maxRetransmitsExceeded(tsn: tsn))
-                }
-                if rtoExpired {
-                    timerExpired = true
-                } else {
-                    fastRetransmit = true
-                }
-                candidateTSNs.append(tsn)
-            }
-        }
-
-        // 2. Apply backoff and congestion response once per event, not once per
-        //    expired chunk (RFC 4960 §6.3.3 E2, §7.2.3, §7.2.4). This runs
-        //    before burst selection so the (possibly collapsed) cwnd bounds it.
-        if timerExpired {
-            rto = min(rto * 2, maxRTO)
-            ssthresh = max(cwnd / 2, 4 * 1460)
-            cwnd = 1460
-        } else if fastRetransmit {
-            ssthresh = max(cwnd / 2, 4 * 1460)
-            cwnd = ssthresh
-        }
-
-        guard !candidateTSNs.isEmpty else { return .success([]) }
-
-        // Retransmit in TSN order (oldest first)
-        candidateTSNs.sort { TSNTracker.isLessThan($0, $1) }
-
-        // 3. Select up to cwnd bytes (always at least one chunk so the lowest
-        //    outstanding TSN makes forward progress even when cwnd < chunk
-        //    size), and mutate ONLY the chunks actually retransmitted. Chunks
-        //    deferred for budget reasons keep their old lastSentTime so the
-        //    next tick re-selects them immediately rather than after a full RTO.
-        var burst: [SCTPDataChunk] = []
-        var budget = 0
-        for tsn in candidateTSNs {
-            guard var chunk = pending[tsn] else { continue }
-            let size = chunk.dataChunk.userData.count
-            if !burst.isEmpty {
-                let (next, overflow) = budget.addingReportingOverflow(size)
-                if overflow || next > cwnd { break }
-                budget = next
-            } else {
-                budget = size
-            }
-
-            chunk.retransmitCount += 1
-            chunk.lastSentTime = now
-            chunk.markedForRetransmit = false
-            chunk.missIndications = 0
-            pending[tsn] = chunk
-            burst.append(chunk.dataChunk)
-        }
-
-        return .success(burst)
+    /// Get chunks that need retransmission.
+    /// - Parameter now: Current time; injectable for deterministic testing.
+    /// - Returns: Chunks to retransmit, or failure if max retransmits exceeded.
+    public mutating func pendingRetransmissions(
+        now: ContinuousClock.Instant = .now
+    ) -> Result<[SCTPDataChunk], RetransmissionError> {
+        state.pendingRetransmissions(nowMillis: millis(now))
     }
 
-    /// Mark a chunk for fast retransmit (3 duplicate SACKs)
-    /// - Parameter tsn: TSN to mark
+    /// Mark a chunk for fast retransmit (3 duplicate SACKs).
     public mutating func markForFastRetransmit(tsn: UInt32) {
-        pending[tsn]?.markedForRetransmit = true
+        state.markForFastRetransmit(tsn: tsn)
     }
 
-    /// Check if queue is empty
-    public var isEmpty: Bool {
-        pending.isEmpty
-    }
+    /// Check if queue is empty.
+    public var isEmpty: Bool { state.isEmpty }
 
-    /// Number of pending chunks
-    public var count: Int {
-        pending.count
-    }
+    /// Number of pending chunks.
+    public var count: Int { state.count }
 
-    /// Check if we can send more data (congestion window check)
-    public var canSend: Bool {
-        bytesInFlight < cwnd
-    }
+    /// Check if we can send more data (congestion window check).
+    public var canSend: Bool { state.canSend }
 
-    /// Current RTO value
-    public var currentRTO: Duration {
-        rto
-    }
+    /// Highest TSN sent.
+    public var highestSentTSN: UInt32? { state.highestSentTSN }
 
-    // MARK: - Private
+    /// Number of bytes in flight.
+    public var bytesInFlight: Int { state.bytesInFlight }
 
-    private mutating func updateRTT(sentTime: ContinuousClock.Instant, receivedTime: ContinuousClock.Instant) {
-        let rtt = receivedTime - sentTime
+    /// Congestion window.
+    public var cwnd: Int { state.cwnd }
 
-        if let currentSRTT = srtt, let currentRTTVar = rttvar {
-            // RFC 4960 Section 6.3.1
-            let alpha = 0.125
-            let beta = 0.25
-
-            let rttSeconds = Double(rtt.components.seconds) + Double(rtt.components.attoseconds) / 1e18
-            let srttSeconds = Double(currentSRTT.components.seconds) + Double(currentSRTT.components.attoseconds) / 1e18
-            let rttvarSeconds = Double(currentRTTVar.components.seconds) + Double(currentRTTVar.components.attoseconds) / 1e18
-
-            let newRTTVar = (1 - beta) * rttvarSeconds + beta * abs(srttSeconds - rttSeconds)
-            let newSRTT = (1 - alpha) * srttSeconds + alpha * rttSeconds
-
-            rttvar = .seconds(newRTTVar)
-            srtt = .seconds(newSRTT)
-
-            // RTO = SRTT + 4 * RTTVAR
-            let newRTO = newSRTT + 4 * newRTTVar
-            rto = Duration.seconds(max(min(newRTO, 60), 1))
-        } else {
-            // First RTT measurement
-            srtt = rtt
-            rttvar = Duration.seconds(Double(rtt.components.seconds) / 2 + Double(rtt.components.attoseconds) / 2e18)
-            let srttSeconds = Double(rtt.components.seconds) + Double(rtt.components.attoseconds) / 1e18
-            let rttvarSeconds = srttSeconds / 2
-            rto = Duration.seconds(max(min(srttSeconds + 4 * rttvarSeconds, 60), 1))
-        }
-    }
-}
-
-/// Retransmission errors
-public enum RetransmissionError: Error, Sendable {
-    case maxRetransmitsExceeded(tsn: UInt32)
+    /// Current RTO value as a `Duration` (converted from the core's millis).
+    public var currentRTO: Duration { .milliseconds(Int64(state.currentRTOMillis)) }
 }

@@ -10,6 +10,21 @@
 import Foundation
 @_exported import SCTPWireCore
 
+// MARK: - SCTPStateError bridging
+
+extension SCTPStateError {
+    /// Maps the Embedded-clean state-machine error onto the historical
+    /// ``SCTPError`` so existing call sites (and tests) keep catching `SCTPError`.
+    public var asSCTPError: SCTPError {
+        switch self {
+        case .receiveBufferExceeded(let streamID):
+            return .receiveBufferExceeded(streamID: streamID)
+        case .sendQueueFull(let bytesInFlight, let limit):
+            return .sendQueueFull(bytesInFlight: bytesInFlight, limit: limit)
+        }
+    }
+}
+
 // MARK: - SCTPWireError unwrapping
 
 extension SCTPWireError {
@@ -48,6 +63,14 @@ public func == (lhs: [UInt8], rhs: Data) -> Bool { lhs == [UInt8](rhs) }
 public func == (lhs: Data, rhs: [UInt8]) -> Bool { [UInt8](lhs) == rhs }
 public func != (lhs: [UInt8], rhs: Data) -> Bool { !(lhs == rhs) }
 public func != (lhs: Data, rhs: [UInt8]) -> Bool { !(lhs == rhs) }
+
+// Optional `[UInt8]?` <-> `Data` bridges. `AssembledMessage.data` is `[UInt8]`
+// in the Embedded-clean core, so `someMessage?.data` is `[UInt8]?`; these let
+// existing call sites (and tests) compare it directly to `Data`.
+public func == (lhs: [UInt8]?, rhs: Data) -> Bool { lhs.map { $0 == rhs } ?? false }
+public func == (lhs: Data, rhs: [UInt8]?) -> Bool { rhs.map { lhs == $0 } ?? false }
+public func != (lhs: [UInt8]?, rhs: Data) -> Bool { !(lhs == rhs) }
+public func != (lhs: Data, rhs: [UInt8]?) -> Bool { !(lhs == rhs) }
 
 // MARK: - SCTPChunk (Data surface)
 

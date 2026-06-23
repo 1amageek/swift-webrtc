@@ -191,7 +191,9 @@ public final class SCTPAssociation: Sendable {
                 }
 
                 for msg in assembled {
-                    receivedData.append((msg.streamID, msg.ppid, msg.data))
+                    // AssembledMessage.data is [UInt8] in the Embedded-clean
+                    // core; bridge to Data at this adapter-side boundary.
+                    receivedData.append((msg.streamID, msg.ppid, Data(msg.data)))
                 }
 
             case .sack:
