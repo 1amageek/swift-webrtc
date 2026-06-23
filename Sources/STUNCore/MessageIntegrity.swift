@@ -1,78 +1,51 @@
-/// STUN MESSAGE-INTEGRITY (RFC 5389 Section 15.4)
+/// STUN MESSAGE-INTEGRITY (RFC 5389 Section 15.4) — Foundation adapter.
 ///
-/// HMAC-SHA1 over the STUN message (header + attributes up to MESSAGE-INTEGRITY).
-/// The message length in the header is adjusted to include MESSAGE-INTEGRITY.
+/// The integrity-input construction and the constant-time verification live in
+/// the Embedded-clean `MessageIntegrityCore` (STUNWireCore), which routes the
+/// HMAC through the `MessageAuthenticationCode` seam. This adapter keeps the
+/// historical `Data`-based surface and supplies the concrete HMAC-SHA1 via the
+/// lib-internal ``FoundationHMACSHA1`` provider. Verification is fail-closed: a
+/// mismatch yields `.invalid`, never `.valid`.
 
 import Foundation
-import Crypto
+import STUNWireCore
 
-/// Result of MESSAGE-INTEGRITY verification
-public enum IntegrityResult: Sendable, Equatable {
-    /// MESSAGE-INTEGRITY attribute present and valid
-    case valid
-    /// MESSAGE-INTEGRITY attribute present but invalid
-    case invalid
-    /// MESSAGE-INTEGRITY attribute not present
-    case missing
-}
+// Re-export the moved `IntegrityResult` so existing call sites keep using
+// `STUNCore.IntegrityResult` unchanged.
+public typealias IntegrityResult = STUNWireCore.IntegrityResult
 
-/// MESSAGE-INTEGRITY computation and verification
+/// MESSAGE-INTEGRITY computation and verification (`Data`-based adapter surface).
 public enum MessageIntegrity: Sendable {
 
-    /// Compute HMAC-SHA1 for MESSAGE-INTEGRITY attribute
+    /// Compute HMAC-SHA1 for the MESSAGE-INTEGRITY attribute.
     /// - Parameters:
     ///   - data: The STUN message bytes (with adjusted length)
     ///   - key: The HMAC key (ICE password as UTF-8)
     /// - Returns: 20-byte HMAC-SHA1
     public static func compute(data: Data, key: Data) -> Data {
-        let symmetricKey = SymmetricKey(data: key)
-        let mac = HMAC<Insecure.SHA1>.authenticationCode(for: data, using: symmetricKey)
-        return Data(mac)
+        Data(MessageIntegrityCore.compute(
+            data: [UInt8](data),
+            key: [UInt8](key),
+            as: FoundationHMACSHA1.self
+        ))
     }
 
-    /// Verify MESSAGE-INTEGRITY in a STUN message (tri-state result)
+    /// Verify MESSAGE-INTEGRITY in a STUN message (tri-state result).
     /// - Parameters:
     ///   - message: The complete STUN message bytes
     ///   - key: The HMAC key
     /// - Returns: IntegrityResult indicating valid, invalid, or missing
     public static func verifyWithResult(message input: Data, key: Data) -> IntegrityResult {
-        // Normalize to a zero-based buffer: the scan below uses absolute
-        // offsets and would trap/misparse on a Data slice.
-        let message = input.startIndex == 0 ? input : Data(input)
-        guard message.count >= stunHeaderSize else { return .missing }
-
-        // Find MESSAGE-INTEGRITY attribute
-        var offset = stunHeaderSize
-        let messageLength = Int(UInt16(message[2]) << 8 | UInt16(message[3]))
-        let end = stunHeaderSize + messageLength
-
-        while offset + stunAttributeHeaderSize <= end {
-            let attrType = UInt16(message[offset]) << 8 | UInt16(message[offset + 1])
-            let attrLength = Int(UInt16(message[offset + 2]) << 8 | UInt16(message[offset + 3]))
-
-            if attrType == STUNAttributeType.messageIntegrity.rawValue {
-                guard attrLength == 20 else { return .invalid }
-
-                let receivedMAC = Data(message[offset + stunAttributeHeaderSize..<offset + stunAttributeHeaderSize + 20])
-
-                // Recompute: use message up to (but not including) MESSAGE-INTEGRITY
-                // with length adjusted to include MESSAGE-INTEGRITY
-                var adjustedMsg = Data(message[0..<offset])
-                let adjustedLength = UInt16(offset - stunHeaderSize + stunAttributeHeaderSize + 20)
-                adjustedMsg[2] = UInt8(adjustedLength >> 8)
-                adjustedMsg[3] = UInt8(adjustedLength & 0xFF)
-
-                let computed = compute(data: adjustedMsg, key: key)
-                return computed == receivedMAC ? .valid : .invalid
-            }
-
-            offset += stunAttributeHeaderSize + ((attrLength + 3) & ~3)
-        }
-
-        return .missing
+        // `[UInt8](input)` is always zero-based, so a Data slice with a non-zero
+        // startIndex is normalized here (the core uses absolute offsets).
+        MessageIntegrityCore.verifyWithResult(
+            message: [UInt8](input),
+            key: [UInt8](key),
+            as: FoundationHMACSHA1.self
+        )
     }
 
-    /// Verify MESSAGE-INTEGRITY in a STUN message (legacy boolean API)
+    /// Verify MESSAGE-INTEGRITY in a STUN message (legacy boolean API).
     /// - Parameters:
     ///   - message: The complete STUN message bytes
     ///   - key: The HMAC key
