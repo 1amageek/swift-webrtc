@@ -58,12 +58,15 @@ public final class WebRTCConnection: Sendable {
         connState.withLock { $0.verifiedRemoteFingerprint }
     }
 
-    /// Remote peer's DER-encoded certificate (available after DTLS handshake).
+    /// Remote peer's DER-encoded leaf certificate (available after the DTLS
+    /// handshake completes).
     ///
-    /// Always `nil` until the facade exposes the peer certificate (see
-    /// ``DTLSEndpoint``).
+    /// The swift-tls Tier-1 DTLS facade surfaces the peer certificate, which the
+    /// internal ``DTLSEndpoint`` exposes; this delegates to it. `nil` while the
+    /// handshake is incomplete or no certificate was presented — never a silent
+    /// stub.
     public var remoteCertificateDER: Data? {
-        nil
+        dtlsEndpoint.remoteCertificateDER.map { Data($0) }
     }
 
     /// Stream of incoming data channels opened by the remote peer.
