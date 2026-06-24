@@ -92,4 +92,15 @@ enum DTLSEndpoint: Sendable {
         case .server(let s): return s.isEstablished
         }
     }
+
+    /// The peer's DER-encoded leaf certificate, if presented during the handshake.
+    /// `nil` while the handshake is incomplete or no certificate was received. The
+    /// swift-tls Tier-1 DTLS facade now surfaces this; WebRTC computes the
+    /// DTLS-SRTP fingerprint from it (RFC 8122).
+    var remoteCertificateDER: [UInt8]? {
+        switch self {
+        case .client(let c): return c.remoteCertificateDER
+        case .server(let s): return s.remoteCertificateDER
+        }
+    }
 }

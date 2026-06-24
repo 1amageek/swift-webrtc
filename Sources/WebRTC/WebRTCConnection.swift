@@ -702,11 +702,14 @@ public final class WebRTCConnection: Sendable {
 
     /// The peer's certificate fingerprint, if the DTLS layer can supply it.
     ///
-    /// Returns `nil` while the swift-tls Tier-1 DTLS facade does not expose the
-    /// peer certificate (see ``DTLSEndpoint``). When the facade gains a
-    /// peer-certificate accessor, compute `CertificateFingerprint.fromDER(...)`
-    /// here to restore full fail-closed verification.
+    /// The swift-tls Tier-1 DTLS facade now surfaces the peer's leaf certificate
+    /// after the handshake (see ``DTLSEndpoint``). We compute the SHA-256
+    /// fingerprint from that DER here, restoring full fail-closed DTLS-SRTP
+    /// verification (RFC 8122). Returns `nil` only when no peer certificate is
+    /// available (handshake incomplete / no cert), in which case the verifier
+    /// rejects — it never silently accepts an unverified peer.
     private func peerFingerprintIfAvailable() -> CertificateFingerprint? {
-        nil
+        guard let der = dtlsEndpoint.remoteCertificateDER else { return nil }
+        return CertificateFingerprint.fromDER(Data(der))
     }
 }
