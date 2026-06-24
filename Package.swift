@@ -32,13 +32,19 @@ let package = Package(
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
-        // Local path on the `embedded` branch: swift-tls's DTLS handshake/record
-        // is now cored (DTLSHandshakeCore / DTLSRecordCore), which makes the
-        // DTLSCore/DTLSRecord Foundation adapters consumed by WebRTC transitively
-        // Embedded-capable. The cored sources land after the released 1.3.0 tag,
-        // so this override is required until that work is tagged. NOT for release.
+        // Local path on the `embedded` branch: the DTLS handshake/record engine is
+        // driven through swift-tls's Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
+        // The former `DTLSCore`/`DTLSRecord` products were demoted to `package` in
+        // the tls facade redesign and are no longer importable here. NOT for release.
         .package(path: "../swift-tls"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
+        // WebRTC owns its DTLS-SRTP leaf certificate (self-signed ECDSA P-256) and
+        // its SHA-256 fingerprint locally, because the `TLS` facade takes a
+        // `TLSIdentity` (DER + raw key) rather than generating certificates. X.509
+        // generation needs swift-certificates + swift-asn1 (already in the graph
+        // transitively via swift-tls).
+        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.1"),
+        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
         .package(path: "../swift-p2p-core"),
     ],
@@ -113,8 +119,14 @@ let package = Package(
             name: "WebRTC",
             dependencies: [
                 "STUNCore", "ICELite", "SCTPCore", "DataChannel",
-                .product(name: "DTLSCore", package: "swift-tls"),
-                .product(name: "DTLSRecord", package: "swift-tls"),
+                // The DTLS handshake/record engine is driven through swift-tls's
+                // Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`). The former
+                // `DTLSCore`/`DTLSRecord` products were demoted to `package` in the
+                // tls facade redesign and are no longer importable here.
+                .product(name: "TLS", package: "swift-tls"),
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
                 .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/WebRTC"
@@ -122,6 +134,7 @@ let package = Package(
         // Tests
         .testTarget(name: "STUNCoreTests", dependencies: ["STUNCore"], path: "Tests/STUNCoreTests"),
         .testTarget(name: "ICELiteTests", dependencies: ["ICELite", "STUNCore"], path: "Tests/ICELiteTests"),
+        .testTarget(name: "ICELiteCoreTests", dependencies: ["ICELiteCore"], path: "Tests/ICELiteCoreTests"),
         .testTarget(name: "SCTPCoreTests", dependencies: ["SCTPCore"], path: "Tests/SCTPCoreTests"),
         .testTarget(name: "DataChannelTests", dependencies: ["DataChannel", "SCTPCore"], path: "Tests/DataChannelTests"),
         .testTarget(name: "WebRTCTests", dependencies: ["WebRTC"], path: "Tests/WebRTCTests"),

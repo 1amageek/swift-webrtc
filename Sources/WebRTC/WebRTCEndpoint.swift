@@ -8,7 +8,6 @@
 
 import Foundation
 import Synchronization
-import DTLSCore
 import STUNCore
 import ICELite
 import SCTPCore
@@ -18,7 +17,7 @@ import Logging
 /// WebRTC Direct endpoint for creating connections and listeners
 public final class WebRTCEndpoint: Sendable {
     /// The DTLS certificate for this endpoint
-    public let certificate: DTLSCertificate
+    public let certificate: WebRTCCertificate
 
     /// The local certificate fingerprint
     public var localFingerprint: CertificateFingerprint {
@@ -34,7 +33,7 @@ public final class WebRTCEndpoint: Sendable {
         var isClosed: Bool = false
     }
 
-    public init(certificate: DTLSCertificate, logger: Logger = Logger(label: "webrtc")) {
+    public init(certificate: WebRTCCertificate, logger: Logger = Logger(label: "webrtc")) {
         self.certificate = certificate
         self.logger = logger
         self.endpointState = Mutex(EndpointState())
@@ -42,7 +41,7 @@ public final class WebRTCEndpoint: Sendable {
 
     /// Create an endpoint with a new self-signed certificate
     public static func create(logger: Logger = Logger(label: "webrtc")) throws -> WebRTCEndpoint {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         return WebRTCEndpoint(certificate: cert, logger: logger)
     }
 

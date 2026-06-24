@@ -2,7 +2,7 @@
 
 import Testing
 import Foundation
-@testable import DTLSCore
+@testable import WebRTC
 
 @Suite("CertificateFingerprint Tests")
 struct CertificateFingerprintTests {

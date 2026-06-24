@@ -4,7 +4,6 @@ import Testing
 import Foundation
 import Synchronization
 @testable import WebRTC
-@testable import DTLSCore
 
 @Suite("WebRTC Endpoint Tests")
 struct WebRTCEndpointTests {
@@ -62,7 +61,7 @@ struct WebRTCConnectionTests {
 
     @Test("Client connection initial state")
     func clientConnectionInitialState() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let remoteFingerprint = CertificateFingerprint.fromDER(Data(repeating: 0xCD, count: 100))
 
         let connection = WebRTCConnection.asClient(
@@ -78,7 +77,7 @@ struct WebRTCConnectionTests {
 
     @Test("Server connection initial state")
     func serverConnectionInitialState() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
 
         let connection = WebRTCConnection.asServer(
             certificate: cert,
@@ -91,7 +90,7 @@ struct WebRTCConnectionTests {
 
     @Test("Client connection start triggers DTLS handshake")
     func clientStartSendsClientHello() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let remoteFingerprint = CertificateFingerprint.fromDER(Data(repeating: 0xEF, count: 100))
 
         let sentData = Mutex<[Data]>([])
@@ -113,7 +112,7 @@ struct WebRTCConnectionTests {
 
     @Test("Connection close sets state")
     func connectionClose() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let connection = WebRTCConnection.asServer(
             certificate: cert,
             sendHandler: { _ in }
@@ -125,7 +124,7 @@ struct WebRTCConnectionTests {
 
     @Test("ICE credentials are generated")
     func iceCredentials() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let connection = WebRTCConnection.asClient(
             certificate: cert,
             remoteFingerprint: CertificateFingerprint.fromDER(Data(repeating: 0, count: 32)),
@@ -143,7 +142,7 @@ struct WebRTCListenerTests {
 
     @Test("Listener accepts connections")
     func listenerAcceptsConnections() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         let conn = listener.acceptConnection(peerID: "127.0.0.1:5000", sendHandler: { _ in })
@@ -153,7 +152,7 @@ struct WebRTCListenerTests {
 
     @Test("Listener returns existing connection for same peer")
     func listenerReturnsExistingConnection() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         let conn1 = listener.acceptConnection(peerID: "127.0.0.1:5000", sendHandler: { _ in })
@@ -167,7 +166,7 @@ struct WebRTCListenerTests {
 
     @Test("Listener replaces a terminal connection for the same peer")
     func listenerReplacesTerminalConnection() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         let accepted1 = listener.acceptConnection(peerID: "127.0.0.1:5000", sendHandler: { _ in })
@@ -186,7 +185,7 @@ struct WebRTCListenerTests {
 
     @Test("Listener returns nil after close")
     func listenerCloseRejectsConnections() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         listener.close()
@@ -197,7 +196,7 @@ struct WebRTCListenerTests {
 
     @Test("Listener remove connection")
     func listenerRemoveConnection() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         let _ = listener.acceptConnection(peerID: "peer1", sendHandler: { _ in })
@@ -209,7 +208,7 @@ struct WebRTCListenerTests {
 
     @Test("Listener closes all connections on close")
     func listenerClosesAllConnections() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         let conn1 = listener.acceptConnection(peerID: "peer1", sendHandler: { _ in })
@@ -223,7 +222,7 @@ struct WebRTCListenerTests {
 
     @Test("Connections accepted before subscription are buffered")
     func connectionsBufferedBeforeSubscription() async throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let listener = WebRTCListener(certificate: cert)
 
         // Accept BEFORE anyone iterates `connections` — the eager stream
@@ -240,5 +239,44 @@ struct WebRTCListenerTests {
         }
         #expect(received.count == 1)
         #expect(received.first === accepted)
+    }
+
+    /// Many concurrent `acceptConnection` calls for the SAME peerID must all
+    /// observe a single claimed connection — never two. Two accepts both passing
+    /// the nil-check would orphan one connection's retransmitTask / DTLS state.
+    /// The check-and-claim is one critical section, so every caller that gets a
+    /// non-nil result gets the identical object, and the listener holds exactly one.
+    @Test("Concurrent accepts for the same peer never orphan a connection", .timeLimit(.minutes(1)))
+    func concurrentAcceptsDoNotOrphan() async throws {
+        let cert = try WebRTCCertificate.generateSelfSigned()
+        let listener = WebRTCListener(certificate: cert)
+        let peerID = "10.0.0.9:7000"
+
+        // Race many tasks claiming the same peerID at once.
+        let results: [WebRTCConnection] = await withTaskGroup(of: WebRTCConnection?.self) { group in
+            for _ in 0..<64 {
+                group.addTask {
+                    listener.acceptConnection(peerID: peerID, sendHandler: { _ in })
+                }
+            }
+            var collected: [WebRTCConnection] = []
+            for await conn in group {
+                if let conn { collected.append(conn) }
+            }
+            return collected
+        }
+
+        // Every successful caller observed the SAME connection object.
+        let first = try #require(results.first)
+        for conn in results {
+            #expect(conn === first)
+        }
+
+        // The listener holds exactly that one connection for the peer, and it was
+        // started (DTLS handshake state machine engaged), not orphaned.
+        #expect(listener.connection(for: peerID) === first)
+        #expect(first.state == .dtlsHandshaking)
+
+        listener.close()
     }
 }

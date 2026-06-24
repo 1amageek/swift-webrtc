@@ -6,7 +6,6 @@
 
 import Foundation
 import Synchronization
-import DTLSCore
 import ICELite
 import Logging
 
@@ -28,7 +27,7 @@ public final class WebRTCListener: Sendable {
 
     // MARK: - Private state
 
-    private let certificate: DTLSCertificate
+    private let certificate: WebRTCCertificate
     private let logger: Logger
     private let listenerState: Mutex<ListenerState>
 
@@ -42,7 +41,7 @@ public final class WebRTCListener: Sendable {
     // MARK: - Init
 
     public init(
-        certificate: DTLSCertificate,
+        certificate: WebRTCCertificate,
         logger: Logger = Logger(label: "webrtc.listener")
     ) {
         self.certificate = certificate
@@ -69,51 +68,83 @@ public final class WebRTCListener: Sendable {
         peerID: String,
         sendHandler: @escaping WebRTCConnection.SendHandler
     ) -> WebRTCConnection? {
-        let isClosed = listenerState.withLock { $0.isClosed }
-        if isClosed { return nil }
+        // Check-and-claim is ONE critical section: a concurrent accept for the
+        // same peerID must not let two callers both pass the nil-check and create
+        // two connections (the second would orphan the first's retransmitTask /
+        // DTLS state). Under the single lock we either return the live existing
+        // connection, or atomically claim the slot with a freshly-created
+        // connection (evicting a terminal one first). The connection is created
+        // inside the lock — only object construction, no I/O — so the claim is
+        // inseparable from the check.
+        enum ClaimOutcome {
+            case closed
+            case existing(WebRTCConnection)
+            case claimed(WebRTCConnection, terminalToClose: WebRTCConnection?, AsyncStream<WebRTCConnection>.Continuation?)
+        }
 
-        // Check if connection already exists. A terminal (failed/closed)
-        // connection is replaced by a fresh one so the peer can reconnect
-        // from the same address.
-        let existing = listenerState.withLock { $0.activeConnections[peerID] }
-        if let existing {
-            if !existing.state.isTerminal {
-                return existing
-            }
-            logger.info("Replacing terminal connection for peer: \(peerID)")
-            listenerState.withLock { state in
-                if state.activeConnections[peerID] === existing {
-                    state.activeConnections.removeValue(forKey: peerID)
+        let outcome = listenerState.withLock { state -> ClaimOutcome in
+            if state.isClosed { return .closed }
+
+            if let existing = state.activeConnections[peerID] {
+                if !existing.state.isTerminal {
+                    return .existing(existing)
                 }
+                // A terminal (failed/closed) connection is replaced by a fresh
+                // one so the peer can reconnect from the same address.
+                state.activeConnections.removeValue(forKey: peerID)
+                // Claim the slot atomically with the eviction.
+                let connection = WebRTCConnection.asServer(
+                    certificate: certificate,
+                    sendHandler: sendHandler,
+                    logger: logger
+                )
+                state.activeConnections[peerID] = connection
+                return .claimed(connection, terminalToClose: existing, state.continuation)
             }
-            existing.close()
-        }
 
-        let connection = WebRTCConnection.asServer(
-            certificate: certificate,
-            sendHandler: sendHandler,
-            logger: logger
-        )
-
-        // Initialize the server-side DTLS handshake state machine.
-        // This transitions to .dtlsHandshaking so incoming ClientHello
-        // packets pass the shouldProcessDTLS() gate.
-        do {
-            try connection.start()
-        } catch {
-            logger.error("Failed to start server connection: \(error)")
-            return nil
-        }
-
-        let continuation = listenerState.withLock { state -> AsyncStream<WebRTCConnection>.Continuation? in
+            let connection = WebRTCConnection.asServer(
+                certificate: certificate,
+                sendHandler: sendHandler,
+                logger: logger
+            )
             state.activeConnections[peerID] = connection
-            return state.continuation
+            return .claimed(connection, terminalToClose: nil, state.continuation)
         }
 
-        logger.info("Accepted new connection from peer: \(peerID)")
-        continuation?.yield(connection)
+        switch outcome {
+        case .closed:
+            return nil
+        case .existing(let existing):
+            return existing
+        case .claimed(let connection, let terminalToClose, let continuation):
+            if let terminalToClose {
+                logger.info("Replacing terminal connection for peer: \(peerID)")
+                terminalToClose.close()
+            }
 
-        return connection
+            // Initialize the server-side DTLS handshake state machine.
+            // This transitions to .dtlsHandshaking so incoming ClientHello
+            // packets pass the shouldProcessDTLS() gate. The slot is already
+            // claimed, so a concurrent accept observes this connection rather
+            // than creating a competing one. If start() fails, relinquish the
+            // claim (only if we still own it) so the peer can retry.
+            do {
+                try connection.start()
+            } catch {
+                logger.error("Failed to start server connection: \(error)")
+                listenerState.withLock { state in
+                    if state.activeConnections[peerID] === connection {
+                        state.activeConnections.removeValue(forKey: peerID)
+                    }
+                }
+                return nil
+            }
+
+            logger.info("Accepted new connection from peer: \(peerID)")
+            continuation?.yield(connection)
+
+            return connection
+        }
     }
 
     /// Get an existing connection by peer ID

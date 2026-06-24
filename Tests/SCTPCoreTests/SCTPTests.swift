@@ -200,3 +200,88 @@ struct SCTPPacketTests {
         #expect(!futureCookie.validate(secretKey: secretKey))
     }
 }
+
+/// Regression coverage for the ordered-delivery Stream-Sequence-Number (SSN)
+/// wrap. Reassembly now uses RFC 1982 serial-number arithmetic (matching the TSN
+/// path) instead of a fixed 0xF000/0x1000 band, so a message that legitimately
+/// straddles the 0xFFFF→0x0000 wrap is neither dropped nor spuriously buffered.
+@Suite("SCTP Ordered SSN Wrap Tests")
+struct SCTPOrderedSSNWrapTests {
+
+    private func dataChunk(
+        tsn: UInt32,
+        streamSequenceNumber: UInt16,
+        userData: [UInt8] = [0xAA]
+    ) -> SCTPDataChunk {
+        SCTPDataChunk(
+            tsn: tsn,
+            streamIdentifier: 0,
+            streamSequenceNumber: streamSequenceNumber,
+            payloadProtocolIdentifier: 53,
+            userData: userData
+        )
+    }
+
+    /// A delayed message whose SSN is the one just BEFORE the wrap (0xFFFF) — i.e.
+    /// serially the predecessor of the stream's current expected SSN 0 — must be
+    /// treated as OLD and discarded, NOT buffered as "future". The old
+    /// `seqNum > expected` band (0xFFFF > 0) buffered it forever, stalling the
+    /// stream and leaking the buffer slot.
+    @Test("Pre-wrap stale SSN is discarded, not buffered as future")
+    func staleSSNBeforeWrapDiscarded() throws {
+        var assembler = FragmentAssembler()
+
+        // Deliver SSN 0 in order (expected advances 0 → 1).
+        let first = try assembler.process(
+            chunk: dataChunk(tsn: 0, streamSequenceNumber: 0)
+        )
+        #expect(first.count == 1)
+
+        // A straggler with SSN 0xFFFF is serially BEFORE 0 (the wrap predecessor),
+        // hence old relative to expected (1): it must be discarded with no buffered
+        // state. Serial arithmetic decides this; the old band would have buffered it.
+        let straggler = try assembler.process(
+            chunk: dataChunk(tsn: 100, streamSequenceNumber: 0xFFFF)
+        )
+        #expect(straggler.isEmpty)
+        #expect(assembler.bufferedBytes == 0)
+        #expect(assembler.pendingCount == 0)
+    }
+
+    /// A genuinely future message that straddles the 0xFFFF→0x0000 wrap is
+    /// buffered when it arrives early, then flushed in order once the gap is
+    /// filled — proving the wrap does not silently drop a valid message. The
+    /// stream is first advanced so its expected SSN sits just below the wrap.
+    @Test("Out-of-order future SSN across the wrap is buffered then delivered")
+    func futureSSNAcrossWrapDeliveredInOrder() throws {
+        var assembler = FragmentAssembler()
+
+        // Advance the stream in order up to expected SSN 0xFFFF.
+        var ssn: UInt16 = 0
+        var tsn: UInt32 = 0
+        while ssn != 0xFFFF {
+            _ = try assembler.process(chunk: dataChunk(tsn: tsn, streamSequenceNumber: ssn))
+            ssn &+= 1
+            tsn &+= 1
+        }
+        // expected is now 0xFFFF.
+
+        // Deliver the POST-wrap message 0x0000 first (out of order): it is one SSN
+        // ahead of expected (0xFFFF), so it is buffered, not delivered.
+        let early = try assembler.process(
+            chunk: dataChunk(tsn: tsn &+ 1, streamSequenceNumber: 0x0000, userData: [0x01])
+        )
+        #expect(early.isEmpty)
+        #expect(assembler.bufferedBytes == 1)
+
+        // Now fill the gap with 0xFFFF: it delivers and then drains the buffered
+        // 0x0000 in order. A fixed-band heuristic could drop one across the wrap.
+        let drained = try assembler.process(
+            chunk: dataChunk(tsn: tsn, streamSequenceNumber: 0xFFFF, userData: [0x02])
+        )
+        #expect(drained.count == 2)
+        #expect(drained[0].sequenceNumber == 0xFFFF)
+        #expect(drained[1].sequenceNumber == 0x0000)
+        #expect(assembler.bufferedBytes == 0)
+    }
+}

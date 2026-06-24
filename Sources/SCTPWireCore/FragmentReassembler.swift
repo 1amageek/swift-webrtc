@@ -277,8 +277,11 @@ public struct FragmentReassembler: Sendable {
             }
 
             return delivered
-        } else if seqNum > expected || (expected > 0xF000 && seqNum < 0x1000) {
-            // Out of order - buffer for later
+        } else if Self.ssnIsLessThan(expected, seqNum) {
+            // Out of order - buffer for later. "Future" is decided by RFC 1982
+            // serial-number comparison on the 16-bit SSN (matching the TSN path),
+            // so a message that legitimately straddles the 0xFFFF→0x0000 wrap is
+            // buffered instead of being dropped by a fixed 0xF000/0x1000 band.
             var streamBuffer = orderedBuffer[streamID] ?? [:]
             guard streamBuffer.count < maxBufferedMessagesPerStream else {
                 throw .receiveBufferExceeded(streamID: streamID)
@@ -353,6 +356,13 @@ public struct FragmentReassembler: Sendable {
 
     private static func unorderedIndexKey(streamID: UInt16, sequenceNumber: UInt16) -> UInt32 {
         UInt32(streamID) << 16 | UInt32(sequenceNumber)
+    }
+
+    /// RFC 1982 serial-number comparison for the 16-bit Stream Sequence Number.
+    /// Returns `true` iff `a` precedes `b` in serial order, correctly handling
+    /// the 0xFFFF→0x0000 wrap. Mirrors `TSNTracker.isLessThan` for the 32-bit TSN.
+    static func ssnIsLessThan(_ a: UInt16, _ b: UInt16) -> Bool {
+        Int16(bitPattern: a &- b) < 0
     }
 
     /// Binary-insert a fragment keeping the array sorted by TSN

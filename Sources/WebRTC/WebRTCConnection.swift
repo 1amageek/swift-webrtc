@@ -6,12 +6,12 @@
 /// Transport-agnostic: uses a send closure for outgoing data and
 /// a `receive(_:remoteAddress:)` method for incoming data.
 ///
-/// DTLS is fully delegated to `DTLSConnection` (from DTLSRecord).
+/// DTLS is driven over the swift-tls Tier-1 `DTLSClient`/`DTLSServer` facade via
+/// the local ``DTLSEndpoint`` wrapper.
 
 import Foundation
 import Synchronization
-import DTLSCore
-import DTLSRecord
+import TLS
 import STUNCore
 import ICELite
 import SCTPCore
@@ -47,14 +47,23 @@ public final class WebRTCConnection: Sendable {
     /// Local certificate fingerprint
     public let localFingerprint: CertificateFingerprint
 
-    /// Remote certificate fingerprint (available after DTLS handshake)
+    /// Remote certificate fingerprint (available after DTLS handshake).
+    ///
+    /// NOTE: the swift-tls Tier-1 DTLS facade (`DTLSClient`/`DTLSServer`) does not
+    /// surface the peer certificate, so this is currently always `nil`. See
+    /// ``DTLSEndpoint`` for the reported facade gap. The fail-closed verifier in
+    /// ``onHandshakeComplete()`` rejects the handshake when an expected fingerprint
+    /// is configured and the peer fingerprint cannot be obtained.
     public var remoteFingerprint: CertificateFingerprint? {
-        dtlsConnection.remoteFingerprint
+        connState.withLock { $0.verifiedRemoteFingerprint }
     }
 
-    /// Remote peer's DER-encoded certificate (available after DTLS handshake)
+    /// Remote peer's DER-encoded certificate (available after DTLS handshake).
+    ///
+    /// Always `nil` until the facade exposes the peer certificate (see
+    /// ``DTLSEndpoint``).
     public var remoteCertificateDER: Data? {
-        dtlsConnection.remoteCertificateDER
+        nil
     }
 
     /// Stream of incoming data channels opened by the remote peer.
@@ -68,7 +77,7 @@ public final class WebRTCConnection: Sendable {
 
     // MARK: - Private state
 
-    private let dtlsConnection: DTLSConnection
+    private let dtlsEndpoint: DTLSEndpoint
     private let connState: Mutex<ConnState>
     private let channelState: Mutex<ChannelState>
     private let dataHandlerState: Mutex<DataHandler?>
@@ -88,6 +97,8 @@ public final class WebRTCConnection: Sendable {
         var sctpAssociation: SCTPAssociation
         var channelManager: DataChannelManager
         var isClient: Bool
+        /// The peer fingerprint verified at handshake completion, if obtainable.
+        var verifiedRemoteFingerprint: CertificateFingerprint?
 
         var state: WebRTCConnectionState {
             stateMachine.state
@@ -103,7 +114,7 @@ public final class WebRTCConnection: Sendable {
 
     /// Create a client-side connection
     public static func asClient(
-        certificate: DTLSCertificate,
+        certificate: WebRTCCertificate,
         remoteFingerprint expectedFingerprint: CertificateFingerprint,
         sendHandler: @escaping SendHandler,
         logger: Logger = Logger(label: "webrtc.connection")
@@ -130,7 +141,7 @@ public final class WebRTCConnection: Sendable {
     ///   to have the handshake fail on mismatch. Pass `nil` when the identity is bound
     ///   by a subsequent layer instead.
     public static func asServer(
-        certificate: DTLSCertificate,
+        certificate: WebRTCCertificate,
         remoteFingerprint expectedFingerprint: CertificateFingerprint? = nil,
         sendHandler: @escaping SendHandler,
         logger: Logger = Logger(label: "webrtc.connection")
@@ -145,7 +156,7 @@ public final class WebRTCConnection: Sendable {
     }
 
     private init(
-        certificate: DTLSCertificate,
+        certificate: WebRTCCertificate,
         isClient: Bool,
         expectedFingerprint: CertificateFingerprint?,
         sendHandler: @escaping SendHandler,
@@ -156,10 +167,19 @@ public final class WebRTCConnection: Sendable {
         // present a certificate and prove possession of its private key. Otherwise an
         // attacker could complete the handshake presenting a victim's (public) WebRTC
         // certificate without holding its key — full inbound peer impersonation.
-        self.dtlsConnection = DTLSConnection(
-            certificate: certificate,
-            requireClientCertificate: !isClient
-        )
+        //
+        // DTLSEndpoint.make can throw only on a malformed identity; this connection
+        // owns the certificate it just generated/validated, so a failure here is a
+        // programmer error in certificate construction, not a runtime peer input.
+        do {
+            self.dtlsEndpoint = try DTLSEndpoint.make(
+                certificate: certificate,
+                isClient: isClient,
+                requireClientCertificate: !isClient
+            )
+        } catch {
+            preconditionFailure("WebRTC local DTLS identity is invalid: \(error)")
+        }
         self.expectedFingerprint = expectedFingerprint
         self.sendHandler = sendHandler
         self.logger = logger
@@ -167,7 +187,8 @@ public final class WebRTCConnection: Sendable {
             iceAgent: ICELiteAgent(),
             sctpAssociation: SCTPAssociation(),
             channelManager: DataChannelManager(isInitiator: isClient),
-            isClient: isClient
+            isClient: isClient,
+            verifiedRemoteFingerprint: nil
         ))
         // Create the stream eagerly so channels arriving before the first
         // subscription are buffered rather than dropped
@@ -208,13 +229,17 @@ public final class WebRTCConnection: Sendable {
             return state.isClient
         }
 
-        if isClient {
-            let datagrams = try dtlsConnection.startHandshake(isClient: true)
-            for datagram in datagrams {
-                sendHandler(datagram)
-            }
-        } else {
-            _ = try dtlsConnection.startHandshake(isClient: false)
+        // Both roles start the handshake FSM; the client emits its ClientHello,
+        // the server has nothing to send until the first ClientHello arrives.
+        let datagrams: [[UInt8]]
+        do {
+            datagrams = try dtlsEndpoint.startHandshake()
+        } catch {
+            throw WebRTCError.dtlsHandshakeFailed(String(describing: error))
+        }
+        _ = isClient
+        for datagram in datagrams {
+            sendHandler(Data(datagram))
         }
     }
 
@@ -423,9 +448,9 @@ public final class WebRTCConnection: Sendable {
     }
 
     private func processDTLS(_ data: Data, remoteAddress: Data) throws {
-        let output: DTLSConnectionOutput
+        let output: DTLSOutput
         do {
-            output = try dtlsConnection.processReceivedDatagram(data, remoteAddress: remoteAddress)
+            output = try dtlsEndpoint.receive([UInt8](data), remoteAddress: [UInt8](remoteAddress))
         } catch {
             // P2.2: Propagate DTLS errors to state machine
             let reason = String(describing: error)
@@ -438,7 +463,7 @@ public final class WebRTCConnection: Sendable {
 
         // Send response datagrams
         for datagram in output.datagramsToSend {
-            sendHandler(datagram)
+            sendHandler(Data(datagram))
         }
 
         // Handle handshake completion
@@ -446,28 +471,40 @@ public final class WebRTCConnection: Sendable {
             try onHandshakeComplete()
         }
 
-        // Process application data (already decrypted by DTLSConnection)
+        // Process application data (already decrypted by the DTLS facade)
         if !output.applicationData.isEmpty {
-            try processSCTP(output.applicationData)
+            try processSCTP(Data(output.applicationData))
         }
     }
 
     private func onHandshakeComplete() throws {
-        // Verify remote fingerprint if expected
+        // Verify remote fingerprint if expected.
+        //
+        // FAIL-CLOSED: WebRTC's DTLS-SRTP peer authentication binds the peer's
+        // leaf-certificate fingerprint to the value advertised in signaling. The
+        // swift-tls Tier-1 DTLS facade does not yet expose the peer certificate
+        // (see ``DTLSEndpoint``), so when an expected fingerprint is configured we
+        // CANNOT verify it and MUST reject — never silently accept an unverified
+        // peer. When no expected fingerprint is set (e.g. a server whose peer
+        // identity is bound by a subsequent layer), the handshake proceeds.
         if let expected = expectedFingerprint {
-            guard let actual = dtlsConnection.remoteFingerprint else {
+            guard let actual = peerFingerprintIfAvailable() else {
+                let reason = "Cannot verify remote fingerprint: the DTLS facade does not expose the peer certificate (expected \(expected.sdpFormat))"
                 connState.withLock { state in
-                    _ = state.stateMachine.process(.dtlsHandshakeFailed("No remote certificate after handshake"))
+                    _ = state.stateMachine.process(.dtlsHandshakeFailed(reason))
                 }
-                throw WebRTCError.dtlsHandshakeFailed("No remote certificate")
+                finishIncomingChannels()
+                throw WebRTCError.dtlsHandshakeFailed(reason)
             }
             guard actual == expected else {
                 let reason = "Remote fingerprint mismatch: expected \(expected.sdpFormat), got \(actual.sdpFormat)"
                 connState.withLock { state in
                     _ = state.stateMachine.process(.dtlsHandshakeFailed(reason))
                 }
+                finishIncomingChannels()
                 throw WebRTCError.dtlsHandshakeFailed(reason)
             }
+            connState.withLock { $0.verifiedRemoteFingerprint = actual }
         }
 
         connState.withLock { state in
@@ -652,8 +689,24 @@ public final class WebRTCConnection: Sendable {
 
     @discardableResult
     private func encryptAndSend(_ plaintext: Data) throws -> Data {
-        let encrypted = try dtlsConnection.writeApplicationData(plaintext)
-        sendHandler(encrypted)
-        return encrypted
+        let encrypted: [UInt8]
+        do {
+            encrypted = try dtlsEndpoint.send([UInt8](plaintext))
+        } catch {
+            throw WebRTCError.dtlsHandshakeFailed(String(describing: error))
+        }
+        let datagram = Data(encrypted)
+        sendHandler(datagram)
+        return datagram
+    }
+
+    /// The peer's certificate fingerprint, if the DTLS layer can supply it.
+    ///
+    /// Returns `nil` while the swift-tls Tier-1 DTLS facade does not expose the
+    /// peer certificate (see ``DTLSEndpoint``). When the facade gains a
+    /// peer-certificate accessor, compute `CertificateFingerprint.fromDER(...)`
+    /// here to restore full fail-closed verification.
+    private func peerFingerprintIfAvailable() -> CertificateFingerprint? {
+        nil
     }
 }

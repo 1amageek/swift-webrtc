@@ -7,14 +7,13 @@ import Testing
 import Foundation
 import Synchronization
 @testable import WebRTC
-@testable import DTLSCore
 
 @Suite("WebRTC Connection Demultiplex Tests")
 struct WebRTCConnectionDemultiplexTests {
 
     @Test("Server start initializes handshake without error")
     func serverStartInitializesHandshake() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let connection = WebRTCConnection.asServer(
             certificate: cert,
             sendHandler: { _ in }
@@ -27,7 +26,7 @@ struct WebRTCConnectionDemultiplexTests {
 
     @Test("Receive empty data is no-op")
     func receiveEmptyDataIsNoop() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let sentData = Mutex<[Data]>([])
         let connection = WebRTCConnection.asServer(
             certificate: cert,
@@ -44,8 +43,8 @@ struct WebRTCConnectionDemultiplexTests {
     @Test("DTLS byte range (20-63) is routed to DTLS processing")
     func receiveDTLSRangeRouted() throws {
         // Create client → capture ClientHello
-        let clientCert = try DTLSCertificate.generateSelfSigned()
-        let serverCert = try DTLSCertificate.generateSelfSigned()
+        let clientCert = try WebRTCCertificate.generateSelfSigned()
+        let serverCert = try WebRTCCertificate.generateSelfSigned()
         let sentByClient = Mutex<[Data]>([])
         let client = WebRTCConnection.asClient(
             certificate: clientCert,
@@ -75,7 +74,7 @@ struct WebRTCConnectionDemultiplexTests {
 
     @Test("Unknown byte (>63, non-STUN) is ignored")
     func receiveUnknownByteIgnored() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let sentData = Mutex<[Data]>([])
         let connection = WebRTCConnection.asServer(
             certificate: cert,
@@ -129,7 +128,7 @@ struct WebRTCConnectionDataHandlerTests {
 
     @Test("setDataHandler stores handler")
     func setDataHandlerStoresHandler() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let connection = WebRTCConnection.asClient(
             certificate: cert,
             remoteFingerprint: CertificateFingerprint.fromDER(Data(repeating: 0, count: 32)),
@@ -150,7 +149,7 @@ struct WebRTCConnectionDataHandlerTests {
 
     @Test("close clears data handler")
     func closeNilsDataHandler() throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let connection = WebRTCConnection.asServer(
             certificate: cert,
             sendHandler: { _ in }
@@ -172,7 +171,7 @@ struct WebRTCConnectionDataHandlerTests {
 
     @Test("incomingChannels after close returns a terminated stream")
     func incomingChannelsAfterCloseTerminates() async throws {
-        let cert = try DTLSCertificate.generateSelfSigned()
+        let cert = try WebRTCCertificate.generateSelfSigned()
         let connection = WebRTCConnection.asServer(
             certificate: cert,
             sendHandler: { _ in }

@@ -85,6 +85,17 @@ public struct ICELiteStateMachine: Sendable, Equatable {
     /// Validated peer keys ("address:port"), supplied by the adapter.
     public private(set) var validatedPeers: Set<String>
 
+    /// Insertion order of `validatedPeers`, oldest first, used for FIFO eviction
+    /// once the cap is reached. Kept in lockstep with `validatedPeers`.
+    private var validatedPeerOrder: [String]
+
+    /// Hard cap on the validated-peer set. A single roaming peer reaching us from
+    /// many source addresses would otherwise grow `validatedPeers` without bound;
+    /// the cap bounds memory by evicting the oldest entry (FIFO). It does NOT relax
+    /// the connectivity check — a peer is only ever inserted after `verdict(for:)`
+    /// returns `.accept`.
+    public static let maxValidatedPeers: Int = 1000
+
     public init(
         localUfrag: String,
         remoteUfrag: String? = nil,
@@ -94,6 +105,7 @@ public struct ICELiteStateMachine: Sendable, Equatable {
         self.remoteUfrag = remoteUfrag
         self.state = state
         self.validatedPeers = []
+        self.validatedPeerOrder = []
     }
 
     // MARK: - State transitions (caller-locked; adapter holds the Mutex)
@@ -119,6 +131,7 @@ public struct ICELiteStateMachine: Sendable, Equatable {
     public mutating func close() {
         state = .closed
         validatedPeers.removeAll()
+        validatedPeerOrder.removeAll()
     }
 
     // MARK: - Connectivity check decision (pure, fail-closed)
@@ -189,8 +202,27 @@ public struct ICELiteStateMachine: Sendable, Equatable {
 
     /// Marks `peerKey` validated and advances `.new`/`.checking` to `.connected`.
     /// Call this only after ``verdict(for:)`` returns `.accept`.
+    ///
+    /// The validated-peer set is bounded by ``maxValidatedPeers``: re-validating a
+    /// key already present is a no-op for membership but refreshes its recency, and
+    /// admitting a new key past the cap evicts the oldest entry (FIFO). The cap is
+    /// purely a memory bound — the caller has already passed the STUN check.
     public mutating func markValidated(peerKey: String) {
-        validatedPeers.insert(peerKey)
+        if validatedPeers.contains(peerKey) {
+            // Refresh recency so a steadily-active peer is not evicted ahead of
+            // peers that have gone silent.
+            if let idx = validatedPeerOrder.firstIndex(of: peerKey) {
+                validatedPeerOrder.remove(at: idx)
+            }
+            validatedPeerOrder.append(peerKey)
+        } else {
+            if validatedPeers.count >= Self.maxValidatedPeers, !validatedPeerOrder.isEmpty {
+                let evicted = validatedPeerOrder.removeFirst()
+                validatedPeers.remove(evicted)
+            }
+            validatedPeers.insert(peerKey)
+            validatedPeerOrder.append(peerKey)
+        }
         if state == .checking || state == .new {
             state = .connected
         }
