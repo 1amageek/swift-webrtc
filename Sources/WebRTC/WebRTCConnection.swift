@@ -47,13 +47,14 @@ public final class WebRTCConnection: Sendable {
     /// Local certificate fingerprint
     public let localFingerprint: CertificateFingerprint
 
-    /// Remote certificate fingerprint (available after DTLS handshake).
+    /// Remote certificate fingerprint, verified after the DTLS handshake.
     ///
-    /// NOTE: the swift-tls Tier-1 DTLS facade (`DTLSClient`/`DTLSServer`) does not
-    /// surface the peer certificate, so this is currently always `nil`. See
-    /// ``DTLSEndpoint`` for the reported facade gap. The fail-closed verifier in
-    /// ``onHandshakeComplete()`` rejects the handshake when an expected fingerprint
-    /// is configured and the peer fingerprint cannot be obtained.
+    /// The swift-tls Tier-1 DTLS facade surfaces the peer certificate via
+    /// `remoteCertificateDER`; ``onHandshakeComplete()`` computes this fingerprint
+    /// from it and only stores it once verified. It is `nil` until the handshake
+    /// completes, or if the peer presented no certificate. The fail-closed verifier
+    /// rejects the handshake when an expected fingerprint is configured and the
+    /// peer fingerprint mismatches or cannot be obtained.
     public var remoteFingerprint: CertificateFingerprint? {
         connState.withLock { $0.verifiedRemoteFingerprint }
     }
@@ -485,14 +486,16 @@ public final class WebRTCConnection: Sendable {
         //
         // FAIL-CLOSED: WebRTC's DTLS-SRTP peer authentication binds the peer's
         // leaf-certificate fingerprint to the value advertised in signaling. The
-        // swift-tls Tier-1 DTLS facade does not yet expose the peer certificate
-        // (see ``DTLSEndpoint``), so when an expected fingerprint is configured we
-        // CANNOT verify it and MUST reject — never silently accept an unverified
-        // peer. When no expected fingerprint is set (e.g. a server whose peer
-        // identity is bound by a subsequent layer), the handshake proceeds.
+        // swift-tls Tier-1 DTLS facade surfaces the peer certificate (see
+        // ``DTLSEndpoint``), so when an expected fingerprint is configured we
+        // compute the peer's fingerprint and accept ONLY on an exact match —
+        // rejecting on mismatch, or when the peer presented no certificate. Never
+        // silently accept an unverified peer. When no expected fingerprint is set
+        // (e.g. a server whose peer identity is bound by a subsequent layer), the
+        // handshake proceeds.
         if let expected = expectedFingerprint {
             guard let actual = peerFingerprintIfAvailable() else {
-                let reason = "Cannot verify remote fingerprint: the DTLS facade does not expose the peer certificate (expected \(expected.sdpFormat))"
+                let reason = "Cannot verify remote fingerprint: the peer presented no certificate (expected \(expected.sdpFormat))"
                 connState.withLock { state in
                     _ = state.stateMachine.process(.dtlsHandshakeFailed(reason))
                 }

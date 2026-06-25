@@ -7,18 +7,17 @@
 /// surface: feed received datagrams via `receive`, send the returned datagrams,
 /// drive flight retransmission via `handleTimeout`.
 ///
-/// ## Peer-certificate gap (reported integration nuance)
+/// ## DTLS-SRTP peer authentication
 ///
-/// The facade's `DTLSClient`/`DTLSServer`/`DTLSOutput` do NOT expose the peer's
-/// certificate or its fingerprint after the handshake (the engine has it, but the
-/// Tier-1 facade does not surface it, and `DTLSConfiguration` has no
-/// certificate-validator hook — unlike `TLSConfiguration`). WebRTC's DTLS-SRTP
-/// peer authentication binds the peer's leaf-certificate fingerprint to the value
-/// advertised in signaling. Because the facade hides the peer certificate,
-/// `remoteCertificateDER`/`remoteFingerprint` are unavailable here. The verifier
-/// in `WebRTCConnection` therefore fails CLOSED when an expected fingerprint is
-/// configured but the peer fingerprint cannot be obtained — it never silently
-/// accepts an unverified peer.
+/// The swift-tls Tier-1 facade surfaces the peer's leaf certificate via
+/// `DTLSClient`/`DTLSServer.remoteCertificateDER` (re-exposed here as
+/// `remoteCertificateDER`). WebRTC's DTLS-SRTP authentication binds the SHA-256
+/// fingerprint of that certificate to the value advertised in signaling
+/// (RFC 8122): `WebRTCConnection.onHandshakeComplete()` computes the peer
+/// fingerprint from the surfaced DER and, when an expected fingerprint is
+/// configured, completes the handshake on match and fails CLOSED on mismatch — or
+/// when the peer certificate is genuinely unavailable. It never silently accepts
+/// an unverified peer.
 
 import Foundation
 import TLS
