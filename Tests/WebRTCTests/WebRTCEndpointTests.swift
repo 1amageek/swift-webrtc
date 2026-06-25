@@ -98,7 +98,7 @@ struct WebRTCConnectionTests {
             certificate: cert,
             remoteFingerprint: remoteFingerprint,
             sendHandler: { data in
-                sentData.withLock { $0.append(data) }
+                sentData.withLock { $0.append(Data(data)) }
             }
         )
 

@@ -4,9 +4,9 @@
 /// Transport-agnostic: the transport layer feeds incoming data
 /// and provides a send handler per connection.
 
-import Foundation
 import ICELite
 #if !hasFeature(Embedded)
+import Foundation
 import Logging
 #endif
 

@@ -30,7 +30,7 @@ struct WebRTCConnectionDemultiplexTests {
         let sentData = Mutex<[Data]>([])
         let connection = WebRTCConnection.asServer(
             certificate: cert,
-            sendHandler: { data in sentData.withLock { $0.append(data) } }
+            sendHandler: { data in sentData.withLock { $0.append(Data(data)) } }
         )
 
         try connection.start()
@@ -49,7 +49,7 @@ struct WebRTCConnectionDemultiplexTests {
         let client = WebRTCConnection.asClient(
             certificate: clientCert,
             remoteFingerprint: serverCert.fingerprint,
-            sendHandler: { data in sentByClient.withLock { $0.append(data) } }
+            sendHandler: { data in sentByClient.withLock { $0.append(Data(data)) } }
         )
 
         try client.start()
@@ -62,7 +62,7 @@ struct WebRTCConnectionDemultiplexTests {
         let sentByServer = Mutex<[Data]>([])
         let server = WebRTCConnection.asServer(
             certificate: serverCert,
-            sendHandler: { data in sentByServer.withLock { $0.append(data) } }
+            sendHandler: { data in sentByServer.withLock { $0.append(Data(data)) } }
         )
         try server.start()
         try server.receive(clientHello[0])
@@ -78,7 +78,7 @@ struct WebRTCConnectionDemultiplexTests {
         let sentData = Mutex<[Data]>([])
         let connection = WebRTCConnection.asServer(
             certificate: cert,
-            sendHandler: { data in sentData.withLock { $0.append(data) } }
+            sendHandler: { data in sentData.withLock { $0.append(Data(data)) } }
         )
 
         try connection.start()
@@ -95,30 +95,30 @@ struct WebRTCConnectionDemultiplexTests {
     @Test("remote endpoint decoding extracts IPv4 port")
     func decodeIPv4RemoteEndpoint() {
         let endpoint = WebRTCConnection.decodeRemoteEndpoint(
-            Data([192, 168, 1, 1, 0x13, 0x88])
+            [192, 168, 1, 1, 0x13, 0x88]
         )
 
-        #expect(endpoint.address == Data([192, 168, 1, 1]))
+        #expect(endpoint.address == [192, 168, 1, 1])
         #expect(endpoint.port == 5000)
     }
 
     @Test("remote endpoint decoding extracts IPv6 port")
     func decodeIPv6RemoteEndpoint() {
         let endpoint = WebRTCConnection.decodeRemoteEndpoint(
-            Data(Array(repeating: 0x20, count: 16) + [0x13, 0x88])
+            Array(repeating: 0x20, count: 16) + [0x13, 0x88]
         )
 
-        #expect(endpoint.address == Data(Array(repeating: 0x20, count: 16)))
+        #expect(endpoint.address == Array(repeating: 0x20, count: 16))
         #expect(endpoint.port == 5000)
     }
 
     @Test("remote endpoint decoding falls back to raw address")
     func decodeRemoteEndpointWithoutPort() {
         let endpoint = WebRTCConnection.decodeRemoteEndpoint(
-            Data([192, 168, 1, 1])
+            [192, 168, 1, 1]
         )
 
-        #expect(endpoint.address == Data([192, 168, 1, 1]))
+        #expect(endpoint.address == [192, 168, 1, 1])
         #expect(endpoint.port == 0)
     }
 }
@@ -156,7 +156,7 @@ struct WebRTCConnectionDataHandlerTests {
         )
 
         let handlerCalled = Mutex(false)
-        connection.setDataHandler { _, _ in
+        connection.setDataHandler { (_: UInt16, _: [UInt8]) in
             handlerCalled.withLock { $0 = true }
         }
 

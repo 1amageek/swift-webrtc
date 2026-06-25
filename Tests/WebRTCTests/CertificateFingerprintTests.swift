@@ -1,7 +1,6 @@
 /// Tests for CertificateFingerprint
 
 import Testing
-import Foundation
 @testable import WebRTC
 
 @Suite("CertificateFingerprint Tests")
@@ -9,7 +8,7 @@ struct CertificateFingerprintTests {
 
     @Test("fromDigest preserves bytes unchanged")
     func fromDigestPreservesBytes() {
-        let digest = Data(repeating: 0xAB, count: 32)
+        let digest: [UInt8] = Array(repeating: 0xAB, count: 32)
         let fingerprint = CertificateFingerprint.fromDigest(digest)
         #expect(fingerprint.bytes == digest)
         #expect(fingerprint.algorithm == .sha256)
@@ -17,7 +16,7 @@ struct CertificateFingerprintTests {
 
     @Test("fromDigest does not double-hash")
     func fromDigestDoesNotDoubleHash() {
-        let digest = Data(repeating: 0xCD, count: 32)
+        let digest: [UInt8] = Array(repeating: 0xCD, count: 32)
 
         let fromDigestFP = CertificateFingerprint.fromDigest(digest)
         let fromDERFP = CertificateFingerprint.fromDER(digest)
@@ -30,7 +29,7 @@ struct CertificateFingerprintTests {
 
     @Test("fromDER hashes input with SHA-256")
     func fromDERHashesInput() {
-        let derData = Data(repeating: 0xEF, count: 100)
+        let derData: [UInt8] = Array(repeating: 0xEF, count: 100)
         let fingerprint = CertificateFingerprint.fromDER(derData)
 
         // SHA-256 always produces 32 bytes
@@ -41,7 +40,7 @@ struct CertificateFingerprintTests {
 
     @Test("fromDigest equality for same bytes")
     func fromDigestEquality() {
-        let digest = Data(repeating: 0x42, count: 32)
+        let digest: [UInt8] = Array(repeating: 0x42, count: 32)
         let fp1 = CertificateFingerprint.fromDigest(digest)
         let fp2 = CertificateFingerprint.fromDigest(digest)
         #expect(fp1 == fp2)
@@ -50,7 +49,7 @@ struct CertificateFingerprintTests {
 
     @Test("multihash roundtrip via fromDigest")
     func multihashRoundtrip() {
-        let originalDigest = Data(repeating: 0x99, count: 32)
+        let originalDigest: [UInt8] = Array(repeating: 0x99, count: 32)
         let fingerprint = CertificateFingerprint.fromDigest(originalDigest)
 
         let multihash = fingerprint.multihash
@@ -60,7 +59,7 @@ struct CertificateFingerprintTests {
         #expect(multihash[1] == 0x20)
 
         // Extract digest from multihash and recreate
-        let extractedDigest = Data(multihash[2...])
+        let extractedDigest = Array(multihash[2...])
         let reconstructed = CertificateFingerprint.fromDigest(extractedDigest)
         #expect(reconstructed == fingerprint)
     }

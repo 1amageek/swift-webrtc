@@ -96,11 +96,11 @@ struct WebRTCLoopbackTests {
         let client = WebRTCConnection.asClient(
             certificate: clientCert,
             remoteFingerprint: serverCert.fingerprint,
-            sendHandler: { data in clientOutbox.withLock { $0.append(data) } }
+            sendHandler: { data in clientOutbox.withLock { $0.append(Data(data)) } }
         )
         let server = WebRTCConnection.asServer(
             certificate: serverCert,
-            sendHandler: { data in serverOutbox.withLock { $0.append(data) } }
+            sendHandler: { data in serverOutbox.withLock { $0.append(Data(data)) } }
         )
 
         try server.start()
@@ -139,11 +139,11 @@ struct WebRTCLoopbackTests {
         let client = WebRTCConnection.asClient(
             certificate: clientCert,
             remoteFingerprint: bogusFingerprint,
-            sendHandler: { data in clientOutbox.withLock { $0.append(data) } }
+            sendHandler: { data in clientOutbox.withLock { $0.append(Data(data)) } }
         )
         let server = WebRTCConnection.asServer(
             certificate: serverCert,
-            sendHandler: { data in serverOutbox.withLock { $0.append(data) } }
+            sendHandler: { data in serverOutbox.withLock { $0.append(Data(data)) } }
         )
 
         try server.start()

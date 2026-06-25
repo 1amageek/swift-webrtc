@@ -9,13 +9,13 @@
 /// DTLS is driven over the swift-tls Tier-1 `DTLSClient`/`DTLSServer` facade via
 /// the local ``DTLSEndpoint`` wrapper.
 
-import Foundation
 import TLS
 import STUNCore
 import ICELite
 import SCTPCore
 import DataChannel
 #if !hasFeature(Embedded)
+import Foundation
 import Logging
 #endif
 
@@ -32,11 +32,17 @@ import Logging
 /// transports cannot deadlock.
 public final class WebRTCConnection: Sendable {
 
-    /// Callback to send raw bytes to the remote peer
-    public typealias SendHandler = @Sendable (Data) -> Void
+    /// Callback to send raw bytes to the remote peer.
+    ///
+    /// The currency is `[UInt8]` (Embedded-clean). Host callers that work in
+    /// `Data` can pass a `{ data in ... }` closure that accepts `[UInt8]` (e.g.
+    /// `ByteBuffer.writeBytes` consumes a `Sequence<UInt8>` either way), or use
+    /// the host-only `Data` overloads on `receive`/`send`/`setDataHandler`.
+    public typealias SendHandler = @Sendable ([UInt8]) -> Void
 
-    /// Callback to deliver application data (channelID, payload)
-    public typealias DataHandler = @Sendable (UInt16, Data) -> Void
+    /// Callback to deliver application data (channelID, payload). `[UInt8]`
+    /// currency; a host-only `Data`-closure overload of `setDataHandler` wraps it.
+    public typealias DataHandler = @Sendable (UInt16, [UInt8]) -> Void
 
     // MARK: - Public properties
 
@@ -67,8 +73,8 @@ public final class WebRTCConnection: Sendable {
     /// internal ``DTLSEndpoint`` exposes; this delegates to it. `nil` while the
     /// handshake is incomplete or no certificate was presented — never a silent
     /// stub.
-    public var remoteCertificateDER: Data? {
-        dtlsEndpoint.remoteCertificateDER.map { Data($0) }
+    public var remoteCertificateDER: [UInt8]? {
+        dtlsEndpoint.remoteCertificateDER
     }
 
     /// Stream of incoming data channels opened by the remote peer.
@@ -228,9 +234,25 @@ public final class WebRTCConnection: Sendable {
     /// Set a handler to receive application data from data channels.
     ///
     /// The handler receives `(channelID, payload)` for each non-DCEP data chunk.
+    /// The payload currency is `[UInt8]` (Embedded-clean).
     public func setDataHandler(_ handler: @escaping DataHandler) {
         dataHandlerState.withLock { $0 = handler }
     }
+
+    #if !hasFeature(Embedded)
+    /// Host-only `Data` convenience: set a `(channelID, Data)` handler. Wraps the
+    /// `[UInt8]` core so existing host callers keep their `Data`-based closures.
+    ///
+    /// The bridge closure is explicitly typed `DataHandler`
+    /// (`(UInt16, [UInt8]) -> Void`) so overload resolution binds the `[UInt8]`
+    /// core method, not this `Data` overload (which would recurse).
+    public func setDataHandler(_ handler: @escaping @Sendable (UInt16, Data) -> Void) {
+        let bridge: DataHandler = { channelID, payload in
+            handler(channelID, Data(payload))
+        }
+        setDataHandler(bridge)
+    }
+    #endif
 
     /// Start the connection process (client-side: initiates DTLS handshake)
     public func start() throws {
@@ -249,7 +271,7 @@ public final class WebRTCConnection: Sendable {
         }
         _ = isClient
         for datagram in datagrams {
-            sendHandler(Data(datagram))
+            sendHandler(datagram)
         }
     }
 
@@ -273,7 +295,7 @@ public final class WebRTCConnection: Sendable {
     /// - Throws: `WebRTCError.closed` if the connection has been closed,
     ///   `WebRTCError.dtlsHandshakeFailed` on a fatal DTLS failure,
     ///   `WebRTCError.sctpFailed` on a fatal SCTP failure
-    public func receive(_ data: Data, remoteAddress: Data = Data()) throws {
+    public func receive(_ data: [UInt8], remoteAddress: [UInt8] = []) throws {
         // P2.4: Check for closed/failed state before processing
         let isClosed = connState.withLock { state in
             state.stateMachine.isTerminal
@@ -301,7 +323,15 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
-    private func demultiplex(_ data: Data, remoteAddress: Data) throws {
+    #if !hasFeature(Embedded)
+    /// Host-only `Data` convenience: process an incoming UDP datagram. Wraps the
+    /// `[UInt8]` core so existing host callers keep passing `Data`.
+    public func receive(_ data: Data, remoteAddress: Data = Data()) throws {
+        try receive([UInt8](data), remoteAddress: [UInt8](remoteAddress))
+    }
+    #endif
+
+    private func demultiplex(_ data: [UInt8], remoteAddress: [UInt8]) throws {
         let firstByte = data[data.startIndex]
 
         // RFC 5764 §5.1.2 demultiplex by first byte value:
@@ -346,8 +376,8 @@ public final class WebRTCConnection: Sendable {
             guard state.stateMachine.isConnected else {
                 throw WebRTCError.invalidState("Cannot open data channel in state \(state.stateMachine.state)")
             }
-            let (channel, dcepData) = try state.channelManager.openChannel(label: label, ordered: ordered)
-            let sctpPacket = try state.sctpAssociation.sendData(
+            let (channel, dcepData) = try state.channelManager.openChannelBytes(label: label, ordered: ordered)
+            let sctpPacket = try state.sctpAssociation.sendDataBytes(
                 streamID: channel.id,
                 payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
                 data: dcepData
@@ -355,7 +385,7 @@ public final class WebRTCConnection: Sendable {
             return (channel, sctpPacket)
         }
 
-        try encryptAndSend(sctpPacket.encode())
+        try encryptAndSend(sctpPacket.encodeBytes())
         return channel
     }
 
@@ -365,7 +395,7 @@ public final class WebRTCConnection: Sendable {
     ///   - channelID: The data channel stream ID
     ///   - binary: Whether data is binary (true) or string (false)
     /// - Throws: `WebRTCError.invalidState` if the connection is not established
-    public func send(_ data: Data, on channelID: UInt16, binary: Bool = true) throws {
+    public func send(_ data: [UInt8], on channelID: UInt16, binary: Bool = true) throws {
         let ppid: UInt32
         if data.isEmpty {
             ppid = binary ? DataChannelPPID.binaryEmpty.rawValue : DataChannelPPID.stringEmpty.rawValue
@@ -377,15 +407,23 @@ public final class WebRTCConnection: Sendable {
             guard state.stateMachine.isConnected else {
                 throw WebRTCError.invalidState("Cannot send data in state \(state.stateMachine.state)")
             }
-            return try state.sctpAssociation.sendData(
+            return try state.sctpAssociation.sendDataBytes(
                 streamID: channelID,
                 payloadProtocolIdentifier: ppid,
                 data: data
             )
         }
 
-        try encryptAndSend(sctpPacket.encode())
+        try encryptAndSend(sctpPacket.encodeBytes())
     }
+
+    #if !hasFeature(Embedded)
+    /// Host-only `Data` convenience: send data on a data channel. Wraps the
+    /// `[UInt8]` core so existing host callers keep passing `Data`.
+    public func send(_ data: Data, on channelID: UInt16, binary: Bool = true) throws {
+        try send([UInt8](data), on: channelID, binary: binary)
+    }
+    #endif
 
     /// Close the connection
     public func close() {
@@ -412,12 +450,12 @@ public final class WebRTCConnection: Sendable {
 
     // MARK: - Private protocol processing
 
-    private func processSTUN(_ data: Data, remoteAddress: Data) throws {
+    private func processSTUN(_ data: [UInt8], remoteAddress: [UInt8]) throws {
         let endpoint = Self.decodeRemoteEndpoint(remoteAddress)
 
         // Single lock for ICE processing + state transition (fixes race condition)
-        let response = connState.withLock { state -> Data? in
-            let stunResponse = state.iceAgent.processSTUN(
+        let response = connState.withLock { state -> [UInt8]? in
+            let stunResponse = state.iceAgent.processSTUNBytes(
                 data: data,
                 sourceAddress: endpoint.address,
                 sourcePort: endpoint.port
@@ -438,29 +476,25 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
-    static func decodeRemoteEndpoint(_ remoteAddress: Data) -> (address: Data, port: UInt16) {
+    static func decodeRemoteEndpoint(_ remoteAddress: [UInt8]) -> (address: [UInt8], port: UInt16) {
         switch remoteAddress.count {
         case 6:
-            let address = Data(remoteAddress.prefix(4))
-            let portBytes = remoteAddress.suffix(2)
-            let port = UInt16(portBytes[portBytes.startIndex]) << 8 |
-                UInt16(portBytes[portBytes.index(after: portBytes.startIndex)])
+            let address = Array(remoteAddress[0..<4])
+            let port = UInt16(remoteAddress[4]) << 8 | UInt16(remoteAddress[5])
             return (address, port)
         case 18:
-            let address = Data(remoteAddress.prefix(16))
-            let portBytes = remoteAddress.suffix(2)
-            let port = UInt16(portBytes[portBytes.startIndex]) << 8 |
-                UInt16(portBytes[portBytes.index(after: portBytes.startIndex)])
+            let address = Array(remoteAddress[0..<16])
+            let port = UInt16(remoteAddress[16]) << 8 | UInt16(remoteAddress[17])
             return (address, port)
         default:
             return (remoteAddress, 0)
         }
     }
 
-    private func processDTLS(_ data: Data, remoteAddress: Data) throws {
+    private func processDTLS(_ data: [UInt8], remoteAddress: [UInt8]) throws {
         let output: DTLSOutput
         do {
-            output = try dtlsEndpoint.receive([UInt8](data), remoteAddress: [UInt8](remoteAddress))
+            output = try dtlsEndpoint.receive(data, remoteAddress: remoteAddress)
         } catch {
             // P2.2: Propagate DTLS errors to state machine
             let reason = String(describing: error)
@@ -473,7 +507,7 @@ public final class WebRTCConnection: Sendable {
 
         // Send response datagrams
         for datagram in output.datagramsToSend {
-            sendHandler(Data(datagram))
+            sendHandler(datagram)
         }
 
         // Handle handshake completion
@@ -483,7 +517,7 @@ public final class WebRTCConnection: Sendable {
 
         // Process application data (already decrypted by the DTLS facade)
         if !output.applicationData.isEmpty {
-            try processSCTP(Data(output.applicationData))
+            try processSCTP(output.applicationData)
         }
     }
 
@@ -531,11 +565,11 @@ public final class WebRTCConnection: Sendable {
                 _ = state.stateMachine.process(.sctpAssociating)
             }
             let initPacket = connState.withLock { $0.sctpAssociation.generateInit() }
-            try encryptAndSend(initPacket.encode())
+            try encryptAndSend(initPacket.encodeBytes())
         }
     }
 
-    private func processSCTP(_ plaintext: Data) throws {
+    private func processSCTP(_ plaintext: [UInt8]) throws {
         // Parse SCTP packet (already decrypted)
         let packet: SCTPPacket
         do {
@@ -551,10 +585,10 @@ public final class WebRTCConnection: Sendable {
         }
 
         let responses: [SCTPPacket]
-        let receivedData: [(streamID: UInt16, ppid: UInt32, data: Data)]
+        let receivedData: [SCTPReceivedMessage]
         do {
             let result = try connState.withLock { state in
-                try state.sctpAssociation.processPacket(packet)
+                try state.sctpAssociation.processPacketBytes(packet)
             }
             responses = result.responses
             receivedData = result.receivedData
@@ -598,27 +632,30 @@ public final class WebRTCConnection: Sendable {
 
         // Send SCTP responses
         for response in responses {
-            try encryptAndSend(response.encode())
+            try encryptAndSend(response.encodeBytes())
         }
 
         // Process received data (DCEP or application data)
         var newChannels: [DataChannel] = []
         let dataHandler = dataHandlerState.withLock { $0 }
 
-        for (streamID, ppid, payload) in receivedData {
+        for message in receivedData {
+            let streamID = message.streamID
+            let ppid = message.ppid
+            let payload = message.data
             if ppid == DataChannelPPID.dcep.rawValue {
                 let (response, channel) = try connState.withLock { state in
-                    try state.channelManager.processIncomingDCEP(streamID: streamID, data: payload)
+                    try state.channelManager.processIncomingDCEPBytes(streamID: streamID, data: payload)
                 }
                 if let response {
                     let sctpPacket = try connState.withLock { state in
-                        try state.sctpAssociation.sendData(
+                        try state.sctpAssociation.sendDataBytes(
                             streamID: streamID,
                             payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
                             data: response
                         )
                     }
-                    try encryptAndSend(sctpPacket.encode())
+                    try encryptAndSend(sctpPacket.encodeBytes())
                 }
                 if let channel {
                     newChannels.append(channel)
@@ -700,7 +737,7 @@ public final class WebRTCConnection: Sendable {
         case .success(let packets):
             do {
                 for packet in packets {
-                    try encryptAndSend(packet.encode())
+                    try encryptAndSend(packet.encodeBytes())
                 }
             } catch {
                 let reason = "Retransmission send failed: \(String(describing: error))"
@@ -725,16 +762,15 @@ public final class WebRTCConnection: Sendable {
     }
 
     @discardableResult
-    private func encryptAndSend(_ plaintext: Data) throws -> Data {
+    private func encryptAndSend(_ plaintext: [UInt8]) throws -> [UInt8] {
         let encrypted: [UInt8]
         do {
-            encrypted = try dtlsEndpoint.send([UInt8](plaintext))
+            encrypted = try dtlsEndpoint.send(plaintext)
         } catch {
             throw WebRTCError.dtlsHandshakeFailed(String(describing: error))
         }
-        let datagram = Data(encrypted)
-        sendHandler(datagram)
-        return datagram
+        sendHandler(encrypted)
+        return encrypted
     }
 
     /// The peer's certificate fingerprint, if the DTLS layer can supply it.
@@ -747,6 +783,6 @@ public final class WebRTCConnection: Sendable {
     /// rejects — it never silently accepts an unverified peer.
     private func peerFingerprintIfAvailable() -> CertificateFingerprint? {
         guard let der = dtlsEndpoint.remoteCertificateDER else { return nil }
-        return CertificateFingerprint.fromDER(Data(der))
+        return CertificateFingerprint.fromDER(der)
     }
 }

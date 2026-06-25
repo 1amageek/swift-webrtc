@@ -6,12 +6,12 @@
 /// Transport-agnostic: callers provide send handlers and feed incoming data
 /// to connections. This allows integration with any UDP transport (NIO, etc).
 
-import Foundation
 import STUNCore
 import ICELite
 import SCTPCore
 import DataChannel
 #if !hasFeature(Embedded)
+import Foundation
 import Logging
 #endif
 

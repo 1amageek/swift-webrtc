@@ -1,7 +1,5 @@
 /// WebRTC Errors
 
-import Foundation
-
 /// Errors in WebRTC operations
 public enum WebRTCError: Error, Sendable {
     case connectionFailed(String)
