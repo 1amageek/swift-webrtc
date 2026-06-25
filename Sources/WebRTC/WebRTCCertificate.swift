@@ -18,6 +18,7 @@ import Crypto
 import SwiftASN1
 #else
 import P2PCoreBytes
+import P2PCoreCrypto
 import P2PCryptoEmbedded
 #endif
 
@@ -260,17 +261,29 @@ public struct WebRTCCertificate: Sendable {
     /// embedder supplies the DER leaf and the 32-byte private-key scalar directly.
     /// The fingerprint is computed fail-closed from the DER. No certificate or key
     /// is fabricated — if the embedder has no identity, none is created.
+    ///
+    /// On host this validates the DER and recovers the typed key, so it `throws`
+    /// (preserving the historical untyped-throws host API). Under Embedded there is
+    /// no X.509 / typed-key validation available to fail (and untyped `throws` is
+    /// rejected by Embedded Swift), so the Embedded variant is non-throwing — it
+    /// simply records the provisioned bytes and computes the fingerprint.
+    #if !hasFeature(Embedded)
     public init(derEncoded: [UInt8], rawPrivateKey: [UInt8]) throws {
-        #if !hasFeature(Embedded)
         // On host, validate the DER parses as an X.509 certificate and recover the
         // typed key (fail-closed on garbage DER or a malformed key scalar).
         _ = try X509.Certificate(derEncoded: derEncoded)
         self.privateKey = try P256.Signing.PrivateKey(rawRepresentation: rawPrivateKey)
-        #endif
         self.derEncoded = derEncoded
         self.rawPrivateKey = rawPrivateKey
         self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
     }
+    #else
+    public init(derEncoded: [UInt8], rawPrivateKey: [UInt8]) {
+        self.derEncoded = derEncoded
+        self.rawPrivateKey = rawPrivateKey
+        self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
+    }
+    #endif
 
     #if !hasFeature(Embedded)
     /// Host-only `Data` convenience: wrap a DER certificate and raw P-256 key

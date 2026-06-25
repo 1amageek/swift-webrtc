@@ -32,4 +32,23 @@ extension WebRTCConnectionState {
             return false
         }
     }
+
+    /// A stable, Embedded-legal label for the state case.
+    ///
+    /// `String(describing:)` / reflection-based interpolation is unavailable under
+    /// Embedded Swift, so diagnostic messages render the state through this manual
+    /// `switch` over string literals (the `.failed` reason is intentionally not
+    /// interpolated, as that reason is itself an Embedded-static string).
+    public var label: String {
+        switch self {
+        case .new: return "new"
+        case .connecting: return "connecting"
+        case .dtlsHandshaking: return "dtlsHandshaking"
+        case .sctpConnecting: return "sctpConnecting"
+        case .connected: return "connected"
+        case .disconnected: return "disconnected"
+        case .failed: return "failed"
+        case .closed: return "closed"
+        }
+    }
 }

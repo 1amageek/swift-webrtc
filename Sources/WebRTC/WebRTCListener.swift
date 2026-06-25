@@ -5,6 +5,10 @@
 /// and provides a send handler per connection.
 
 import ICELite
+// REQUIRED under Embedded for `AsyncStream` (probe P10); the host build picks it
+// up from the implicit stdlib import, but the Embedded build needs the explicit
+// `_Concurrency` import to bring `AsyncStream` into scope.
+import _Concurrency
 #if !hasFeature(Embedded)
 import Foundation
 import Logging
@@ -132,7 +136,10 @@ public final class WebRTCListener: Sendable {
             do {
                 try connection.start()
             } catch {
-                logger.error("Failed to start server connection: \(error)")
+                // `String(describing:)` is unavailable under Embedded, so the
+                // caught error is not interpolated here; the static log line
+                // records the failure without reconstructing the error text.
+                logger.error("Failed to start server connection")
                 listenerState.withLock { state in
                     if state.activeConnections[peerID] === connection {
                         state.activeConnections.removeValue(forKey: peerID)

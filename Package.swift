@@ -30,14 +30,16 @@ let coreSettings: [SwiftSetting] = {
 // codecs through the crypto/random/clock seams. All eight adapter/core targets
 // Embedded-compile under `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1`.
 //
-// NOTE: a full `--target WebRTC` Embedded build is now blocked ONLY by the facade
-// itself, which still `import Foundation` and exposes a `Data`-based public API
-// (`SendHandler` / `DataHandler` / `receive` / `send` / `remoteCertificateDER`,
-// and `CertificateFingerprint`'s `Data` surface). `Data` requires Foundation,
-// which is unavailable under Embedded. Converting the facade to a `[UInt8]` public
-// surface (as the swift-tls facade did) would break swift-libp2p's
-// `WebRTCMuxedConnection`, which consumes that `Data` API — a cross-package
-// re-point, out of scope here. See CONTEXT.md.
+// The `WebRTC` facade now Embedded-compiles end to end: a full
+// `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1 swift build --target WebRTC -c release`
+// builds clean. The facade exposes a `[UInt8]` public surface (with host-only
+// `Data` convenience overloads gated `#if !hasFeature(Embedded)`, so swift-libp2p's
+// `Data`-based consumers are unaffected); Foundation / Logging / swift-crypto /
+// swift-certificates are host-only `#if`-gated imports, the fingerprint SHA-256 is
+// routed through `P2PCryptoEmbedded`'s `BoringSHA256`, the retransmission driver
+// uses the `AsyncTimer` seam, and every throwing entry point is typed-throws
+// (`throws(WebRTCError)`) with static / structured error reasons (no
+// `String(describing:)`). See CONTEXT.md.
 let webrtcFacadeDependencies: [Target.Dependency] = {
     var d: [Target.Dependency] = [
         "STUNCore", "ICELite", "SCTPCore", "DataChannel",

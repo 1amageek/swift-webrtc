@@ -65,7 +65,7 @@ public final class WebRTCEndpoint: Sendable {
     public func connect(
         remoteFingerprint: CertificateFingerprint,
         sendHandler: @escaping WebRTCConnection.SendHandler
-    ) throws -> WebRTCConnection {
+    ) throws(WebRTCError) -> WebRTCConnection {
         let isClosed = endpointState.withLock { $0.isClosed }
         guard !isClosed else {
             throw WebRTCError.closed
@@ -89,7 +89,7 @@ public final class WebRTCEndpoint: Sendable {
     /// Create a server-side listener
     ///
     /// - Returns: A new WebRTC listener that accepts incoming connections
-    public func listen() throws -> WebRTCListener {
+    public func listen() throws(WebRTCError) -> WebRTCListener {
         let isClosed = endpointState.withLock { $0.isClosed }
         guard !isClosed else {
             throw WebRTCError.closed

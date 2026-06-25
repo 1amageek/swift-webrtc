@@ -14,6 +14,10 @@ import STUNCore
 import ICELite
 import SCTPCore
 import DataChannel
+// REQUIRED under Embedded for `AsyncStream` / `Task` / `async` (probe P10); the
+// host build picks these up from the implicit stdlib import, but the Embedded
+// build needs the explicit `_Concurrency` import to bring them into scope.
+import _Concurrency
 #if !hasFeature(Embedded)
 import Foundation
 import Logging
@@ -193,7 +197,10 @@ public final class WebRTCConnection: Sendable {
                 requireClientCertificate: !isClient
             )
         } catch {
-            preconditionFailure("WebRTC local DTLS identity is invalid: \(error)")
+            // `String(describing:)` is unavailable under Embedded; the static
+            // precondition message names the invariant (a locally-owned identity
+            // must be valid) without interpolating the error value.
+            preconditionFailure("WebRTC local DTLS identity is invalid")
         }
         self.expectedFingerprint = expectedFingerprint
         self.sendHandler = sendHandler
@@ -255,7 +262,7 @@ public final class WebRTCConnection: Sendable {
     #endif
 
     /// Start the connection process (client-side: initiates DTLS handshake)
-    public func start() throws {
+    public func start() throws(WebRTCError) {
         let isClient = connState.withLock { state -> Bool in
             state.stateMachine.process(.dtlsHandshakeStarted)
             return state.isClient
@@ -267,7 +274,9 @@ public final class WebRTCConnection: Sendable {
         do {
             datagrams = try dtlsEndpoint.startHandshake()
         } catch {
-            throw WebRTCError.dtlsHandshakeFailed(String(describing: error))
+            throw WebRTCError.dtlsHandshakeFailed(
+                Self.failureReason(error, context: "DTLS handshake start failed")
+            )
         }
         _ = isClient
         for datagram in datagrams {
@@ -295,7 +304,7 @@ public final class WebRTCConnection: Sendable {
     /// - Throws: `WebRTCError.closed` if the connection has been closed,
     ///   `WebRTCError.dtlsHandshakeFailed` on a fatal DTLS failure,
     ///   `WebRTCError.sctpFailed` on a fatal SCTP failure
-    public func receive(_ data: [UInt8], remoteAddress: [UInt8] = []) throws {
+    public func receive(_ data: [UInt8], remoteAddress: [UInt8] = []) throws(WebRTCError) {
         // P2.4: Check for closed/failed state before processing
         let isClosed = connState.withLock { state in
             state.stateMachine.isTerminal
@@ -315,7 +324,9 @@ public final class WebRTCConnection: Sendable {
             // explicitly (e.g. send failures while emitting responses).
             connState.withLock { state in
                 if !state.stateMachine.isTerminal {
-                    _ = state.stateMachine.process(.error(String(describing: error)))
+                    _ = state.stateMachine.process(
+                        .error(Self.failureReason(error, context: "receive() processing failed"))
+                    )
                 }
             }
             finishIncomingChannels()
@@ -331,7 +342,7 @@ public final class WebRTCConnection: Sendable {
     }
     #endif
 
-    private func demultiplex(_ data: [UInt8], remoteAddress: [UInt8]) throws {
+    private func demultiplex(_ data: [UInt8], remoteAddress: [UInt8]) throws(WebRTCError) {
         let firstByte = data[data.startIndex]
 
         // RFC 5764 §5.1.2 demultiplex by first byte value:
@@ -357,7 +368,7 @@ public final class WebRTCConnection: Sendable {
         }
 
         if STUNMessage.isSTUN(data) {
-            try processSTUN(data, remoteAddress: remoteAddress)
+            processSTUN(data, remoteAddress: remoteAddress)
             return
         }
 
@@ -371,18 +382,45 @@ public final class WebRTCConnection: Sendable {
     ///   - ordered: Whether messages should be delivered in order
     /// - Returns: The opened data channel
     /// - Throws: `WebRTCError.invalidState` if the connection is not established
-    public func openDataChannel(label: String, ordered: Bool = true) throws -> DataChannel {
-        let (channel, sctpPacket) = try connState.withLock { state -> (DataChannel, SCTPPacket) in
-            guard state.stateMachine.isConnected else {
-                throw WebRTCError.invalidState("Cannot open data channel in state \(state.stateMachine.state)")
+    public func openDataChannel(label: String, ordered: Bool = true) throws(WebRTCError) -> DataChannel {
+        // Each locked sub-operation has its own concrete thrown error type
+        // (`openChannelBytes` is `throws(DataChannelError)`, `sendDataBytes` is
+        // `throws(SCTPError)`). Under Embedded a single lock closure cannot widen
+        // two thrown types into `any Error`, so each call keeps a lock closure
+        // typed to its sub-error and is converted to `WebRTCError` in an outer
+        // `do/catch`. `channelManager` and `sctpAssociation` are independent
+        // sub-states (the DCEP receive path mutates them under separate locks too),
+        // so splitting the lock preserves the per-sub-object invariants.
+        let isConnected = connState.withLock { $0.stateMachine.isConnected }
+        guard isConnected else {
+            throw WebRTCError.invalidState("Cannot open data channel in state \(state.label)")
+        }
+
+        let channel: DataChannel
+        let dcepData: [UInt8]
+        do {
+            (channel, dcepData) = try connState.withLock { state throws(DataChannelError) in
+                try state.channelManager.openChannelBytes(label: label, ordered: ordered)
             }
-            let (channel, dcepData) = try state.channelManager.openChannelBytes(label: label, ordered: ordered)
-            let sctpPacket = try state.sctpAssociation.sendDataBytes(
-                streamID: channel.id,
-                payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
-                data: dcepData
+        } catch {
+            throw WebRTCError.sctpFailed(
+                Self.failureReason(error, context: "DCEP open-channel encode failed")
             )
-            return (channel, sctpPacket)
+        }
+
+        let sctpPacket: SCTPPacket
+        do {
+            sctpPacket = try connState.withLock { state throws(SCTPError) in
+                try state.sctpAssociation.sendDataBytes(
+                    streamID: channel.id,
+                    payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
+                    data: dcepData
+                )
+            }
+        } catch {
+            throw WebRTCError.sctpFailed(
+                Self.failureReason(error, context: "SCTP send (DCEP open) failed")
+            )
         }
 
         try encryptAndSend(sctpPacket.encodeBytes())
@@ -395,7 +433,7 @@ public final class WebRTCConnection: Sendable {
     ///   - channelID: The data channel stream ID
     ///   - binary: Whether data is binary (true) or string (false)
     /// - Throws: `WebRTCError.invalidState` if the connection is not established
-    public func send(_ data: [UInt8], on channelID: UInt16, binary: Bool = true) throws {
+    public func send(_ data: [UInt8], on channelID: UInt16, binary: Bool = true) throws(WebRTCError) {
         let ppid: UInt32
         if data.isEmpty {
             ppid = binary ? DataChannelPPID.binaryEmpty.rawValue : DataChannelPPID.stringEmpty.rawValue
@@ -403,14 +441,26 @@ public final class WebRTCConnection: Sendable {
             ppid = binary ? DataChannelPPID.binary.rawValue : DataChannelPPID.string.rawValue
         }
 
-        let sctpPacket = try connState.withLock { state -> SCTPPacket in
-            guard state.stateMachine.isConnected else {
-                throw WebRTCError.invalidState("Cannot send data in state \(state.stateMachine.state)")
+        let isConnected = connState.withLock { $0.stateMachine.isConnected }
+        guard isConnected else {
+            throw WebRTCError.invalidState("Cannot send data in state \(state.label)")
+        }
+
+        // `sendDataBytes` is `throws(SCTPError)`; the lock closure stays typed to
+        // that sub-error and is converted to `WebRTCError` in an outer `do/catch`
+        // (Embedded cannot widen the thrown type to `any Error`).
+        let sctpPacket: SCTPPacket
+        do {
+            sctpPacket = try connState.withLock { state throws(SCTPError) in
+                try state.sctpAssociation.sendDataBytes(
+                    streamID: channelID,
+                    payloadProtocolIdentifier: ppid,
+                    data: data
+                )
             }
-            return try state.sctpAssociation.sendDataBytes(
-                streamID: channelID,
-                payloadProtocolIdentifier: ppid,
-                data: data
+        } catch {
+            throw WebRTCError.sctpFailed(
+                Self.failureReason(error, context: "SCTP send failed")
             )
         }
 
@@ -450,7 +500,7 @@ public final class WebRTCConnection: Sendable {
 
     // MARK: - Private protocol processing
 
-    private func processSTUN(_ data: [UInt8], remoteAddress: [UInt8]) throws {
+    private func processSTUN(_ data: [UInt8], remoteAddress: [UInt8]) {
         let endpoint = Self.decodeRemoteEndpoint(remoteAddress)
 
         // Single lock for ICE processing + state transition (fixes race condition)
@@ -491,13 +541,13 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
-    private func processDTLS(_ data: [UInt8], remoteAddress: [UInt8]) throws {
+    private func processDTLS(_ data: [UInt8], remoteAddress: [UInt8]) throws(WebRTCError) {
         let output: DTLSOutput
         do {
             output = try dtlsEndpoint.receive(data, remoteAddress: remoteAddress)
         } catch {
             // P2.2: Propagate DTLS errors to state machine
-            let reason = String(describing: error)
+            let reason = Self.failureReason(error, context: "DTLS receive failed")
             connState.withLock { state in
                 _ = state.stateMachine.process(.dtlsHandshakeFailed(reason))
             }
@@ -521,7 +571,7 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
-    private func onHandshakeComplete() throws {
+    private func onHandshakeComplete() throws(WebRTCError) {
         // Verify remote fingerprint if expected.
         //
         // FAIL-CLOSED: WebRTC's DTLS-SRTP peer authentication binds the peer's
@@ -569,14 +619,14 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
-    private func processSCTP(_ plaintext: [UInt8]) throws {
+    private func processSCTP(_ plaintext: [UInt8]) throws(WebRTCError) {
         // Parse SCTP packet (already decrypted)
         let packet: SCTPPacket
         do {
             packet = try SCTPPacket.decode(from: plaintext)
         } catch {
             // P2.2: Propagate SCTP decode errors
-            let reason = String(describing: error)
+            let reason = Self.failureReason(error, context: "SCTP packet decode failed")
             connState.withLock { state in
                 _ = state.stateMachine.process(.sctpFailed(reason))
             }
@@ -587,12 +637,16 @@ public final class WebRTCConnection: Sendable {
         let responses: [SCTPPacket]
         let receivedData: [SCTPReceivedMessage]
         do {
-            let result = try connState.withLock { state in
+            let result = try connState.withLock { state throws(SCTPError) in
                 try state.sctpAssociation.processPacketBytes(packet)
             }
             responses = result.responses
             receivedData = result.receivedData
-        } catch let error as SCTPError {
+        } catch {
+            // `processPacketBytes` is `throws(SCTPError)`, so `error` is a typed
+            // `SCTPError` here. A typed `catch ... as SCTPError` clause SILGen-crashes
+            // under Embedded, so the type narrowing is done via a plain `catch` plus
+            // an `if case` switch on the already-typed error instead.
             if case .verificationTagMismatch(let expected, let actual) = error {
                 // RFC 4960 §8.5: a packet with an invalid verification tag is
                 // silently discarded. Failing the association here would let an
@@ -601,14 +655,7 @@ public final class WebRTCConnection: Sendable {
                 return
             }
             // P2.2: Propagate SCTP processing errors
-            let reason = String(describing: error)
-            connState.withLock { state in
-                _ = state.stateMachine.process(.sctpFailed(reason))
-            }
-            finishIncomingChannels()
-            throw WebRTCError.sctpFailed(reason)
-        } catch {
-            let reason = String(describing: error)
+            let reason = Self.failureReason(error, context: "SCTP packet processing failed")
             connState.withLock { state in
                 _ = state.stateMachine.process(.sctpFailed(reason))
             }
@@ -644,15 +691,34 @@ public final class WebRTCConnection: Sendable {
             let ppid = message.ppid
             let payload = message.data
             if ppid == DataChannelPPID.dcep.rawValue {
-                let (response, channel) = try connState.withLock { state in
-                    try state.channelManager.processIncomingDCEPBytes(streamID: streamID, data: payload)
+                // `processIncomingDCEPBytes` is `throws(DataChannelError)` and
+                // `sendDataBytes` is `throws(SCTPError)`; both are converted to
+                // `WebRTCError` so this `throws(WebRTCError)` function has a single
+                // concrete thrown type (Embedded requirement).
+                let response: [UInt8]?
+                let channel: DataChannel?
+                do {
+                    (response, channel) = try connState.withLock { state throws(DataChannelError) in
+                        try state.channelManager.processIncomingDCEPBytes(streamID: streamID, data: payload)
+                    }
+                } catch {
+                    throw WebRTCError.sctpFailed(
+                        Self.failureReason(error, context: "DCEP message processing failed")
+                    )
                 }
                 if let response {
-                    let sctpPacket = try connState.withLock { state in
-                        try state.sctpAssociation.sendDataBytes(
-                            streamID: streamID,
-                            payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
-                            data: response
+                    let sctpPacket: SCTPPacket
+                    do {
+                        sctpPacket = try connState.withLock { state throws(SCTPError) in
+                            try state.sctpAssociation.sendDataBytes(
+                                streamID: streamID,
+                                payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
+                                data: response
+                            )
+                        }
+                    } catch {
+                        throw WebRTCError.sctpFailed(
+                            Self.failureReason(error, context: "SCTP send (DCEP ack) failed")
                         )
                     }
                     try encryptAndSend(sctpPacket.encodeBytes())
@@ -695,15 +761,16 @@ public final class WebRTCConnection: Sendable {
             // not leak via the task→self→task cycle). Under Embedded the strong
             // capture is broken by `close()` cancelling the task (or the loop
             // self-terminating on a terminal state), so no live cycle persists.
+            //
+            // The tick suspension goes through `parkForTick(_:on:)`, a NON-throwing
+            // helper that swallows the timer's typed `CancellationError` internally.
+            // The Task closure therefore contains no throwing call, so Embedded does
+            // not have to infer a thrown type across the `await` boundary (a bare
+            // `catch` there widens to `any Error`, which Embedded rejects).
             #if !hasFeature(Embedded)
             task = Task { [weak self] in
                 while !Task.isCancelled {
-                    let deadline = timer.monotonicNanos() &+ tickNanos
-                    do {
-                        try await timer.sleep(untilNanos: deadline)
-                    } catch {
-                        return // task cancelled during sleep
-                    }
+                    if !(await Self.parkForTick(tickNanos, on: timer)) { return }
                     guard let self else { return }
                     if self.driveRetransmissions() { return }
                 }
@@ -711,16 +778,26 @@ public final class WebRTCConnection: Sendable {
             #else
             task = Task { [self] in
                 while !Task.isCancelled {
-                    let deadline = timer.monotonicNanos() &+ tickNanos
-                    do {
-                        try await timer.sleep(untilNanos: deadline)
-                    } catch {
-                        return // task cancelled during sleep
-                    }
+                    if !(await Self.parkForTick(tickNanos, on: timer)) { return }
                     if self.driveRetransmissions() { return }
                 }
             }
             #endif
+        }
+    }
+
+    /// Suspend for one retransmission tick via the injected `AsyncTimer`,
+    /// swallowing the timer's typed `CancellationError`.
+    ///
+    /// - Returns: `true` if the tick elapsed normally, `false` if the task was
+    ///   cancelled during the suspension (the caller stops the loop).
+    private static func parkForTick(_ tickNanos: UInt64, on timer: WebRTCDefaultTimer) async -> Bool {
+        let deadline = timer.monotonicNanos() &+ tickNanos
+        do {
+            try await timer.sleep(untilNanos: deadline)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -740,7 +817,7 @@ public final class WebRTCConnection: Sendable {
                     try encryptAndSend(packet.encodeBytes())
                 }
             } catch {
-                let reason = "Retransmission send failed: \(String(describing: error))"
+                let reason = Self.failureReason(error, context: "SCTP retransmission send failed")
                 logger.error("\(reason)")
                 connState.withLock { state in
                     _ = state.stateMachine.process(.sctpFailed(reason))
@@ -751,8 +828,8 @@ public final class WebRTCConnection: Sendable {
             return false
 
         case .failure(let error):
-            let reason = String(describing: error)
-            logger.error("SCTP retransmission limit exceeded: \(reason)")
+            let reason = Self.failureReason(error, context: "SCTP retransmission limit exceeded")
+            logger.error("\(reason)")
             connState.withLock { state in
                 _ = state.stateMachine.process(.sctpFailed(reason))
             }
@@ -761,13 +838,33 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
+    /// Render a caught error into the human-readable reason string carried by
+    /// `WebRTCError` / the connection state machine.
+    ///
+    /// `String(describing:)` is unavailable under Embedded Swift, so the rich
+    /// per-error description is host-only. Under Embedded the caller's stable
+    /// static `context` (a plain `String` literal, the only Embedded-legal
+    /// reason source) describes WHICH operation failed — the failing subsystem is
+    /// the actionable signal; the inner error's text is not reconstructible
+    /// without Foundation reflection. Fail-closed behavior is preserved either
+    /// way: the connection still transitions to the same terminal state.
+    private static func failureReason(_ error: some Error, context: String) -> String {
+        #if !hasFeature(Embedded)
+        return String(describing: error)
+        #else
+        return context
+        #endif
+    }
+
     @discardableResult
-    private func encryptAndSend(_ plaintext: [UInt8]) throws -> [UInt8] {
+    private func encryptAndSend(_ plaintext: [UInt8]) throws(WebRTCError) -> [UInt8] {
         let encrypted: [UInt8]
         do {
             encrypted = try dtlsEndpoint.send(plaintext)
         } catch {
-            throw WebRTCError.dtlsHandshakeFailed(String(describing: error))
+            throw WebRTCError.dtlsHandshakeFailed(
+                Self.failureReason(error, context: "DTLS encrypt/send failed")
+            )
         }
         sendHandler(encrypted)
         return encrypted
