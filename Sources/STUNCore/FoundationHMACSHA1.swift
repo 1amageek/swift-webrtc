@@ -6,7 +6,12 @@
 /// (swift-crypto's `Insecure.SHA1`) is named for STUN. The `STUNWireCore`
 /// integrity core depends only on the `MessageAuthenticationCode` protocol; this
 /// type plugs it into HMAC-SHA1 at the host boundary.
+///
+/// Host-only: under Embedded the STUN adapter routes MESSAGE-INTEGRITY through
+/// `P2PCryptoEmbedded.BoringHMACSHA1`, so this swift-crypto-backed provider is
+/// gated out of the Embedded build.
 
+#if !hasFeature(Embedded)
 import Crypto
 import P2PCoreCrypto
 
@@ -65,3 +70,5 @@ struct FoundationHMACSHA1: P2PCoreCrypto.MessageAuthenticationCode {
         )
     }
 }
+
+#endif

@@ -24,10 +24,20 @@ let coreSettings: [SwiftSetting] = {
 // fail-closed verification) and schedules its retransmission tick through
 // `P2PCoreCrypto`'s `AsyncTimer` seam.
 //
-// NOTE: the WebRTC facade orchestration still drives the host-only `Data`-based
-// adapters (`STUNCore` / `ICELite` / `SCTPCore` / `DataChannel`); those adapter
-// targets are NOT yet Embedded-built, so a full `--target WebRTC` Embedded build
-// is blocked at the adapter layer until they are cored. See CONTEXT.md.
+// The adapter layer (`STUNCore` / `ICELite` / `SCTPCore` / `DataChannel`) is now
+// cored + dual-built: each adapter is a `final class & Sendable` holding an
+// Embedded-clean value-type engine behind a `FacadeLock`, driving the `*WireCore`
+// codecs through the crypto/random/clock seams. All eight adapter/core targets
+// Embedded-compile under `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1`.
+//
+// NOTE: a full `--target WebRTC` Embedded build is now blocked ONLY by the facade
+// itself, which still `import Foundation` and exposes a `Data`-based public API
+// (`SendHandler` / `DataHandler` / `receive` / `send` / `remoteCertificateDER`,
+// and `CertificateFingerprint`'s `Data` surface). `Data` requires Foundation,
+// which is unavailable under Embedded. Converting the facade to a `[UInt8]` public
+// surface (as the swift-tls facade did) would break swift-libp2p's
+// `WebRTCMuxedConnection`, which consumes that `Data` API — a cross-package
+// re-point, out of scope here. See CONTEXT.md.
 let webrtcFacadeDependencies: [Target.Dependency] = {
     var d: [Target.Dependency] = [
         "STUNCore", "ICELite", "SCTPCore", "DataChannel",
@@ -53,6 +63,33 @@ let webrtcFacadeDependencies: [Target.Dependency] = {
     }
     return d
 }()
+
+// The Embedded-clean crypto seam providers each caller-locked adapter needs. On
+// host the `MessageAuthenticationCode` / `RandomSource` seams resolve to the
+// swift-crypto–backed `P2PCryptoFoundation` providers; under Embedded they
+// resolve to the BoringSSL-backed `P2PCryptoEmbedded` providers. `P2PCoreCrypto`
+// (the seam protocols) is needed in both modes. swift-crypto is still pulled in
+// on host for the historical `Data` wrappers' direct use; it is dropped under
+// Embedded.
+func adapterSeamDependencies(extra: [Target.Dependency] = []) -> [Target.Dependency] {
+    var d: [Target.Dependency] = [
+        .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+    ]
+    if embeddedEnabled {
+        d += [.product(name: "P2PCryptoEmbedded", package: "swift-p2p-crypto")]
+    } else {
+        d += [
+            .product(name: "P2PCryptoFoundation", package: "swift-p2p-crypto"),
+            .product(name: "Crypto", package: "swift-crypto"),
+        ]
+    }
+    return d + extra
+}
+
+let sctpAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["SCTPWireCore"])
+let stunAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["STUNWireCore"])
+let iceAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["STUNCore", "ICELiteCore"])
+let dataChannelAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["SCTPCore", "DataChannelCore"])
 
 let package = Package(
     name: "swift-webrtc",
@@ -103,14 +140,14 @@ let package = Package(
             path: "Sources/STUNWireCore",
             swiftSettings: coreSettings
         ),
-        // ---- Foundation adapter: keeps the existing Data-based STUN API ----
+        // ---- Caller-locked STUN adapter (dual-build: host + Embedded) ----
+        // Keeps the Data-based STUN API; routes MESSAGE-INTEGRITY HMAC-SHA1 and
+        // CSPRNG through the seams (host: swift-crypto; Embedded: BoringSSL).
         .target(
             name: "STUNCore",
-            dependencies: [
-                "STUNWireCore",
-                .product(name: "Crypto", package: "swift-crypto"),
-            ],
-            path: "Sources/STUNCore"
+            dependencies: stunAdapterDependencies,
+            path: "Sources/STUNCore",
+            swiftSettings: coreSettings
         ),
         // ---- Embedded-clean ICE Lite state machine (dual-build: host + Embedded) ----
         .target(
@@ -119,11 +156,15 @@ let package = Package(
             path: "Sources/ICELiteCore",
             swiftSettings: coreSettings
         ),
-        // ---- Foundation adapter: wire decode + crypto + Mutex over the core ----
+        // ---- Caller-locked ICE Lite adapter (dual-build: host + Embedded) ----
+        // Holds the Embedded-clean `ICELiteStateMachine` behind a `FacadeLock`;
+        // the wire decode + crypto (FINGERPRINT / MESSAGE-INTEGRITY) route through
+        // STUNCore's seams. Gated `Data`/`Foundation` boundary only.
         .target(
             name: "ICELite",
-            dependencies: ["STUNCore", "ICELiteCore"],
-            path: "Sources/ICELite"
+            dependencies: iceAdapterDependencies,
+            path: "Sources/ICELite",
+            swiftSettings: coreSettings
         ),
         // ---- Embedded-clean SCTP wire codec (dual-build: host + Embedded) ----
         .target(
@@ -135,14 +176,16 @@ let package = Package(
             path: "Sources/SCTPWireCore",
             swiftSettings: coreSettings
         ),
-        // ---- Foundation adapter: keeps the existing Data-based SCTP API ----
+        // ---- Caller-locked SCTP association adapter (dual-build: host + Embedded) ----
+        // Holds the Embedded-clean value-type `SCTPAssociationEngine` behind a
+        // `FacadeLock`. Host: swift-crypto cookie HMAC + `FoundationRandom` +
+        // `ContinuousClock` boundary. Embedded: `BoringHMACSHA256` + `BoringRandom`
+        // + `clock_gettime`; the `Data`/`ContinuousClock` wrappers are gated out.
         .target(
             name: "SCTPCore",
-            dependencies: [
-                "SCTPWireCore",
-                .product(name: "Crypto", package: "swift-crypto"),
-            ],
-            path: "Sources/SCTPCore"
+            dependencies: sctpAdapterDependencies,
+            path: "Sources/SCTPCore",
+            swiftSettings: coreSettings
         ),
         // ---- Embedded-clean DCEP wire codec (dual-build: host + Embedded) ----
         .target(
@@ -153,11 +196,15 @@ let package = Package(
             path: "Sources/DataChannelCore",
             swiftSettings: coreSettings
         ),
-        // ---- Foundation adapter: keeps the existing Data-based DCEP API ----
+        // ---- Caller-locked DCEP / data-channel adapter (dual-build: host + Embedded) ----
+        // Holds the Embedded-clean `DataChannelManagerState` value type behind a
+        // `FacadeLock`, driving DataChannelCore's DCEP codec. Gated `Data`/`Foundation`
+        // boundary only.
         .target(
             name: "DataChannel",
-            dependencies: ["SCTPCore", "DataChannelCore"],
-            path: "Sources/DataChannel"
+            dependencies: dataChannelAdapterDependencies,
+            path: "Sources/DataChannel",
+            swiftSettings: coreSettings
         ),
         // ---- Tier-1 facade: WebRTCEndpoint/Connection/Listener/DataChannel ----
         // Dual-build orchestrator. Host: `Mutex` / `ContinuousClock` / swift-log /

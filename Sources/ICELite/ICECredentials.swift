@@ -1,9 +1,16 @@
 /// ICE Credentials (RFC 8445)
 ///
 /// Local and remote ICE username fragments and passwords.
+///
+/// Embedded-clean: the random ufrag/password generation uses the `RandomSource`
+/// seam (via `STUNCore.SecureRandom`) and `String` building, both available under
+/// Embedded. The `stunKey` is exposed as `[UInt8]` (the seam currency); the `Data`
+/// convenience is gated host-only.
 
-import Foundation
 import STUNCore
+#if !hasFeature(Embedded)
+import Foundation
+#endif
 
 /// ICE credential pair for connectivity checks
 public struct ICECredentials: Sendable, Equatable {
@@ -67,8 +74,15 @@ public struct ICECredentials: Sendable, Equatable {
         return "\(remoteUfrag):\(localUfrag)"
     }
 
-    /// The STUN key (local password as UTF-8)
+    /// The STUN key (local password as UTF-8 bytes) — the seam currency.
+    public var stunKeyBytes: [UInt8] {
+        Array(localPassword.utf8)
+    }
+
+    #if !hasFeature(Embedded)
+    /// The STUN key (local password as UTF-8) as `Data`. Host-only convenience.
     public var stunKey: Data {
         Data(localPassword.utf8)
     }
+    #endif
 }

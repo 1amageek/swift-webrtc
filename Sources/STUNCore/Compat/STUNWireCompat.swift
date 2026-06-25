@@ -5,53 +5,14 @@
 /// `Data`-based public surface that the rest of `swift-webrtc` (ICE, WebRTC) and
 /// the existing test suite bind to. It is pure bridging plus the crypto-bearing
 /// helpers (`encodeWithIntegrity`) that must stay Foundation/Crypto side.
+///
+/// Host-only: the `Data`-based bridges below are gated out of the Embedded build.
+/// The Embedded-clean `STUNError` + `STUNWireError.rethrowUnwrapped` (used by the
+/// Embedded path too) live in `STUNErrorBridge.swift` (no Foundation).
 
+#if !hasFeature(Embedded)
 import Foundation
 @_exported import STUNWireCore
-
-// MARK: - STUNError (adapter-owned, historical concrete error)
-
-/// STUN errors (historical concrete type).
-///
-/// The Embedded-clean core throws ``STUNWireError``; the adapter unwraps it back
-/// to this type at the `Data`-based boundary so callers (and the existing test
-/// suite) continue to catch `STUNError` directly.
-public enum STUNError: Error, Sendable {
-    case insufficientData(expected: Int, actual: Int)
-    case invalidFormat(String)
-    case invalidMagicCookie(UInt32)
-    case integrityCheckFailed
-    case fingerprintCheckFailed
-}
-
-// MARK: - STUNWireError unwrapping
-
-extension STUNWireError {
-    /// Rethrows the *wrapped* error mapped onto the historical ``STUNError``.
-    ///
-    /// Usage at a `Data`-API boundary that calls a typed-throws core method:
-    /// ```swift
-    /// do { return try coreCall() } catch { try error.rethrowUnwrapped() }
-    /// ```
-    /// In the bare `catch`, `error` has static type `STUNWireError` (the core's
-    /// typed throw), so this avoids the generic-helper / `catch as` forms that
-    /// miscompile with typed throws on this toolchain.
-    public func rethrowUnwrapped() throws -> Never {
-        switch self {
-        case .bytes(let e):
-            throw STUNError.invalidFormat("byte error: \(e)")
-        case .decode(let e):
-            switch e {
-            case .insufficientData(let expected, let actual):
-                throw STUNError.insufficientData(expected: expected, actual: actual)
-            case .invalidFormat(let message):
-                throw STUNError.invalidFormat(message)
-            case .invalidMagicCookie(let cookie):
-                throw STUNError.invalidMagicCookie(cookie)
-            }
-        }
-    }
-}
 
 // MARK: - Byte-array <-> Data equality bridges
 
@@ -112,3 +73,5 @@ extension STUNAttribute {
         xorMappedAddress(address: [UInt8](address), port: port, transactionID: transactionID)
     }
 }
+
+#endif

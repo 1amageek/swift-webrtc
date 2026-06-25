@@ -1,19 +1,44 @@
-import Crypto
-import Foundation
+/// CSPRNG for STUN/ICE material (transaction IDs, ufrag/password generation)
+/// routed through the Embedded-clean `RandomSource` seam.
+///
+/// The concrete backend is selected at the host boundary: swift-crypto-backed
+/// `FoundationRandom` on host, BoringSSL `BoringRandom` under Embedded. This keeps
+/// the file Embedded-clean (no Foundation, no `any`); only the concrete
+/// `RandomSource` instantiated differs between builds.
+
+import P2PCoreCrypto
+#if !hasFeature(Embedded)
+import P2PCryptoFoundation
+#else
+import P2PCryptoEmbedded
+#endif
 
 public enum SecureRandom {
-    public static func data(count: Int) -> Data {
-        guard count > 0 else {
-            return Data()
-        }
+    #if !hasFeature(Embedded)
+    private static let source: any RandomSource = FoundationRandom()
+    #else
+    private static let source = BoringRandom()
+    #endif
 
-        let key = SymmetricKey(size: SymmetricKeySize(bitCount: count * 8))
-        return key.withUnsafeBytes { bytes in
-            Data(bytes)
-        }
+    /// Returns `count` fresh random bytes.
+    public static func bytes(count: Int) -> [UInt8] {
+        guard count > 0 else { return [] }
+        return source.randomBytes(count)
     }
 
     public static func byte() -> UInt8 {
-        data(count: 1)[0]
+        bytes(count: 1)[0]
     }
 }
+
+#if !hasFeature(Embedded)
+import Foundation
+
+extension SecureRandom {
+    /// `count` fresh random bytes as `Data`. Host-only convenience kept for the
+    /// historical `Data`-based STUN surface and the test suite.
+    public static func data(count: Int) -> Data {
+        Data(bytes(count: count))
+    }
+}
+#endif

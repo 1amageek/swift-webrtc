@@ -7,7 +7,13 @@
 /// ``SCTPError`` so existing call sites (and the test suite) keep catching
 /// `SCTPError`. Payloads remain `[UInt8]` on ``AssembledMessage`` and bridge to
 /// `Data` at the consumption boundary via the `[UInt8] == Data` overloads.
+///
+/// Host-only: this `Data`/`SCTPError`-bridging surface exists for the historical
+/// public API and the test suite. The Embedded path drives
+/// `SCTPWireCore.FragmentReassembler` directly, so this wrapper is gated out of
+/// the Embedded build.
 
+#if !hasFeature(Embedded)
 import Foundation
 
 /// Assembled message ready for delivery.
@@ -59,3 +65,5 @@ public struct FragmentAssembler: Sendable {
         state.resetStream(streamID)
     }
 }
+
+#endif

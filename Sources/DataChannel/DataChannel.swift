@@ -1,11 +1,22 @@
-/// WebRTC Data Channel (RFC 8831)
+/// WebRTC Data Channel (RFC 8831) — caller-locked adapter.
 ///
-/// A single bidirectional data channel over SCTP.
+/// A single bidirectional data channel over SCTP, plus the `DataChannelManager`
+/// that handles DCEP open/ack and channel lifecycle.
+///
+/// `DataChannelManager` is a `final class & Sendable` that holds its mutable
+/// channel-table state value behind a ``FacadeLock`` (the proven caller-locked
+/// pattern: `Synchronization.Mutex` on host, an `Atomic` spinlock under Embedded),
+/// driving `DataChannelCore`'s DCEP codec. The currency is `[UInt8]`
+/// (Embedded-clean); the historical `Data`-based `openChannel` /
+/// `processIncomingDCEP` overloads are gated host-only.
 
-import Foundation
 import SCTPCore
+import DataChannelCore
+#if !hasFeature(Embedded)
+import Foundation
+#endif
 
-/// Data channel state
+/// Data channel state.
 public enum DataChannelState: Sendable, Equatable {
     case connecting
     case open
@@ -13,21 +24,21 @@ public enum DataChannelState: Sendable, Equatable {
     case closed
 }
 
-/// A WebRTC data channel
+/// A WebRTC data channel.
 public struct DataChannel: Sendable {
-    /// Unique channel ID (SCTP stream identifier)
+    /// Unique channel ID (SCTP stream identifier).
     public let id: UInt16
 
-    /// Channel label
+    /// Channel label.
     public let label: String
 
-    /// Negotiated sub-protocol
+    /// Negotiated sub-protocol.
     public let `protocol`: String
 
-    /// Whether this channel is ordered
+    /// Whether this channel is ordered.
     public let ordered: Bool
 
-    /// Current state
+    /// Current state.
     public var state: DataChannelState
 
     public init(
@@ -45,9 +56,9 @@ public struct DataChannel: Sendable {
     }
 }
 
-/// Data channel manager handling DCEP and channel lifecycle
+/// Data channel manager handling DCEP and channel lifecycle.
 public final class DataChannelManager: Sendable {
-    private let managerState: Mutex<ManagerState>
+    private let managerState: FacadeLock<ManagerState>
 
     private struct ManagerState: Sendable {
         var channels: [UInt16: DataChannel] = [:]
@@ -55,7 +66,7 @@ public final class DataChannelManager: Sendable {
         var pendingIncoming: [DataChannel] = []
     }
 
-    /// Whether this is the initiator (even stream IDs) or responder (odd stream IDs)
+    /// Whether this is the initiator (even stream IDs) or responder (odd stream IDs).
     private let isInitiator: Bool
 
     /// Hard cap on simultaneously tracked channels (open + connecting).
@@ -77,47 +88,41 @@ public final class DataChannelManager: Sendable {
         self.maxChannels = maxChannels
         self.maxPendingIncoming = maxPendingIncoming
         self.maxLabelOrProtocolLength = maxLabelOrProtocolLength
-        self.managerState = Mutex(ManagerState(
+        self.managerState = FacadeLock(ManagerState(
             nextStreamID: isInitiator ? 0 : 1
         ))
     }
 
-    /// Open a new data channel
-    /// - Parameters:
-    ///   - label: Channel label
-    ///   - ordered: Whether messages are ordered
-    /// - Returns: (channel, DCEP Open message to send on SCTP)
-    /// - Throws: `DataChannelError.streamIDsExhausted` when no further stream ID
-    ///   of the local parity is available, `DataChannelError.tooManyChannels`
-    ///   when the channel cap is reached, `DataChannelError.labelOrProtocolTooLong`
-    ///   when the label exceeds the configured maximum.
-    public func openChannel(
+    // MARK: - [UInt8] surface (Embedded-clean)
+
+    /// Open a new data channel (`[UInt8]` DCEP surface).
+    /// - Returns: (channel, DCEP Open message bytes to send on SCTP).
+    /// - Throws: `DataChannelError.streamIDsExhausted`, `.tooManyChannels`,
+    ///   `.labelOrProtocolTooLong`.
+    public func openChannelBytes(
         label: String,
         ordered: Bool = true,
         protocol channelProtocol: String = "",
         reliabilityParameter: UInt32 = 0,
         priority: UInt16 = 0
-    ) throws -> (DataChannel, Data) {
-        guard Data(label.utf8).count <= maxLabelOrProtocolLength,
-              Data(channelProtocol.utf8).count <= maxLabelOrProtocolLength else {
+    ) throws(DataChannelError) -> (DataChannel, [UInt8]) {
+        guard Array(label.utf8).count <= maxLabelOrProtocolLength,
+              Array(channelProtocol.utf8).count <= maxLabelOrProtocolLength else {
             throw DataChannelError.labelOrProtocolTooLong(limit: maxLabelOrProtocolLength)
         }
 
-        return try managerState.withLock { s -> (DataChannel, Data) in
+        return try managerState.withLock { (s) throws(DataChannelError) -> (DataChannel, [UInt8]) in
             guard s.channels.count < maxChannels else {
                 throw DataChannelError.tooManyChannels(limit: maxChannels)
             }
 
             // Find the next free stream ID of our parity. Detect exhaustion
-            // instead of wrapping/trapping on UInt16 overflow, and skip IDs
-            // that already have a live channel (collision check).
+            // instead of wrapping/trapping on UInt16 overflow, and skip IDs that
+            // already have a live channel (collision check).
             let streamID = try Self.allocateStreamID(start: s.nextStreamID, taken: s.channels)
-            // Advance past the allocated ID, guarding the final-ID overflow.
             let (advanced, overflow) = streamID.addingReportingOverflow(2)
             s.nextStreamID = overflow ? streamID : advanced
 
-            // Reliability/priority parameters are now threaded into the DCEP
-            // OPEN so partial-reliability channels are not silently downgraded.
             let channelType = Self.channelType(
                 ordered: ordered,
                 reliabilityParameter: reliabilityParameter
@@ -140,45 +145,45 @@ public final class DataChannelManager: Sendable {
                 protocol_: channelProtocol
             )
 
-            return (channel, dcepOpen.encode())
+            return (channel, dcepOpen.encodeBytes())
         }
     }
 
-    /// Process incoming DCEP message on a stream
-    /// - Parameters:
-    ///   - streamID: The SCTP stream ID
-    ///   - data: The DCEP message data
-    /// - Returns: Optional response data to send, and the opened channel if applicable
-    /// - Throws: `DataChannelError.streamParityViolation` for an OPEN on a
-    ///   stream ID of the local parity, `DataChannelError.unexpectedAck` for an
-    ///   ACK on a stream with no channel awaiting one, and resource-cap errors.
-    public func processIncomingDCEP(
+    /// Process an incoming DCEP message on a stream (`[UInt8]` surface).
+    /// - Returns: optional response bytes to send, and the opened channel if any.
+    /// - Throws: `DataChannelError.streamParityViolation`, `.unexpectedAck`,
+    ///   resource-cap errors, decode errors.
+    public func processIncomingDCEPBytes(
         streamID: UInt16,
-        data: Data
-    ) throws -> (response: Data?, channel: DataChannel?) {
+        data: [UInt8]
+    ) throws(DataChannelError) -> (response: [UInt8]?, channel: DataChannel?) {
         guard !data.isEmpty else {
             throw DataChannelError.invalidFormat("Empty DCEP message")
         }
 
         switch data[0] {
         case DCEPMessageType.dataChannelOpen.rawValue:
-            // RFC 8832 §6: the side that did NOT initiate the channel must use
-            // the opposite stream-ID parity. We open on (isInitiator ? even :
-            // odd), so a peer-initiated OPEN must use (isInitiator ? odd :
-            // even). Reject a violation rather than accepting a colliding ID.
+            // RFC 8832 §6: the side that did NOT initiate the channel must use the
+            // opposite stream-ID parity. We open on (isInitiator ? even : odd), so
+            // a peer-initiated OPEN must use (isInitiator ? odd : even).
             let isEven = (streamID % 2 == 0)
             let expectedEven = !isInitiator
             guard isEven == expectedEven else {
                 throw DataChannelError.streamParityViolation(streamID: streamID)
             }
 
-            let open = try DCEPOpen.decode(from: data)
-            guard Data(open.label.utf8).count <= maxLabelOrProtocolLength,
-                  Data(open.protocol_.utf8).count <= maxLabelOrProtocolLength else {
+            let open: DCEPOpen
+            do {
+                open = try DCEPOpen.decode(from: data)
+            } catch {
+                try error.rethrowUnwrapped()
+            }
+            guard Array(open.label.utf8).count <= maxLabelOrProtocolLength,
+                  Array(open.protocol_.utf8).count <= maxLabelOrProtocolLength else {
                 throw DataChannelError.labelOrProtocolTooLong(limit: maxLabelOrProtocolLength)
             }
 
-            // RFC 8832 Section 8.2.2: High-order bit (0x80) indicates unordered delivery
+            // RFC 8832 §8.2.2: high-order bit (0x80) indicates unordered delivery.
             let isOrdered = (open.channelType.rawValue & 0x80) == 0
             let channel = DataChannel(
                 id: streamID,
@@ -188,11 +193,11 @@ public final class DataChannelManager: Sendable {
                 state: .open
             )
 
-            return try managerState.withLock { s -> (Data?, DataChannel?) in
+            return try managerState.withLock { (s) throws(DataChannelError) -> ([UInt8]?, DataChannel?) in
                 // Duplicate OPEN (retransmitted): re-ACK idempotently without
                 // replacing the live channel or re-queuing it as a new arrival.
                 if let existing = s.channels[streamID] {
-                    return (DCEPAck().encode(), existing)
+                    return (DCEPAck().encodeBytes(), existing)
                 }
 
                 guard s.channels.count < maxChannels else {
@@ -204,13 +209,13 @@ public final class DataChannelManager: Sendable {
 
                 s.channels[streamID] = channel
                 s.pendingIncoming.append(channel)
-                return (DCEPAck().encode(), channel)
+                return (DCEPAck().encodeBytes(), channel)
             }
 
         case DCEPMessageType.dataChannelAck.rawValue:
-            // RFC 8832 §5.2: an ACK is only valid for a channel we opened that
-            // is awaiting confirmation. A stray ACK is a protocol violation.
-            try managerState.withLock { s in
+            // RFC 8832 §5.2: an ACK is only valid for a channel we opened that is
+            // awaiting confirmation. A stray ACK is a protocol violation.
+            try managerState.withLock { (s) throws(DataChannelError) -> Void in
                 guard s.channels[streamID] != nil else {
                     throw DataChannelError.unexpectedAck(streamID: streamID)
                 }
@@ -219,16 +224,49 @@ public final class DataChannelManager: Sendable {
             return (nil, nil)
 
         default:
-            throw DataChannelError.invalidFormat("Unknown DCEP type: \(data[0])")
+            throw DataChannelError.invalidFormat("Unknown DCEP type")
         }
     }
+
+    #if !hasFeature(Embedded)
+    // MARK: - Data surface (host-only)
+
+    /// Open a new data channel (`Data` DCEP surface).
+    public func openChannel(
+        label: String,
+        ordered: Bool = true,
+        protocol channelProtocol: String = "",
+        reliabilityParameter: UInt32 = 0,
+        priority: UInt16 = 0
+    ) throws -> (DataChannel, Data) {
+        let (channel, bytes) = try openChannelBytes(
+            label: label,
+            ordered: ordered,
+            protocol: channelProtocol,
+            reliabilityParameter: reliabilityParameter,
+            priority: priority
+        )
+        return (channel, Data(bytes))
+    }
+
+    /// Process an incoming DCEP message on a stream (`Data` surface).
+    public func processIncomingDCEP(
+        streamID: UInt16,
+        data: Data
+    ) throws -> (response: Data?, channel: DataChannel?) {
+        let (response, channel) = try processIncomingDCEPBytes(streamID: streamID, data: [UInt8](data))
+        return (response.map { Data($0) }, channel)
+    }
+    #endif
+
+    // MARK: - Channel queries / lifecycle
 
     /// Allocate the next free stream ID at or after `start` of the same parity,
     /// skipping IDs already in use. Throws when the parity space is exhausted.
     private static func allocateStreamID(
         start: UInt16,
         taken: [UInt16: DataChannel]
-    ) throws -> UInt16 {
+    ) throws(DataChannelError) -> UInt16 {
         var candidate = start
         while taken[candidate] != nil {
             let (next, overflow) = candidate.addingReportingOverflow(2)
@@ -254,17 +292,17 @@ public final class DataChannelManager: Sendable {
         }
     }
 
-    /// Get a channel by stream ID
+    /// Get a channel by stream ID.
     public func channel(id: UInt16) -> DataChannel? {
         managerState.withLock { $0.channels[id] }
     }
 
-    /// Get all open channels
+    /// Get all open channels.
     public var channels: [DataChannel] {
         managerState.withLock { Array($0.channels.values) }
     }
 
-    /// Take pending incoming channels
+    /// Take pending incoming channels.
     public func takePendingIncoming() -> [DataChannel] {
         managerState.withLock { s in
             let pending = s.pendingIncoming
@@ -273,17 +311,14 @@ public final class DataChannelManager: Sendable {
         }
     }
 
-    /// Close a channel
+    /// Close a channel.
     public func closeChannel(id: UInt16) {
         managerState.withLock { s in
             s.channels[id]?.state = .closed
         }
     }
 
-    /// Shutdown the manager, closing all channels
-    ///
-    /// Call this method when the connection is being closed to ensure
-    /// all channels are properly cleaned up.
+    /// Shutdown the manager, closing all channels.
     public func shutdown() {
         managerState.withLock { s in
             for channelID in s.channels.keys {
@@ -294,6 +329,3 @@ public final class DataChannelManager: Sendable {
         }
     }
 }
-
-// MARK: - Mutex import
-import Synchronization

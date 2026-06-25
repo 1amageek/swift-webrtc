@@ -6,53 +6,16 @@
 /// `FragmentAssembler`, `SCTPCookie`, …), `WebRTC`, and the existing test suite
 /// bind to. It is pure bridging plus the package-internal `Data`-based byte
 /// helpers the state machine still uses.
+///
+/// Host-only: the `Data`-based bridges below exist for the historical public API
+/// and the test suite and are gated out of the Embedded build. The Embedded-clean
+/// error bridges (`SCTPStateError.asSCTPError`, `SCTPWireError.rethrowUnwrapped`),
+/// which the cored ``SCTPAssociationEngine`` also uses, live in
+/// `SCTPErrorBridge.swift` (no Foundation).
 
+#if !hasFeature(Embedded)
 import Foundation
 @_exported import SCTPWireCore
-
-// MARK: - SCTPStateError bridging
-
-extension SCTPStateError {
-    /// Maps the Embedded-clean state-machine error onto the historical
-    /// ``SCTPError`` so existing call sites (and tests) keep catching `SCTPError`.
-    public var asSCTPError: SCTPError {
-        switch self {
-        case .receiveBufferExceeded(let streamID):
-            return .receiveBufferExceeded(streamID: streamID)
-        case .sendQueueFull(let bytesInFlight, let limit):
-            return .sendQueueFull(bytesInFlight: bytesInFlight, limit: limit)
-        }
-    }
-}
-
-// MARK: - SCTPWireError unwrapping
-
-extension SCTPWireError {
-    /// Rethrows the *wrapped* error mapped onto the historical ``SCTPError``.
-    ///
-    /// Usage at a `Data`-API boundary that calls a typed-throws core method:
-    /// ```swift
-    /// do { return try coreCall() } catch { try error.rethrowUnwrapped() }
-    /// ```
-    /// In the bare `catch`, `error` has static type `SCTPWireError` (the core's
-    /// typed throw), so this avoids the generic-helper / `catch as` forms that
-    /// miscompile with typed throws on this toolchain.
-    public func rethrowUnwrapped() throws -> Never {
-        switch self {
-        case .bytes(let e):
-            throw SCTPError.invalidFormat("byte error: \(e)")
-        case .decode(let e):
-            switch e {
-            case .insufficientData(let expected, let actual):
-                throw SCTPError.insufficientData(expected: expected, actual: actual)
-            case .invalidFormat(let message):
-                throw SCTPError.invalidFormat(message)
-            case .checksumMismatch(let expected, let actual):
-                throw SCTPError.checksumMismatch(expected: expected, actual: actual)
-            }
-        }
-    }
-}
 
 // MARK: - Byte-array <-> Data equality bridges
 
@@ -236,3 +199,5 @@ func readUInt32(_ data: [UInt8], offset: Int) -> UInt32 {
 func crc32c(_ data: Data) -> UInt32 {
     SCTPWireCore.crc32c([UInt8](data))
 }
+
+#endif

@@ -1,6 +1,11 @@
 /// `Data`-based convenience surface for the moved `STUNMessage` type, plus the
-/// crypto-bearing `encodeWithIntegrity` which must stay Foundation/Crypto side.
+/// crypto-bearing `encodeWithIntegrity`.
+///
+/// Host-only: the `Data` surface is gated out of the Embedded build, which uses
+/// the `[UInt8]` core primitives (`STUNMessage.encodeWithIntegrityBytes`,
+/// `isSTUN([UInt8])`, `decode(from: [UInt8])`) directly.
 
+#if !hasFeature(Embedded)
 import Foundation
 import STUNWireCore
 
@@ -94,58 +99,14 @@ extension STUNMessage {
 
     // MARK: - Encode with MESSAGE-INTEGRITY and FINGERPRINT (crypto, adapter-side)
 
-    /// Encode with MESSAGE-INTEGRITY and FINGERPRINT.
+    /// Encode with MESSAGE-INTEGRITY and FINGERPRINT (`Data` surface).
     /// - Parameter key: The HMAC-SHA1 key (ICE password)
     /// - Returns: Encoded message with integrity and fingerprint
     ///
-    /// Builds the wire format in a single buffer: the header length field is
-    /// first written to cover MESSAGE-INTEGRITY for the HMAC input, then
-    /// patched in place to also cover FINGERPRINT for the CRC input
-    /// (RFC 5389 §15.4, §15.5).
+    /// Delegates to the Embedded-clean `[UInt8]` implementation
+    /// (``encodeWithIntegrityBytes(key:)``) so both surfaces stay byte-identical.
     public func encodeWithIntegrity(key: Data) -> Data {
-        let attrData = Data(STUNMessage.encodeAttributes(attributes))
-
-        let integrityAttrSize = stunAttributeHeaderSize + 20 // HMAC-SHA1
-        let fingerprintAttrSize = stunAttributeHeaderSize + 4 // CRC-32
-
-        var data = Data(capacity: stunHeaderSize + attrData.count + integrityAttrSize + fingerprintAttrSize)
-
-        // Header — length covers attributes + MESSAGE-INTEGRITY
-        let lengthWithIntegrity = UInt16(attrData.count + integrityAttrSize)
-        data.append(UInt8(messageType.rawValue >> 8))
-        data.append(UInt8(messageType.rawValue & 0xFF))
-        data.append(UInt8(lengthWithIntegrity >> 8))
-        data.append(UInt8(lengthWithIntegrity & 0xFF))
-        data.append(UInt8(stunMagicCookie >> 24))
-        data.append(UInt8((stunMagicCookie >> 16) & 0xFF))
-        data.append(UInt8((stunMagicCookie >> 8) & 0xFF))
-        data.append(UInt8(stunMagicCookie & 0xFF))
-        data.append(transactionID.bytes)
-        data.append(attrData)
-
-        // MESSAGE-INTEGRITY over the buffer so far (value is 20 bytes,
-        // already 4-byte aligned — no padding needed)
-        let hmac = MessageIntegrity.compute(data: data, key: key)
-        data.append(UInt8(STUNAttributeType.messageIntegrity.rawValue >> 8))
-        data.append(UInt8(STUNAttributeType.messageIntegrity.rawValue & 0xFF))
-        data.append(0)
-        data.append(20)
-        data.append(hmac)
-
-        // Patch the length in place to also cover FINGERPRINT
-        let lengthWithFingerprint = UInt16(attrData.count + integrityAttrSize + fingerprintAttrSize)
-        data[2] = UInt8(lengthWithFingerprint >> 8)
-        data[3] = UInt8(lengthWithFingerprint & 0xFF)
-
-        // FINGERPRINT over the buffer so far (value is 4 bytes, aligned)
-        let fp = STUNFingerprint.compute(data: data)
-        data.append(UInt8(STUNAttributeType.fingerprint.rawValue >> 8))
-        data.append(UInt8(STUNAttributeType.fingerprint.rawValue & 0xFF))
-        data.append(0)
-        data.append(4)
-        data.append(fp)
-
-        return data
+        Data(encodeWithIntegrityBytes(key: [UInt8](key)))
     }
 }
 
@@ -163,3 +124,5 @@ extension STUNFingerprint {
         verify(message: [UInt8](input))
     }
 }
+
+#endif

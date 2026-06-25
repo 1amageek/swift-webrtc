@@ -5,35 +5,14 @@
 /// so it can build under Embedded Swift. This adapter restores the historical
 /// `Data`-based `encode()`/`decode(from:Data)` surface that `DataChannelManager`,
 /// `WebRTC`, and the existing test suite bind to.
+///
+/// Host-only: the `Data` surface below is gated out of the Embedded build, which
+/// uses the `[UInt8]` core primitives directly. The Embedded-clean error bridge
+/// (`DataChannelWireError.rethrowUnwrapped`) lives in `DCEPErrorBridge.swift`.
 
+#if !hasFeature(Embedded)
 import Foundation
 @_exported import DataChannelCore
-
-// MARK: - DataChannelWireError unwrapping
-
-extension DataChannelWireError {
-    /// Rethrows the *wrapped* error mapped onto the historical
-    /// ``DataChannelError``.
-    ///
-    /// Usage at a `Data`-API boundary that calls a typed-throws core method:
-    /// ```swift
-    /// do { return try coreCall() } catch { try error.rethrowUnwrapped() }
-    /// ```
-    /// In the bare `catch`, `error` has static type `DataChannelWireError` (the
-    /// core's typed throw), so this avoids the generic-helper / `catch as` forms
-    /// that miscompile with typed throws on this toolchain.
-    public func rethrowUnwrapped() throws -> Never {
-        switch self {
-        case .bytes(let e):
-            throw DataChannelError.invalidFormat("byte error: \(e)")
-        case .decode(let e):
-            switch e {
-            case .invalidFormat(let message):
-                throw DataChannelError.invalidFormat(message)
-            }
-        }
-    }
-}
 
 // MARK: - DCEPOpen (Data surface)
 
@@ -70,3 +49,5 @@ extension DCEPAck {
         }
     }
 }
+
+#endif

@@ -6,8 +6,10 @@
 /// catch `SCTPError` directly. The state machine (`SCTPAssociation`,
 /// `FragmentAssembler`, `RetransmissionQueue`, `SCTPCookie`, …) also throws this
 /// type for protocol-level violations.
-
-import Foundation
+///
+/// Embedded-clean: `Error`/`Sendable` are available under Embedded Swift, so this
+/// type needs no Foundation import and is shared by both the host adapter and the
+/// Embedded engine.
 
 public enum SCTPError: Error, Sendable {
     case insufficientData(expected: Int, actual: Int)

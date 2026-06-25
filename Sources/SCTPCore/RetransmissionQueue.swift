@@ -14,7 +14,13 @@
 /// before delegating, so the millisecond deltas the core reasons about match the
 /// `Duration` deltas callers pass. `Duration`-typed results (RTO) are converted
 /// back from the core's millis.
+///
+/// Host-only: this `ContinuousClock`/`Duration` surface exists for the historical
+/// public API and the test suite. The Embedded path drives
+/// `SCTPWireCore.RetransmissionState` directly (millis domain), so this wrapper is
+/// gated out of the Embedded build.
 
+#if !hasFeature(Embedded)
 import Foundation
 
 /// Retransmission error surfaced by the queue's retransmission scan.
@@ -122,3 +128,5 @@ public struct RetransmissionQueue: Sendable {
     /// Current RTO value as a `Duration` (converted from the core's millis).
     public var currentRTO: Duration { .milliseconds(Int64(state.currentRTOMillis)) }
 }
+
+#endif

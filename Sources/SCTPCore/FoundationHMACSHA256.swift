@@ -5,7 +5,12 @@
 /// HMAC: the only place the concrete crypto backend (swift-crypto) is named. The
 /// `SCTPWireCore` cookie core depends only on the `MessageAuthenticationCode`
 /// protocol; this type plugs the protocol into HMAC-SHA256 at the host boundary.
+///
+/// Host-only: under Embedded the SCTP adapter routes the COOKIE HMAC through
+/// `P2PCryptoEmbedded.BoringHMACSHA256`, so this swift-crypto-backed provider is
+/// gated out of the Embedded build.
 
+#if !hasFeature(Embedded)
 import Crypto
 import P2PCoreCrypto
 
@@ -64,3 +69,5 @@ struct FoundationHMACSHA256: P2PCoreCrypto.MessageAuthenticationCode {
         )
     }
 }
+
+#endif

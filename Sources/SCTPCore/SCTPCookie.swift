@@ -8,7 +8,13 @@
 /// ``FoundationHMACSHA256`` provider. The cookie-secret rotation stays with the
 /// caller (`SCTPAssociation`). The binding check is fail-closed: any mismatch
 /// (HMAC, expiry, future timestamp) is rejected via the core, never accepted.
+///
+/// Host-only: this `Data`/`ProcessInfo`-clock surface exists for the historical
+/// public API and the test suite. The Embedded path (and the cored
+/// ``SCTPAssociationEngine``) drives ``SCTPWireCore/SCTPCookieCore`` directly with
+/// an injected `nowMillis`, so this wrapper is gated out of the Embedded build.
 
+#if !hasFeature(Embedded)
 import Foundation
 import SCTPWireCore
 
@@ -135,3 +141,5 @@ public struct SCTPCookie: Sendable, Equatable {
         UInt64(ProcessInfo.processInfo.systemUptime * 1000)
     }
 }
+
+#endif
