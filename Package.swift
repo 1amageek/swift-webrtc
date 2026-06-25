@@ -14,6 +14,46 @@ let coreSettings: [SwiftSetting] = {
     return s
 }()
 
+// The Tier-1 `WebRTC` facade's dependencies. The DTLS facade (`TLS`) and the
+// Embedded-clean cores dual-build under `P2P_CORE_EMBEDDED`. Host-only packages
+// — swift-certificates / swift-asn1 (self-signed X.509 generation) and swift-log
+// (logging) — are dropped under Embedded, where the facade gates the matching
+// imports behind `#if !hasFeature(Embedded)` and uses the no-op logger shim +
+// the externally-provisioned-identity path. Under Embedded the facade hashes the
+// DTLS-SRTP fingerprint via `P2PCryptoEmbedded`'s `BoringSHA256` (preserving
+// fail-closed verification) and schedules its retransmission tick through
+// `P2PCoreCrypto`'s `AsyncTimer` seam.
+//
+// NOTE: the WebRTC facade orchestration still drives the host-only `Data`-based
+// adapters (`STUNCore` / `ICELite` / `SCTPCore` / `DataChannel`); those adapter
+// targets are NOT yet Embedded-built, so a full `--target WebRTC` Embedded build
+// is blocked at the adapter layer until they are cored. See CONTEXT.md.
+let webrtcFacadeDependencies: [Target.Dependency] = {
+    var d: [Target.Dependency] = [
+        "STUNCore", "ICELite", "SCTPCore", "DataChannel",
+        // The DTLS handshake/record engine is driven through swift-tls's Tier-1
+        // `TLS` facade (`DTLSClient`/`DTLSServer`).
+        .product(name: "TLS", package: "swift-tls"),
+        // Time + deadline-sleep seam for the retransmission driver (dual-build).
+        .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
+    ]
+    if embeddedEnabled {
+        d += [
+            // Embedded fingerprint SHA-256 + the `Span` currency it consumes.
+            .product(name: "P2PCryptoEmbedded", package: "swift-p2p-crypto"),
+            .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
+        ]
+    } else {
+        d += [
+            .product(name: "Crypto", package: "swift-crypto"),
+            .product(name: "X509", package: "swift-certificates"),
+            .product(name: "SwiftASN1", package: "swift-asn1"),
+            .product(name: "Logging", package: "swift-log"),
+        ]
+    }
+    return d
+}()
+
 let package = Package(
     name: "swift-webrtc",
     platforms: [
@@ -47,6 +87,10 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
         .package(path: "../swift-p2p-core"),
+        // Provides `P2PCryptoEmbedded.BoringSHA256` for the Embedded DTLS-SRTP
+        // fingerprint (fail-closed on both builds). Local path on the `embedded`
+        // branch; restore the URL pin before release.
+        .package(path: "../swift-p2p-crypto"),
     ],
     targets: [
         // ---- Embedded-clean STUN wire codec (dual-build: host + Embedded) ----
@@ -115,21 +159,18 @@ let package = Package(
             dependencies: ["SCTPCore", "DataChannelCore"],
             path: "Sources/DataChannel"
         ),
+        // ---- Tier-1 facade: WebRTCEndpoint/Connection/Listener/DataChannel ----
+        // Dual-build orchestrator. Host: `Mutex` / `ContinuousClock` / swift-log /
+        // swift-certificates. Embedded: those host-only deps are dropped (gated
+        // `#if !hasFeature(Embedded)`); the lock becomes an `Atomic` spinlock, the
+        // retransmission timer the `clock_gettime`-backed `WebRTCEmbeddedTimer`,
+        // the logger a no-op shim, and the DTLS-SRTP fingerprint a `BoringSHA256`.
+        // The externally-provisioned-identity path replaces X.509 generation.
         .target(
             name: "WebRTC",
-            dependencies: [
-                "STUNCore", "ICELite", "SCTPCore", "DataChannel",
-                // The DTLS handshake/record engine is driven through swift-tls's
-                // Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`). The former
-                // `DTLSCore`/`DTLSRecord` products were demoted to `package` in the
-                // tls facade redesign and are no longer importable here.
-                .product(name: "TLS", package: "swift-tls"),
-                .product(name: "Crypto", package: "swift-crypto"),
-                .product(name: "X509", package: "swift-certificates"),
-                .product(name: "SwiftASN1", package: "swift-asn1"),
-                .product(name: "Logging", package: "swift-log"),
-            ],
-            path: "Sources/WebRTC"
+            dependencies: webrtcFacadeDependencies,
+            path: "Sources/WebRTC",
+            swiftSettings: coreSettings
         ),
         // Tests
         .testTarget(name: "STUNCoreTests", dependencies: ["STUNCore"], path: "Tests/STUNCoreTests"),

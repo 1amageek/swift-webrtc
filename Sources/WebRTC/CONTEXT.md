@@ -6,8 +6,11 @@ Invariants and design intent that the code does not state structurally. Read thi
 before changing the DTLS-SRTP authentication path, the certificate/fingerprint
 ownership, or the SCTP/ICE buffering caps. The protocol stack is `UDP → STUN /
 ICE Lite → DTLS 1.2 → SCTP → Data Channels`; the lower layers split into an
-Embedded-clean `*WireCore`/`*Core` value type plus a Foundation adapter, while
-this top-level module is host-only (Foundation + swift-crypto + X.509).
+Embedded-clean `*WireCore`/`*Core` value type plus a Foundation adapter. This
+top-level module's own sources are now Embedded-seamed (FacadeLock / AsyncTimer /
+logger / cert gating), but the target does not yet fully Embedded-compile because
+it still orchestrates the host-only `Data`/`Mutex` adapters — see "Embedded
+constraints".
 
 ## Contracts (the load-bearing rules)
 
@@ -27,9 +30,10 @@ this top-level module is host-only (Foundation + swift-crypto + X.509).
 - **The server is configured with `requireClientCertificate: true`.**
   `DTLSEndpoint.make` honors `requireClientCertificate` only on the server role;
   the WebRTC server demands mutual DTLS authentication. Do not relax this.
-- **`WebRTCConnection` thread safety is `Mutex`-based, not actor-based.** Internal
-  state lives behind `connState.withLock`. Keep mutations inside the lock; do not
-  hold the lock across an `await`.
+- **`WebRTCConnection` thread safety is lock-based, not actor-based.** Internal
+  state lives behind `connState.withLock` via the `FacadeLock` seam (host
+  `Synchronization.Mutex` / Embedded `Atomic` spinlock). Keep mutations inside the
+  lock; do not hold the lock across an `await`.
 - **`incomingChannels` is an `AsyncStream` that MUST be finished on close/fail.**
   `finishIncomingChannels()` calls the continuation's `finish()`; the fail-closed
   handshake paths call it before throwing. A path that fails the connection without
@@ -53,8 +57,11 @@ this top-level module is host-only (Foundation + swift-crypto + X.509).
   `fromDigest` wraps an existing SHA-256 digest (e.g. extracted from a `/certhash`
   multihash) verbatim. Do not collapse the two — a hash-of-hash breaks peer
   matching.
-- **`WebRTCCertificate.init` is fail-closed on garbage DER.** It parses the DER as
-  an `X509.Certificate` before accepting it; unparseable bytes throw.
+- **`WebRTCCertificate.init` is fail-closed on garbage DER (host).** On host it
+  parses the DER as an `X509.Certificate` before accepting it; unparseable bytes
+  throw. Under Embedded (no X.509), `init(derEncoded:rawPrivateKey:)` accepts the
+  externally-provisioned DER + raw key and computes the fingerprint via
+  `BoringSHA256`; no identity is fabricated if absent.
 - **ICE-Lite `validatedPeers` is capped FIFO.** `ICELiteStateMachine`
   (`Sources/ICELiteCore/ICELiteStateMachine.swift`) caps the set at
   `maxValidatedPeers` (1000); admitting a new key past the cap evicts the oldest
@@ -82,9 +89,40 @@ this top-level module is host-only (Foundation + swift-crypto + X.509).
 
 ## Embedded constraints (do not regress)
 
-- **This top-level `WebRTC` module is host-only.** It depends on Foundation,
-  swift-crypto, X.509, and swift-asn1 (certificate generation). Only the four
-  cores dual-build for Embedded Swift.
+- **The `WebRTC` facade's own sources are Embedded-seamed (lock/timer/logger/cert),
+  but the target does NOT yet fully Embedded-compile.** The facade files
+  (`WebRTCConnection` / `WebRTCEndpoint` / `WebRTCListener` / `WebRTCCertificate`)
+  route their host-only deps through build-gated seams: `FacadeLock` (host `Mutex`
+  / Embedded `Atomic` spinlock), `WebRTCDefaultTimer` (the `AsyncTimer` seam — host
+  `ContinuousClock`+`Task.sleep`, Embedded `clock_gettime`+sliced `nanosleep`;
+  drives the SCTP T3-rtx tick), `WebRTCLogger` (host swift-log / Embedded no-op),
+  and a build-gated DTLS-SRTP fingerprint SHA-256 (host swift-crypto / Embedded
+  `P2PCryptoEmbedded.BoringSHA256`). Do not reintroduce a bare `Mutex` /
+  `Task.sleep` / `ContinuousClock` / `Logging.Logger` into the facade.
+- **Cert generation is host-only; the Embedded identity is externally provisioned.**
+  `WebRTCCertificate.generateSelfSigned` (swift-certificates / swift-asn1) and the
+  typed `privateKey` (`P256.Signing.PrivateKey`) are `#if !hasFeature(Embedded)`.
+  Under Embedded the embedder MUST supply the identity via
+  `init(derEncoded:rawPrivateKey:)` (DER + 32-byte raw P-256 scalar) — fail-closed,
+  never fabricated. `WebRTCEndpoint.create()` (which generates a cert) is likewise
+  host-only; use `init(certificate:)` under Embedded. The fail-closed DTLS-SRTP
+  fingerprint verification is preserved on BOTH builds.
+- **REMAINING BLOCKER for a full `--target WebRTC -c release` Embedded build: the
+  host-only adapter layer.** `WebRTCConnection` orchestrates the `Data`/`Mutex`/
+  `Crypto`/`ContinuousClock` adapters `STUNCore` / `ICELite` / `SCTPCore` /
+  `DataChannel` (the `SCTPAssociation` / `ICELiteAgent` / `DataChannelManager`
+  state machines + the STUN message-integrity HMAC). These adapter targets are NOT
+  dual-built, so under `P2P_CORE_EMBEDDED=1` they fail to import the now-Embedded
+  `STUNWireCore` / `P2PCoreBytes` / `P2PCoreCrypto` ("module … cannot be imported
+  because it was built with embedded Swift") and SwiftPM halts before the WebRTC
+  module is reached. The `*Core`/`*WireCore` modules supply only the wire codecs
+  and value-type sub-pieces (cookie value, TSN tracker, reassembler, ICE verdict),
+  NOT the association/agent/manager orchestration. Making `--target WebRTC`
+  Embedded-compile is therefore a SEPARATE effort: port (core) `SCTPAssociation` /
+  `ICELiteAgent` / `DataChannelManager` + the STUN HMAC to an Embedded-clean,
+  `[UInt8]`/`Span`-native orchestration layer (mirroring how the tls/mDNS/SWIM
+  facades sit directly on cored engines). The facade `Data`-based public API must
+  stay (libp2p's `P2PTransportWebRTC` depends on it).
 - **The Embedded-clean layers are `STUNWireCore`, `ICELiteCore`, `SCTPWireCore`,
   `DataChannelCore`** — value types, no Foundation. Build with
   `P2P_CORE_EMBEDDED=1 swift build --target <Core> -c release`. Do not introduce

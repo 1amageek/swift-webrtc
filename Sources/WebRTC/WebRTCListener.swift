@@ -5,9 +5,10 @@
 /// and provides a send handler per connection.
 
 import Foundation
-import Synchronization
 import ICELite
+#if !hasFeature(Embedded)
 import Logging
+#endif
 
 /// A WebRTC listener that accepts incoming connections
 public final class WebRTCListener: Sendable {
@@ -28,8 +29,8 @@ public final class WebRTCListener: Sendable {
     // MARK: - Private state
 
     private let certificate: WebRTCCertificate
-    private let logger: Logger
-    private let listenerState: Mutex<ListenerState>
+    private let logger: WebRTCLogger
+    private let listenerState: FacadeLock<ListenerState>
 
     private struct ListenerState: Sendable {
         var stream: AsyncStream<WebRTCConnection>
@@ -42,7 +43,7 @@ public final class WebRTCListener: Sendable {
 
     public init(
         certificate: WebRTCCertificate,
-        logger: Logger = Logger(label: "webrtc.listener")
+        logger: WebRTCLogger = WebRTCLogger(label: "webrtc.listener")
     ) {
         self.certificate = certificate
         self.localFingerprint = certificate.fingerprint
@@ -50,7 +51,7 @@ public final class WebRTCListener: Sendable {
         // Create the stream eagerly so connections accepted before the first
         // subscription are buffered rather than dropped
         let (stream, continuation) = AsyncStream<WebRTCConnection>.makeStream()
-        self.listenerState = Mutex(ListenerState(stream: stream, continuation: continuation))
+        self.listenerState = FacadeLock(ListenerState(stream: stream, continuation: continuation))
     }
 
     // MARK: - Connection acceptance

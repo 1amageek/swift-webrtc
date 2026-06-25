@@ -10,13 +10,14 @@
 /// the local ``DTLSEndpoint`` wrapper.
 
 import Foundation
-import Synchronization
 import TLS
 import STUNCore
 import ICELite
 import SCTPCore
 import DataChannel
+#if !hasFeature(Embedded)
 import Logging
+#endif
 
 /// A WebRTC Direct connection over UDP
 ///
@@ -82,15 +83,19 @@ public final class WebRTCConnection: Sendable {
     // MARK: - Private state
 
     private let dtlsEndpoint: DTLSEndpoint
-    private let connState: Mutex<ConnState>
-    private let channelState: Mutex<ChannelState>
-    private let dataHandlerState: Mutex<DataHandler?>
+    private let connState: FacadeLock<ConnState>
+    private let channelState: FacadeLock<ChannelState>
+    private let dataHandlerState: FacadeLock<DataHandler?>
     private let sendHandler: SendHandler
     private let expectedFingerprint: CertificateFingerprint?
-    private let logger: Logger
+    private let logger: WebRTCLogger
+
+    /// Time + deadline-sleep seam for the SCTP retransmission driver
+    /// (`AsyncTimer.sleep(untilNanos:)`, never `Task.sleep` / `ContinuousClock`).
+    private let timer: WebRTCDefaultTimer
 
     /// Periodic driver for SCTP T3-rtx retransmissions
-    private let retransmitTask: Mutex<Task<Void, Never>?>
+    private let retransmitTask: FacadeLock<Task<Void, Never>?>
 
     /// Interval between retransmission timer checks
     private static let retransmitTickInterval: Duration = .milliseconds(250)
@@ -121,7 +126,7 @@ public final class WebRTCConnection: Sendable {
         certificate: WebRTCCertificate,
         remoteFingerprint expectedFingerprint: CertificateFingerprint,
         sendHandler: @escaping SendHandler,
-        logger: Logger = Logger(label: "webrtc.connection")
+        logger: WebRTCLogger = WebRTCLogger(label: "webrtc.connection")
     ) -> WebRTCConnection {
         WebRTCConnection(
             certificate: certificate,
@@ -148,7 +153,7 @@ public final class WebRTCConnection: Sendable {
         certificate: WebRTCCertificate,
         remoteFingerprint expectedFingerprint: CertificateFingerprint? = nil,
         sendHandler: @escaping SendHandler,
-        logger: Logger = Logger(label: "webrtc.connection")
+        logger: WebRTCLogger = WebRTCLogger(label: "webrtc.connection")
     ) -> WebRTCConnection {
         WebRTCConnection(
             certificate: certificate,
@@ -164,7 +169,7 @@ public final class WebRTCConnection: Sendable {
         isClient: Bool,
         expectedFingerprint: CertificateFingerprint?,
         sendHandler: @escaping SendHandler,
-        logger: Logger
+        logger: WebRTCLogger
     ) {
         self.localFingerprint = certificate.fingerprint
         // The DTLS server (this endpoint when !isClient) MUST require the client to
@@ -187,7 +192,8 @@ public final class WebRTCConnection: Sendable {
         self.expectedFingerprint = expectedFingerprint
         self.sendHandler = sendHandler
         self.logger = logger
-        self.connState = Mutex(ConnState(
+        self.timer = WebRTCDefaultTimer()
+        self.connState = FacadeLock(ConnState(
             iceAgent: ICELiteAgent(),
             sctpAssociation: SCTPAssociation(),
             channelManager: DataChannelManager(isInitiator: isClient),
@@ -197,12 +203,12 @@ public final class WebRTCConnection: Sendable {
         // Create the stream eagerly so channels arriving before the first
         // subscription are buffered rather than dropped
         let (incomingStream, incomingContinuation) = AsyncStream<DataChannel>.makeStream()
-        self.channelState = Mutex(ChannelState(
+        self.channelState = FacadeLock(ChannelState(
             incomingStream: incomingStream,
             incomingContinuation: incomingContinuation
         ))
-        self.dataHandlerState = Mutex(nil)
-        self.retransmitTask = Mutex(nil)
+        self.dataHandlerState = FacadeLock(nil)
+        self.retransmitTask = FacadeLock(nil)
     }
 
     // MARK: - Connection lifecycle
@@ -642,10 +648,22 @@ public final class WebRTCConnection: Sendable {
     private func startRetransmissionDriver() {
         retransmitTask.withLock { task in
             guard task == nil else { return }
+            // The retransmission tick is scheduled through the injected
+            // `AsyncTimer` seam (`timer.sleep(untilNanos:)`), NOT `Task.sleep` /
+            // `ContinuousClock`, both of which are unavailable under Embedded.
+            let tickNanos = Self.retransmitTickInterval.facadeNanoseconds
+            let timer = self.timer
+            // `weak`/`unowned` are forbidden under Embedded; the host build keeps
+            // the weak capture (so dropping the connection without `close()` does
+            // not leak via the task→self→task cycle). Under Embedded the strong
+            // capture is broken by `close()` cancelling the task (or the loop
+            // self-terminating on a terminal state), so no live cycle persists.
+            #if !hasFeature(Embedded)
             task = Task { [weak self] in
                 while !Task.isCancelled {
+                    let deadline = timer.monotonicNanos() &+ tickNanos
                     do {
-                        try await Task.sleep(for: Self.retransmitTickInterval)
+                        try await timer.sleep(untilNanos: deadline)
                     } catch {
                         return // task cancelled during sleep
                     }
@@ -653,6 +671,19 @@ public final class WebRTCConnection: Sendable {
                     if self.driveRetransmissions() { return }
                 }
             }
+            #else
+            task = Task { [self] in
+                while !Task.isCancelled {
+                    let deadline = timer.monotonicNanos() &+ tickNanos
+                    do {
+                        try await timer.sleep(untilNanos: deadline)
+                    } catch {
+                        return // task cancelled during sleep
+                    }
+                    if self.driveRetransmissions() { return }
+                }
+            }
+            #endif
         }
     }
 

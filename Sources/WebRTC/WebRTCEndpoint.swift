@@ -7,12 +7,13 @@
 /// to connections. This allows integration with any UDP transport (NIO, etc).
 
 import Foundation
-import Synchronization
 import STUNCore
 import ICELite
 import SCTPCore
 import DataChannel
+#if !hasFeature(Embedded)
 import Logging
+#endif
 
 /// WebRTC Direct endpoint for creating connections and listeners
 public final class WebRTCEndpoint: Sendable {
@@ -24,8 +25,8 @@ public final class WebRTCEndpoint: Sendable {
         certificate.fingerprint
     }
 
-    private let logger: Logger
-    private let endpointState: Mutex<EndpointState>
+    private let logger: WebRTCLogger
+    private let endpointState: FacadeLock<EndpointState>
 
     private struct EndpointState: Sendable {
         var listeners: [WebRTCListener] = []
@@ -33,17 +34,25 @@ public final class WebRTCEndpoint: Sendable {
         var isClosed: Bool = false
     }
 
-    public init(certificate: WebRTCCertificate, logger: Logger = Logger(label: "webrtc")) {
+    public init(certificate: WebRTCCertificate, logger: WebRTCLogger = WebRTCLogger(label: "webrtc")) {
         self.certificate = certificate
         self.logger = logger
-        self.endpointState = Mutex(EndpointState())
+        self.endpointState = FacadeLock(EndpointState())
     }
 
-    /// Create an endpoint with a new self-signed certificate
-    public static func create(logger: Logger = Logger(label: "webrtc")) throws -> WebRTCEndpoint {
+    /// Create an endpoint with a new self-signed certificate.
+    ///
+    /// Host-only: self-signed X.509 generation needs swift-certificates /
+    /// swift-asn1, which are unavailable under Embedded. Under Embedded the
+    /// embedder must supply a `WebRTCCertificate` (DER + raw key) externally and
+    /// construct the endpoint via `init(certificate:)`. There is no silent
+    /// fallback: the convenience constructor simply does not exist there.
+    #if !hasFeature(Embedded)
+    public static func create(logger: WebRTCLogger = WebRTCLogger(label: "webrtc")) throws -> WebRTCEndpoint {
         let cert = try WebRTCCertificate.generateSelfSigned()
         return WebRTCEndpoint(certificate: cert, logger: logger)
     }
+    #endif
 
     // MARK: - Client connections
 

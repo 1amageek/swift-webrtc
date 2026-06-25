@@ -11,10 +11,15 @@
 /// certificate, `digitalSignature` key usage, not a CA, valid for one year.
 
 import Foundation
-import Crypto
 import TLS
+#if !hasFeature(Embedded)
+import Crypto
 @preconcurrency import X509
 import SwiftASN1
+#else
+import P2PCoreBytes
+import P2PCryptoEmbedded
+#endif
 
 /// Fingerprint hash algorithm. WebRTC mandates SHA-256 in current deployments.
 public enum FingerprintAlgorithm: String, Sendable, Hashable {
@@ -36,9 +41,21 @@ public struct CertificateFingerprint: Sendable, Hashable, Equatable {
     }
 
     /// Compute a fingerprint from a DER-encoded X.509 certificate by hashing it.
+    ///
+    /// The SHA-256 is routed through a build-gated seam so DTLS-SRTP fingerprint
+    /// verification (RFC 8122) is byte-identical and fail-closed on BOTH host and
+    /// Embedded: host uses swift-crypto's `SHA256`, Embedded uses the BoringSSL
+    /// `BoringSHA256`. There is no platform on which fingerprint computation
+    /// silently degrades.
     public static func fromDER(_ data: Data) -> CertificateFingerprint {
+        #if !hasFeature(Embedded)
         let hash = SHA256.hash(data: data)
         return CertificateFingerprint(algorithm: .sha256, bytes: Data(hash))
+        #else
+        let bytes = [UInt8](data)
+        let hash = BoringSHA256.hash(bytes.span)
+        return CertificateFingerprint(algorithm: .sha256, bytes: Data(hash))
+        #endif
     }
 
     /// Create from an existing SHA-256 digest (e.g. extracted from a multihash
@@ -75,26 +92,47 @@ public struct CertificateFingerprint: Sendable, Hashable, Equatable {
 
 /// A WebRTC DTLS certificate: an ECDSA P-256 leaf certificate, its private key,
 /// and the SHA-256 fingerprint of the DER encoding.
+///
+/// ## Host vs Embedded
+///
+/// On host, the certificate can be self-signed locally (`generateSelfSigned`)
+/// using swift-certificates / swift-asn1, and the typed `privateKey`
+/// (`P256.Signing.PrivateKey`) is exposed for callers that want it. Under
+/// Embedded, X.509 generation is unavailable: the embedder MUST supply the DER
+/// certificate and the raw P-256 private-key scalar externally via
+/// `init(derEncoded:rawPrivateKey:)`. There is no silent fallback — neither build
+/// fabricates an identity it was not given. The DTLS facade is fed the raw key
+/// scalar + DER chain via `tlsIdentity` identically on both builds.
 public struct WebRTCCertificate: Sendable {
     /// The DER-encoded X.509 leaf certificate.
     public let derEncoded: Data
 
-    /// The ECDSA P-256 signing private key.
-    public let privateKey: P256.Signing.PrivateKey
+    /// The raw ECDSA P-256 private-key scalar (32 bytes). This is the canonical
+    /// key representation fed to the DTLS facade's `TLSIdentity` on both builds.
+    public let rawPrivateKey: [UInt8]
 
     /// SHA-256 fingerprint of `derEncoded`.
     public let fingerprint: CertificateFingerprint
 
-    /// Wrap an externally-generated DER certificate and its private key.
+    #if !hasFeature(Embedded)
+    /// The ECDSA P-256 signing private key (host-only typed view).
+    public let privateKey: P256.Signing.PrivateKey
+
+    /// Wrap an externally-generated DER certificate and its typed private key.
     public init(derEncoded: Data, privateKey: P256.Signing.PrivateKey) throws {
         // Validate the DER parses as an X.509 certificate (fail-closed on garbage).
         _ = try X509.Certificate(derEncoded: Array(derEncoded))
         self.derEncoded = derEncoded
         self.privateKey = privateKey
+        self.rawPrivateKey = [UInt8](privateKey.rawRepresentation)
         self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
     }
 
     /// Generate a self-signed ECDSA P-256 certificate (WebRTC convention).
+    ///
+    /// Host-only: self-signed X.509 generation needs swift-certificates /
+    /// swift-asn1, which are unavailable under Embedded. Under Embedded use
+    /// `init(derEncoded:rawPrivateKey:)` with an externally-provisioned identity.
     public static func generateSelfSigned(commonName: String = "webrtc") throws -> WebRTCCertificate {
         let privateKey = P256.Signing.PrivateKey()
 
@@ -125,12 +163,31 @@ public struct WebRTCCertificate: Sendable {
 
         return try WebRTCCertificate(derEncoded: derData, privateKey: privateKey)
     }
+    #endif
+
+    /// Wrap an externally-provisioned DER certificate and raw P-256 key scalar.
+    ///
+    /// This is the Embedded provisioning path (and is also available on host): the
+    /// embedder supplies the DER leaf and the 32-byte private-key scalar directly.
+    /// The fingerprint is computed fail-closed from the DER. No certificate or key
+    /// is fabricated — if the embedder has no identity, none is created.
+    public init(derEncoded: Data, rawPrivateKey: [UInt8]) throws {
+        #if !hasFeature(Embedded)
+        // On host, validate the DER parses as an X.509 certificate and recover the
+        // typed key (fail-closed on garbage DER or a malformed key scalar).
+        _ = try X509.Certificate(derEncoded: Array(derEncoded))
+        self.privateKey = try P256.Signing.PrivateKey(rawRepresentation: rawPrivateKey)
+        #endif
+        self.derEncoded = derEncoded
+        self.rawPrivateKey = rawPrivateKey
+        self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
+    }
 
     /// Build the swift-tls `TLSIdentity` the DTLS facade requires (raw P-256
     /// private-key scalar + DER leaf certificate).
     public var tlsIdentity: TLS.TLSIdentity {
         TLS.TLSIdentity(
-            privateKey: [UInt8](privateKey.rawRepresentation),
+            privateKey: rawPrivateKey,
             keyType: .ecdsaP256,
             certificateChain: [TLS.Certificate(der: [UInt8](derEncoded))]
         )
