@@ -21,19 +21,40 @@ dependencies: [
 ]
 ```
 
+> **Note:** The released `1.5.0` ships the prior API. The Tier-1 `TLS`-facade
+> wiring and the local certificate ownership (`WebRTCCertificate` /
+> `CertificateFingerprint` / fail-closed DTLS-SRTP) documented below currently
+> live on the unreleased `embedded` branch (M8 pending) and are not in any
+> tagged release yet. That branch also references `swift-tls` by local path, so
+> it is not consumable as a versioned dependency.
+
 ## Architecture
 
-The library is split into independent modules:
+The library is split into independent modules. Each protocol layer has an
+Embedded-clean `*WireCore`/`*Core` (value types, no Foundation) and a Foundation
+adapter built on top of it that preserves the `Data`-based API:
 
 | Module | Description | RFC |
 |---|---|---|
-| **STUNCore** | STUN message encoding/decoding, MESSAGE-INTEGRITY, FINGERPRINT | [RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389) |
+| **STUNWireCore** | Embedded-clean STUN wire codec | [RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389) |
+| **STUNCore** | Foundation STUN API, MESSAGE-INTEGRITY, FINGERPRINT | [RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389) |
+| **ICELiteCore** | Embedded-clean ICE Lite state machine | [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445) |
 | **ICELite** | ICE Lite agent for server-side connectivity checks | [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445) |
-| **SCTPCore** | SCTP association, chunk encoding/decoding, stream management | [RFC 4960](https://datatracker.ietf.org/doc/html/rfc4960) |
+| **SCTPWireCore** | Embedded-clean SCTP wire codec (chunks, packets, TSN) | [RFC 4960](https://datatracker.ietf.org/doc/html/rfc4960) |
+| **SCTPCore** | Foundation SCTP API, association, stream management | [RFC 4960](https://datatracker.ietf.org/doc/html/rfc4960) |
+| **DataChannelCore** | Embedded-clean DCEP wire codec | [RFC 8832](https://datatracker.ietf.org/doc/html/rfc8832) |
 | **DataChannel** | Data channel lifecycle, DCEP (open/ack) messages | [RFC 8831](https://datatracker.ietf.org/doc/html/rfc8831), [RFC 8832](https://datatracker.ietf.org/doc/html/rfc8832) |
 | **WebRTC** | Top-level API integrating all layers | — |
 
-DTLS is provided by [swift-tls](https://github.com/1amageek/swift-tls).
+The four `*WireCore` / `ICELiteCore` cores dual-build for Embedded Swift
+(`P2P_CORE_EMBEDDED=1 swift build --target <Core> -c release`).
+
+DTLS is driven through the Tier-1 `TLS` facade of
+[swift-tls](https://github.com/1amageek/swift-tls) (`DTLSClient` / `DTLSServer`).
+WebRTC owns its DTLS-SRTP certificate layer locally — `WebRTCCertificate`
+(self-signed ECDSA P-256 → DER + `TLSIdentity`) and `CertificateFingerprint`
+(SHA-256, SDP / `/certhash`) — because the facade takes a `TLSIdentity` rather
+than generating certificates.
 
 ## Usage
 
