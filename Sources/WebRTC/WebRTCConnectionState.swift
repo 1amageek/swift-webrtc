@@ -1,7 +1,5 @@
 /// WebRTC Connection State
 
-import Foundation
-
 /// WebRTC connection lifecycle state
 public enum WebRTCConnectionState: Sendable, Equatable {
     /// Initial state

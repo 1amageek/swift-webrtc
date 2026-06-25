@@ -19,7 +19,6 @@
 /// when the peer certificate is genuinely unavailable. It never silently accepts
 /// an unverified peer.
 
-import Foundation
 import TLS
 
 /// A DTLS role driven over the WebRTC datagram path.

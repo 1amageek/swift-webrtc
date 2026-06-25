@@ -3,7 +3,6 @@
 /// Unified state management for ICE/DTLS/SCTP protocol layers.
 /// Coordinates state transitions and ensures consistent error propagation.
 
-import Foundation
 import ICELite
 import SCTPCore
 
