@@ -111,11 +111,9 @@ let package = Package(
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
     dependencies: [
-        // Local path on the `embedded` branch: the DTLS handshake/record engine is
-        // driven through swift-tls's Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
-        // The former `DTLSCore`/`DTLSRecord` products were demoted to `package` in
-        // the tls facade redesign and are no longer importable here. NOT for release.
-        .package(path: "../swift-tls"),
+        // The DTLS handshake/record engine is driven through swift-tls's Tier-1
+        // `TLS` facade (`DTLSClient`/`DTLSServer`).
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.1"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
         // WebRTC owns its DTLS-SRTP leaf certificate (self-signed ECDSA P-256) and
         // its SHA-256 fingerprint locally, because the `TLS` facade takes a
@@ -125,11 +123,10 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.1"),
         .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
-        .package(path: "../swift-p2p-core"),
+        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
         // Provides `P2PCryptoEmbedded.BoringSHA256` for the Embedded DTLS-SRTP
-        // fingerprint (fail-closed on both builds). Local path on the `embedded`
-        // branch; restore the URL pin before release.
-        .package(path: "../swift-p2p-crypto"),
+        // fingerprint (fail-closed on both builds).
+        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
     ],
     targets: [
         // ---- Embedded-clean STUN wire codec (dual-build: host + Embedded) ----
@@ -219,6 +216,7 @@ let package = Package(
             name: "WebRTC",
             dependencies: webrtcFacadeDependencies,
             path: "Sources/WebRTC",
+            exclude: ["CONTEXT.md"],
             swiftSettings: coreSettings
         ),
         // Tests

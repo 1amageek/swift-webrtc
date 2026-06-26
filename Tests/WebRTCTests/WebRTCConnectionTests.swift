@@ -187,4 +187,79 @@ struct WebRTCConnectionDataHandlerTests {
 
         #expect(receivedCount == 0)
     }
+
+    @Test("openDataChannel after close is rejected")
+    func openDataChannelAfterCloseRejected() throws {
+        let cert = try WebRTCCertificate.generateSelfSigned()
+        let connection = WebRTCConnection.asServer(
+            certificate: cert,
+            sendHandler: { _ in }
+        )
+        connection.close()
+
+        do {
+            _ = try connection.openDataChannel(label: "closed")
+            Issue.record("Expected openDataChannel to fail after close")
+        } catch WebRTCError.invalidState(let message) {
+            #expect(message.contains("closed"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("send after close is rejected")
+    func sendAfterCloseRejected() throws {
+        let cert = try WebRTCCertificate.generateSelfSigned()
+        let connection = WebRTCConnection.asServer(
+            certificate: cert,
+            sendHandler: { _ in }
+        )
+        connection.close()
+
+        do {
+            try connection.send([0x01], on: 0)
+            Issue.record("Expected send to fail after close")
+        } catch WebRTCError.invalidState(let message) {
+            #expect(message.contains("closed"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("close racing with send and openDataChannel is safe", .timeLimit(.minutes(1)))
+    func closeRacingWithSendAndOpenDataChannelIsSafe() async throws {
+        let cert = try WebRTCCertificate.generateSelfSigned()
+        let connection = WebRTCConnection.asServer(
+            certificate: cert,
+            sendHandler: { _ in }
+        )
+        try connection.start()
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<200 {
+                group.addTask {
+                    switch index % 3 {
+                    case 0:
+                        connection.close()
+                    case 1:
+                        do {
+                            _ = try connection.openDataChannel(label: "race-\(index)")
+                        } catch WebRTCError.invalidState {
+                        } catch {
+                            Issue.record("Unexpected openDataChannel error: \(error)")
+                        }
+                    default:
+                        do {
+                            try connection.send([0x01, 0x02], on: UInt16(index))
+                        } catch WebRTCError.invalidState {
+                        } catch {
+                            Issue.record("Unexpected send error: \(error)")
+                        }
+                    }
+                }
+            }
+        }
+
+        #expect(connection.state == .closed)
+    }
 }

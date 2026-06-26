@@ -129,6 +129,19 @@ public final class WebRTCConnection: Sendable {
         var incomingContinuation: AsyncStream<DataChannel>.Continuation?
     }
 
+    private enum OpenDataChannelResult {
+        case success(DataChannel, SCTPPacket)
+        case invalidState(WebRTCConnectionState)
+        case dataChannelError(DataChannelError)
+        case sctpError(SCTPError)
+    }
+
+    private enum SendDataResult {
+        case success(SCTPPacket)
+        case invalidState(WebRTCConnectionState)
+        case sctpError(SCTPError)
+    }
+
     // MARK: - Init
 
     /// Create a client-side connection
@@ -383,46 +396,55 @@ public final class WebRTCConnection: Sendable {
     /// - Returns: The opened data channel
     /// - Throws: `WebRTCError.invalidState` if the connection is not established
     public func openDataChannel(label: String, ordered: Bool = true) throws(WebRTCError) -> DataChannel {
-        // Each locked sub-operation has its own concrete thrown error type
-        // (`openChannelBytes` is `throws(DataChannelError)`, `sendDataBytes` is
-        // `throws(SCTPError)`). Under Embedded a single lock closure cannot widen
-        // two thrown types into `any Error`, so each call keeps a lock closure
-        // typed to its sub-error and is converted to `WebRTCError` in an outer
-        // `do/catch`. `channelManager` and `sctpAssociation` are independent
-        // sub-states (the DCEP receive path mutates them under separate locks too),
-        // so splitting the lock preserves the per-sub-object invariants.
-        let isConnected = connState.withLock { $0.stateMachine.isConnected }
-        guard isConnected else {
-            throw WebRTCError.invalidState("Cannot open data channel in state \(state.label)")
-        }
+        let result = connState.withLock { state -> OpenDataChannelResult in
+            guard state.stateMachine.isConnected else {
+                return .invalidState(state.stateMachine.state)
+            }
 
-        let channel: DataChannel
-        let dcepData: [UInt8]
-        do {
-            (channel, dcepData) = try connState.withLock { state throws(DataChannelError) in
+            let opened = Result { () throws(DataChannelError) -> (DataChannel, [UInt8]) in
                 try state.channelManager.openChannelBytes(label: label, ordered: ordered)
             }
-        } catch {
-            throw WebRTCError.sctpFailed(
-                Self.failureReason(error, context: "DCEP open-channel encode failed")
-            )
-        }
+            let channel: DataChannel
+            let dcepData: [UInt8]
+            switch opened {
+            case .success(let value):
+                (channel, dcepData) = value
+            case .failure(let error):
+                return .dataChannelError(error)
+            }
 
-        let sctpPacket: SCTPPacket
-        do {
-            sctpPacket = try connState.withLock { state throws(SCTPError) in
+            let sent = Result { () throws(SCTPError) -> SCTPPacket in
                 try state.sctpAssociation.sendDataBytes(
                     streamID: channel.id,
                     payloadProtocolIdentifier: DataChannelPPID.dcep.rawValue,
                     data: dcepData
                 )
             }
-        } catch {
+            switch sent {
+            case .success(let packet):
+                return .success(channel, packet)
+            case .failure(let error):
+                return .sctpError(error)
+            }
+        }
+
+        let channel: DataChannel
+        let sctpPacket: SCTPPacket
+        switch result {
+        case .success(let openedChannel, let packet):
+            channel = openedChannel
+            sctpPacket = packet
+        case .invalidState(let state):
+            throw WebRTCError.invalidState("Cannot open data channel in state \(state.label)")
+        case .dataChannelError(let error):
+            throw WebRTCError.sctpFailed(
+                Self.failureReason(error, context: "DCEP open-channel encode failed")
+            )
+        case .sctpError(let error):
             throw WebRTCError.sctpFailed(
                 Self.failureReason(error, context: "SCTP send (DCEP open) failed")
             )
         }
-
         try encryptAndSend(sctpPacket.encodeBytes())
         return channel
     }
@@ -441,24 +463,33 @@ public final class WebRTCConnection: Sendable {
             ppid = binary ? DataChannelPPID.binary.rawValue : DataChannelPPID.string.rawValue
         }
 
-        let isConnected = connState.withLock { $0.stateMachine.isConnected }
-        guard isConnected else {
-            throw WebRTCError.invalidState("Cannot send data in state \(state.label)")
-        }
+        let result = connState.withLock { state -> SendDataResult in
+            guard state.stateMachine.isConnected else {
+                return .invalidState(state.stateMachine.state)
+            }
 
-        // `sendDataBytes` is `throws(SCTPError)`; the lock closure stays typed to
-        // that sub-error and is converted to `WebRTCError` in an outer `do/catch`
-        // (Embedded cannot widen the thrown type to `any Error`).
-        let sctpPacket: SCTPPacket
-        do {
-            sctpPacket = try connState.withLock { state throws(SCTPError) in
+            let sent = Result { () throws(SCTPError) -> SCTPPacket in
                 try state.sctpAssociation.sendDataBytes(
                     streamID: channelID,
                     payloadProtocolIdentifier: ppid,
                     data: data
                 )
             }
-        } catch {
+            switch sent {
+            case .success(let packet):
+                return .success(packet)
+            case .failure(let error):
+                return .sctpError(error)
+            }
+        }
+
+        let sctpPacket: SCTPPacket
+        switch result {
+        case .success(let packet):
+            sctpPacket = packet
+        case .invalidState(let state):
+            throw WebRTCError.invalidState("Cannot send data in state \(state.label)")
+        case .sctpError(let error):
             throw WebRTCError.sctpFailed(
                 Self.failureReason(error, context: "SCTP send failed")
             )
