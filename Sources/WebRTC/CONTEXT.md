@@ -6,11 +6,9 @@ Invariants and design intent that the code does not state structurally. Read thi
 before changing the DTLS-SRTP authentication path, the certificate/fingerprint
 ownership, or the SCTP/ICE buffering caps. The protocol stack is `UDP → STUN /
 ICE Lite → DTLS 1.2 → SCTP → Data Channels`; the lower layers split into an
-Embedded-clean `*WireCore`/`*Core` value type plus a Foundation adapter. This
-top-level module's own sources are now Embedded-seamed (FacadeLock / AsyncTimer /
-logger / cert gating), but the target does not yet fully Embedded-compile because
-it still orchestrates the host-only `Data`/`Mutex` adapters — see "Embedded
-constraints".
+Embedded-clean `*WireCore`/`*Core` value type plus a caller-locked adapter. This
+top-level module's sources are Embedded-seamed (FacadeLock / AsyncTimer / logger /
+cert gating), and the full `WebRTC` target is part of the Embedded readiness gate.
 
 ## Contracts (the load-bearing rules)
 
@@ -89,8 +87,7 @@ constraints".
 
 ## Embedded constraints (do not regress)
 
-- **The `WebRTC` facade's own sources are Embedded-seamed (lock/timer/logger/cert),
-  but the target does NOT yet fully Embedded-compile.** The facade files
+- **The full `WebRTC` facade must Embedded-compile.** The facade files
   (`WebRTCConnection` / `WebRTCEndpoint` / `WebRTCListener` / `WebRTCCertificate`)
   route their host-only deps through build-gated seams: `FacadeLock` (host `Mutex`
   / Embedded `Atomic` spinlock), `WebRTCDefaultTimer` (the `AsyncTimer` seam — host
@@ -102,39 +99,28 @@ constraints".
 - **Cert generation is host-only; the Embedded identity is externally provisioned.**
   `WebRTCCertificate.generateSelfSigned` (swift-certificates / swift-asn1) and the
   typed `privateKey` (`P256.Signing.PrivateKey`) are `#if !hasFeature(Embedded)`.
+  The package manifest must also drop swift-crypto / swift-certificates /
+  swift-asn1 / swift-log under `P2P_CORE_EMBEDDED=1`, so Embedded builds do not
+  retain unused host-only dependencies.
   Under Embedded the embedder MUST supply the identity via
   `init(derEncoded:rawPrivateKey:)` (DER + 32-byte raw P-256 scalar) — fail-closed,
   never fabricated. `WebRTCEndpoint.create()` (which generates a cert) is likewise
   host-only; use `init(certificate:)` under Embedded. The fail-closed DTLS-SRTP
   fingerprint verification is preserved on BOTH builds.
-- **REMAINING BLOCKER for a full `--target WebRTC -c release` Embedded build: the
-  host-only adapter layer.** `WebRTCConnection` orchestrates the `Data`/`Mutex`/
-  `Crypto`/`ContinuousClock` adapters `STUNCore` / `ICELite` / `SCTPCore` /
-  `DataChannel` (the `SCTPAssociation` / `ICELiteAgent` / `DataChannelManager`
-  state machines + the STUN message-integrity HMAC). These adapter targets are NOT
-  dual-built, so under `P2P_CORE_EMBEDDED=1` they fail to import the now-Embedded
-  `STUNWireCore` / `P2PCoreBytes` / `P2PCoreCrypto` ("module … cannot be imported
-  because it was built with embedded Swift") and SwiftPM halts before the WebRTC
-  module is reached. The `*Core`/`*WireCore` modules supply only the wire codecs
-  and value-type sub-pieces (cookie value, TSN tracker, reassembler, ICE verdict),
-  NOT the association/agent/manager orchestration. Making `--target WebRTC`
-  Embedded-compile is therefore a SEPARATE effort: port (core) `SCTPAssociation` /
-  `ICELiteAgent` / `DataChannelManager` + the STUN HMAC to an Embedded-clean,
-  `[UInt8]`/`Span`-native orchestration layer (mirroring how the tls/mDNS/SWIM
-  facades sit directly on cored engines). The facade `Data`-based public API must
-  stay (libp2p's `P2PTransportWebRTC` depends on it).
+- **The adapter layer is dual-built, not host-only.** `STUNCore`, `ICELite`,
+  `SCTPCore`, and `DataChannel` hold Embedded-clean value engines behind
+  `FacadeLock` and route crypto/random/clock work through seams. Host-only
+  `Data` conveniences are gated out under Embedded; the `[UInt8]` surface remains
+  available.
 - **The Embedded-clean layers are `STUNWireCore`, `ICELiteCore`, `SCTPWireCore`,
-  `DataChannelCore`** — value types, no Foundation. Build with
-  `P2P_CORE_EMBEDDED=1 swift build --target <Core> -c release`. Do not introduce
-  Foundation / `any` / `Mutex` into a `*WireCore` / `ICELiteCore` target; keep
-  Foundation and crypto in the `*Core` / adapter layers above them.
+  `DataChannelCore`, plus the dual-built adapters and facade.** Do not introduce
+  Foundation / `any` / bare `Mutex` into `*WireCore` / `ICELiteCore`, and do not
+  bypass the adapter seams in `STUNCore` / `ICELite` / `SCTPCore` / `DataChannel`.
 
 ## Dependencies & seams
 
-- **swift-tls is referenced by local path on this branch** (`.package(path:
-  "../swift-tls")`) so the Tier-1 `TLS` facade (`DTLSClient` / `DTLSServer`) is
-  available. This configuration is NOT releasable — it must become a versioned
-  dependency before tagging.
+- The Tier-1 `TLS` facade (`DTLSClient` / `DTLSServer`) is consumed from the
+  versioned `swift-tls` dependency.
 - **`SendHandler` is the only egress seam.** The library is transport-agnostic:
   callers inject a send closure and feed inbound bytes via `receive(_:)`. No UDP
   socket is bound inside the library.
@@ -152,5 +138,5 @@ constraints".
 
 - Host: `swift build` (Swift tools 6.2, platform floor v26). Tests:
   `timeout 60 swift test` (per-module filters in `CLAUDE.md`).
-- Embedded cores: `P2P_CORE_EMBEDDED=1 swift build --target STUNWireCore -c release`
-  (likewise `ICELiteCore` / `SCTPWireCore` / `DataChannelCore`).
+- Embedded facade: `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1 swiftly run +6.3.1
+  swift build --target WebRTC -c release -Xswiftc -warnings-as-errors`.

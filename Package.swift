@@ -93,6 +93,30 @@ let stunAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra
 let iceAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["STUNCore", "ICELiteCore"])
 let dataChannelAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["SCTPCore", "DataChannelCore"])
 
+let packageDependencies: [Package.Dependency] = {
+    var d: [Package.Dependency] = [
+        // The DTLS handshake/record engine is driven through swift-tls's Tier-1
+        // `TLS` facade (`DTLSClient`/`DTLSServer`).
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.1"),
+        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
+        // Provides `P2PCryptoEmbedded.BoringSHA256` for the Embedded DTLS-SRTP
+        // fingerprint (fail-closed on both builds).
+        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
+    ]
+    if !embeddedEnabled {
+        d += [
+            .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
+            // WebRTC owns its DTLS-SRTP leaf certificate (self-signed ECDSA P-256)
+            // and its SHA-256 fingerprint locally, because the `TLS` facade takes a
+            // `TLSIdentity` (DER + raw key) rather than generating certificates.
+            .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.1"),
+            .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.1"),
+            .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
+        ]
+    }
+    return d
+}()
+
 let package = Package(
     name: "swift-webrtc",
     platforms: [
@@ -110,24 +134,7 @@ let package = Package(
         .library(name: "DataChannelCore", targets: ["DataChannelCore"]),
         .library(name: "DataChannel", targets: ["DataChannel"]),
     ],
-    dependencies: [
-        // The DTLS handshake/record engine is driven through swift-tls's Tier-1
-        // `TLS` facade (`DTLSClient`/`DTLSServer`).
-        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.1"),
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
-        // WebRTC owns its DTLS-SRTP leaf certificate (self-signed ECDSA P-256) and
-        // its SHA-256 fingerprint locally, because the `TLS` facade takes a
-        // `TLSIdentity` (DER + raw key) rather than generating certificates. X.509
-        // generation needs swift-certificates + swift-asn1 (already in the graph
-        // transitively via swift-tls).
-        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.1"),
-        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.1"),
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
-        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
-        // Provides `P2PCryptoEmbedded.BoringSHA256` for the Embedded DTLS-SRTP
-        // fingerprint (fail-closed on both builds).
-        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
-    ],
+    dependencies: packageDependencies,
     targets: [
         // ---- Embedded-clean STUN wire codec (dual-build: host + Embedded) ----
         .target(
