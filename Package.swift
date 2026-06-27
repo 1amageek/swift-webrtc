@@ -20,7 +20,7 @@ let coreSettings: [SwiftSetting] = {
 // (logging) — are dropped under Embedded, where the facade gates the matching
 // imports behind `#if !hasFeature(Embedded)` and uses the no-op logger shim +
 // the externally-provisioned-identity path. Under Embedded the facade hashes the
-// DTLS-SRTP fingerprint via `P2PCryptoEmbedded`'s `BoringSHA256` (preserving
+// DTLS-SRTP fingerprint via `P2PCryptoBoringSSL`'s `BoringSHA256` (preserving
 // fail-closed verification) and schedules its retransmission tick through
 // `P2PCoreCrypto`'s `AsyncTimer` seam.
 //
@@ -36,7 +36,7 @@ let coreSettings: [SwiftSetting] = {
 // `Data` convenience overloads gated `#if !hasFeature(Embedded)`, so swift-libp2p's
 // `Data`-based consumers are unaffected); Foundation / Logging / swift-crypto /
 // swift-certificates are host-only `#if`-gated imports, the fingerprint SHA-256 is
-// routed through `P2PCryptoEmbedded`'s `BoringSHA256`, the retransmission driver
+// routed through `P2PCryptoBoringSSL`'s `BoringSHA256`, the retransmission driver
 // uses the `AsyncTimer` seam, and every throwing entry point is typed-throws
 // (`throws(WebRTCError)`) with static / structured error reasons (no
 // `String(describing:)`). See CONTEXT.md.
@@ -52,7 +52,7 @@ let webrtcFacadeDependencies: [Target.Dependency] = {
     if embeddedEnabled {
         d += [
             // Embedded fingerprint SHA-256 + the `Span` currency it consumes.
-            .product(name: "P2PCryptoEmbedded", package: "swift-p2p-crypto"),
+            .product(name: "P2PCryptoBoringSSL", package: "swift-p2p-crypto"),
             .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
         ]
     } else {
@@ -68,8 +68,8 @@ let webrtcFacadeDependencies: [Target.Dependency] = {
 
 // The Embedded-clean crypto seam providers each caller-locked adapter needs. On
 // host the `MessageAuthenticationCode` / `RandomSource` seams resolve to the
-// swift-crypto–backed `P2PCryptoFoundation` providers; under Embedded they
-// resolve to the BoringSSL-backed `P2PCryptoEmbedded` providers. `P2PCoreCrypto`
+// swift-crypto–backed `P2PCryptoFoundationEssentials` providers; under Embedded they
+// resolve to the BoringSSL-backed `P2PCryptoBoringSSL` providers. `P2PCoreCrypto`
 // (the seam protocols) is needed in both modes. swift-crypto is still pulled in
 // on host for the historical `Data` wrappers' direct use; it is dropped under
 // Embedded.
@@ -78,10 +78,10 @@ func adapterSeamDependencies(extra: [Target.Dependency] = []) -> [Target.Depende
         .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
     ]
     if embeddedEnabled {
-        d += [.product(name: "P2PCryptoEmbedded", package: "swift-p2p-crypto")]
+        d += [.product(name: "P2PCryptoBoringSSL", package: "swift-p2p-crypto")]
     } else {
         d += [
-            .product(name: "P2PCryptoFoundation", package: "swift-p2p-crypto"),
+            .product(name: "P2PCryptoFoundationEssentials", package: "swift-p2p-crypto"),
             .product(name: "Crypto", package: "swift-crypto"),
         ]
     }
@@ -99,7 +99,7 @@ let packageDependencies: [Package.Dependency] = {
         // `TLS` facade (`DTLSClient`/`DTLSServer`).
         .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.1"),
         .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
-        // Provides `P2PCryptoEmbedded.BoringSHA256` for the Embedded DTLS-SRTP
+        // Provides `P2PCryptoBoringSSL.BoringSHA256` for the Embedded DTLS-SRTP
         // fingerprint (fail-closed on both builds).
         .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
     ]
@@ -184,9 +184,9 @@ let package = Package(
         ),
         // ---- Caller-locked SCTP association adapter (dual-build: host + Embedded) ----
         // Holds the Embedded-clean value-type `SCTPAssociationEngine` behind a
-        // `FacadeLock`. Host: swift-crypto cookie HMAC + `FoundationRandom` +
+        // `FacadeLock`. Host: swift-crypto cookie HMAC + `FoundationEssentialsRandom` +
         // `ContinuousClock` boundary. Embedded: `BoringHMACSHA256` + `BoringRandom`
-        // + `clock_gettime`; the `Data`/`ContinuousClock` wrappers are gated out.
+        // + platform monotonic clock; the `Data`/`ContinuousClock` wrappers are gated out.
         .target(
             name: "SCTPCore",
             dependencies: sctpAdapterDependencies,
@@ -216,7 +216,7 @@ let package = Package(
         // Dual-build orchestrator. Host: `Mutex` / `ContinuousClock` / swift-log /
         // swift-certificates. Embedded: those host-only deps are dropped (gated
         // `#if !hasFeature(Embedded)`); the lock becomes an `Atomic` spinlock, the
-        // retransmission timer the `clock_gettime`-backed `WebRTCEmbeddedTimer`,
+        // retransmission timer the platform-clock-backed `WebRTCEmbeddedTimer`,
         // the logger a no-op shim, and the DTLS-SRTP fingerprint a `BoringSHA256`.
         // The externally-provisioned-identity path replaces X.509 generation.
         .target(

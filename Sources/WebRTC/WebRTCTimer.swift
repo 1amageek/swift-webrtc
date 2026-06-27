@@ -8,7 +8,7 @@
 /// selects which concrete timer the build uses.
 ///
 ///   host  (default):   WebRTCDefaultTimer = WebRTCHostTimer   (ContinuousClock + Task.sleep)
-///   Embedded (-c rel): WebRTCDefaultTimer = WebRTCEmbeddedTimer (clock_gettime + park)
+///   Embedded (-c rel): WebRTCDefaultTimer = WebRTCEmbeddedTimer (platform clock + park)
 ///
 /// The webrtc package defines its own timers (rather than depending on
 /// swift-p2p-transport's `DefaultAsyncTimer`) so the Embedded build is driven by
@@ -80,16 +80,18 @@ import Darwin
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(WASILibc)
+import WASILibc
 #endif
 
-/// The Embedded default timer: `clock_gettime(CLOCK_MONOTONIC)` for time.
+/// The Embedded default timer: the platform monotonic clock for time.
 typealias WebRTCDefaultTimer = WebRTCEmbeddedTimer
 
 /// An Embedded-clean `AsyncTimer` over the POSIX C library.
 ///
-/// `monotonicNanos()` reads `CLOCK_MONOTONIC`. `sleep(untilNanos:)` parks in
-/// fixed slices running a sliced `nanosleep`, honoring cancellation between
-/// slices. Embedded-clean: only the platform C library + `_Concurrency`; no
+/// `monotonicNanos()` reads the platform monotonic clock. `sleep(untilNanos:)`
+/// parks in fixed slices, honoring cancellation between slices. Embedded-clean:
+/// only the platform C library + `_Concurrency`; no
 /// Foundation, no NIO, no `any`, no `ContinuousClock`, no `Task.sleep`.
 ///
 /// A production embedder is expected to inject its own timer parked on the
@@ -126,22 +128,44 @@ struct WebRTCEmbeddedTimer: AsyncTimer {
 
     @inline(__always)
     static func nowNanos() -> UInt64 {
+        #if canImport(WASILibc)
+        var timestamp: __wasi_timestamp_t = 0
+        let result = __wasi_clock_time_get(__wasi_clockid_t(1), 1, &timestamp)
+        precondition(result == 0, "WASI monotonic clock failed")
+        return UInt64(timestamp)
+        #else
         var ts = timespec()
         let result = clock_gettime(CLOCK_MONOTONIC, &ts)
         precondition(result == 0, "clock_gettime(CLOCK_MONOTONIC) failed")
         let seconds = UInt64(ts.tv_sec)
         let nanos = UInt64(ts.tv_nsec)
         return seconds &* 1_000_000_000 &+ nanos
+        #endif
     }
 
     @inline(__always)
     static func nanosleepFor(_ nanos: UInt64) {
+        #if canImport(WASILibc)
+        var subscription = __wasi_subscription_t()
+        subscription.userdata = 0
+        subscription.u.tag = __wasi_eventtype_t(0)
+        subscription.u.u.clock.id = __wasi_clockid_t(1)
+        subscription.u.u.clock.timeout = __wasi_timestamp_t(nanos)
+        subscription.u.u.clock.precision = 1
+        subscription.u.u.clock.flags = 0
+
+        var event = __wasi_event_t()
+        var eventCount: __wasi_size_t = 0
+        let result = __wasi_poll_oneoff(&subscription, &event, 1, &eventCount)
+        precondition(result == 0, "WASI clock sleep failed")
+        #else
         var req = timespec(
             tv_sec: Int(nanos / 1_000_000_000),
             tv_nsec: Int(nanos % 1_000_000_000)
         )
         var rem = timespec()
         _ = nanosleep(&req, &rem)
+        #endif
     }
 }
 

@@ -23,13 +23,15 @@ import Darwin
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(WASILibc)
+import WASILibc
 #endif
 
 #if !hasFeature(Embedded)
 /// The concrete COOKIE HMAC for the host build.
 private typealias SCTPCookieMAC = FoundationHMACSHA256
 #else
-import P2PCryptoEmbedded
+import P2PCryptoBoringSSL
 /// The concrete COOKIE HMAC for the Embedded build.
 private typealias SCTPCookieMAC = BoringHMACSHA256
 #endif
@@ -195,12 +197,19 @@ public final class SCTPAssociation: Sendable {
     }
     #else
     private static func nowMillis() -> UInt64 {
+        #if canImport(WASILibc)
+        var timestamp: __wasi_timestamp_t = 0
+        let result = __wasi_clock_time_get(__wasi_clockid_t(1), 1, &timestamp)
+        precondition(result == 0, "WASI monotonic clock failed")
+        return UInt64(timestamp) / 1_000_000
+        #else
         var ts = timespec()
         let result = clock_gettime(CLOCK_MONOTONIC, &ts)
         precondition(result == 0, "clock_gettime(CLOCK_MONOTONIC) failed")
         let seconds = UInt64(ts.tv_sec)
         let nanos = UInt64(ts.tv_nsec)
         return (seconds &* 1_000_000_000 &+ nanos) / 1_000_000
+        #endif
     }
     #endif
 }

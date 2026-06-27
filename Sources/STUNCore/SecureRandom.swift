@@ -2,20 +2,20 @@
 /// routed through the Embedded-clean `RandomSource` seam.
 ///
 /// The concrete backend is selected at the host boundary: swift-crypto-backed
-/// `FoundationRandom` on host, BoringSSL `BoringRandom` under Embedded. This keeps
+/// `FoundationEssentialsRandom` on host, BoringSSL `BoringRandom` under Embedded. This keeps
 /// the file Embedded-clean (no Foundation, no `any`); only the concrete
 /// `RandomSource` instantiated differs between builds.
 
 import P2PCoreCrypto
 #if !hasFeature(Embedded)
-import P2PCryptoFoundation
+import P2PCryptoFoundationEssentials
 #else
-import P2PCryptoEmbedded
+import P2PCryptoBoringSSL
 #endif
 
 public enum SecureRandom {
     #if !hasFeature(Embedded)
-    private static let source: any RandomSource = FoundationRandom()
+    private static let source: any RandomSource = FoundationEssentialsRandom()
     #else
     private static let source = BoringRandom()
     #endif

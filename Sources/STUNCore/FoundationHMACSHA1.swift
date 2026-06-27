@@ -8,7 +8,7 @@
 /// type plugs it into HMAC-SHA1 at the host boundary.
 ///
 /// Host-only: under Embedded the STUN adapter routes MESSAGE-INTEGRITY through
-/// `P2PCryptoEmbedded.BoringHMACSHA1`, so this swift-crypto-backed provider is
+/// `P2PCryptoBoringSSL.BoringHMACSHA1`, so this swift-crypto-backed provider is
 /// gated out of the Embedded build.
 
 #if !hasFeature(Embedded)
