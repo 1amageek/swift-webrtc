@@ -62,8 +62,7 @@ WebRTC drives DTLS through swift-tls's Tier-1 `TLS` facade value types
 (`DTLSClient` / `DTLSServer`). The former swift-tls `DTLSCore` / `DTLSRecord`
 products were demoted to `package` visibility in the facade redesign and are no
 longer importable here (swift-tls now exports only `TLS`, `TLSWire`, `DTLSWire`).
-On the `embedded` branch swift-tls is referenced via local path (`../swift-tls`),
-so this configuration is NOT for release.
+swift-tls is consumed through its released `TLS` product.
 
 - **DTLSEndpoint** (`Sources/WebRTC/DTLSEndpoint.swift`) - Internal enum wrapping
   `DTLSClient` / `DTLSServer` behind one sans-IO surface: `receive` / `send` /

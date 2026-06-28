@@ -6,7 +6,7 @@ A pure Swift implementation of WebRTC data channels, built entirely from scratch
 UDP → STUN / ICE Lite → DTLS 1.2 → SCTP → Data Channels
 ```
 
-> **Release status.** The released `1.5.0` ships the prior API. The Embedded-first API documented here (the Tier-1 `TLS`-facade DTLS wiring and the local `WebRTCCertificate` / `CertificateFingerprint` / fail-closed DTLS-SRTP certificate ownership) lives on the unreleased `embedded` branch (M8 pending) and is not tagged — pin to the branch to use it. That branch references `swift-tls` by local path, so it is not yet consumable as a versioned dependency.
+> **Release status.** Current release: `1.5.3`.
 
 ## Features
 
@@ -30,7 +30,7 @@ UDP → STUN / ICE Lite → DTLS 1.2 → SCTP → Data Channels
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-webrtc.git", branch: "embedded"),
+    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "1.5.3"),
 ]
 ```
 

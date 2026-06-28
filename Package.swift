@@ -97,11 +97,11 @@ let packageDependencies: [Package.Dependency] = {
     var d: [Package.Dependency] = [
         // The DTLS handshake/record engine is driven through swift-tls's Tier-1
         // `TLS` facade (`DTLSClient`/`DTLSServer`).
-        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.1"),
-        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.1.0"),
+        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.2"),
+        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.2.1"),
         // Provides `P2PCrypto.BoringSHA256` for the Embedded DTLS-SRTP
         // fingerprint (fail-closed on both builds).
-        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.0"),
+        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.1"),
     ]
     if !embeddedEnabled {
         d += [
