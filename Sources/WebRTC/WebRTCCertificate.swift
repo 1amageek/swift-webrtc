@@ -19,7 +19,7 @@ import SwiftASN1
 #else
 import P2PCoreBytes
 import P2PCoreCrypto
-import P2PCryptoBoringSSL
+import P2PCrypto
 #endif
 
 /// Fingerprint hash algorithm. WebRTC mandates SHA-256 in current deployments.

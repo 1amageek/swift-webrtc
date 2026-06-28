@@ -94,7 +94,7 @@ cert gating), and the full `WebRTC` target is part of the Embedded readiness gat
   `ContinuousClock`+`Task.sleep`, Embedded platform monotonic clock + sliced park;
   drives the SCTP T3-rtx tick), `WebRTCLogger` (host swift-log / Embedded no-op),
   and a build-gated DTLS-SRTP fingerprint SHA-256 (host swift-crypto / Embedded
-  `P2PCryptoBoringSSL.BoringSHA256`). Do not reintroduce a bare `Mutex` /
+  `P2PCrypto.BoringSHA256`). Do not reintroduce a bare `Mutex` /
   `Task.sleep` / `ContinuousClock` / `Logging.Logger` into the facade.
 - **Cert generation is host-only; the Embedded identity is externally provisioned.**
   `WebRTCCertificate.generateSelfSigned` (swift-certificates / swift-asn1) and the

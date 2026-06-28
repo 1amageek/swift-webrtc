@@ -7,11 +7,7 @@
 /// `RandomSource` instantiated differs between builds.
 
 import P2PCoreCrypto
-#if !hasFeature(Embedded)
-import P2PCryptoFoundationEssentials
-#else
-import P2PCryptoBoringSSL
-#endif
+import P2PCrypto
 
 public enum SecureRandom {
     #if !hasFeature(Embedded)

@@ -13,7 +13,7 @@ import P2PCoreCrypto
 #if !hasFeature(Embedded)
 import Foundation
 #else
-import P2PCryptoBoringSSL
+import P2PCrypto
 #endif
 
 /// The concrete MESSAGE-INTEGRITY HMAC-SHA1 for this build.

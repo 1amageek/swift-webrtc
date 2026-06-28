@@ -7,11 +7,7 @@
 /// between builds is which concrete `RandomSource` is instantiated.
 
 import P2PCoreCrypto
-#if !hasFeature(Embedded)
-import P2PCryptoFoundationEssentials
-#else
-import P2PCryptoBoringSSL
-#endif
+import P2PCrypto
 
 enum SCTPSecureRandom {
     /// The concrete CSPRNG for this build (host: Foundation; Embedded: BoringSSL).

@@ -7,7 +7,7 @@
 /// protocol; this type plugs the protocol into HMAC-SHA256 at the host boundary.
 ///
 /// Host-only: under Embedded the SCTP adapter routes the COOKIE HMAC through
-/// `P2PCryptoBoringSSL.BoringHMACSHA256`, so this swift-crypto-backed provider is
+/// `P2PCrypto.BoringHMACSHA256`, so this swift-crypto-backed provider is
 /// gated out of the Embedded build.
 
 #if !hasFeature(Embedded)

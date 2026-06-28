@@ -31,7 +31,7 @@ import WASILibc
 /// The concrete COOKIE HMAC for the host build.
 private typealias SCTPCookieMAC = FoundationHMACSHA256
 #else
-import P2PCryptoBoringSSL
+import P2PCrypto
 /// The concrete COOKIE HMAC for the Embedded build.
 private typealias SCTPCookieMAC = BoringHMACSHA256
 #endif
