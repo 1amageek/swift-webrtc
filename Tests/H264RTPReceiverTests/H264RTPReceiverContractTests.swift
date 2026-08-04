@@ -367,9 +367,9 @@ struct H264RTPReceiverContractTests {
 
     @Test("AVCC four-byte lengths reject values above UInt32.max")
     func avccFourByteLengthBoundary() throws {
-        // On 32-bit targets no representable Array can exceed the four-byte
-        // AVCC limit, so the impossible branch is intentionally absent.
-        guard Int.bitWidth > 32 else { return }
+        // A 32-bit target cannot represent a length above the four-byte AVCC
+        // limit, so this boundary is exercised on the supported 64-bit hosts.
+#if arch(arm64) || arch(x86_64)
         let rejectedByteCount = Int(UInt32.max) + 1
 
         do {
@@ -384,6 +384,9 @@ struct H264RTPReceiverContractTests {
                 maximum: Int(UInt32.max)
             ))
         }
+#else
+        #expect(Bool(true))
+#endif
     }
 
     @Test("Access-unit duration is bounded and its timestamp stays quarantined")

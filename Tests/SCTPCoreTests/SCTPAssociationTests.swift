@@ -869,7 +869,7 @@ struct SCTPAssociationTests {
 
     @Test("Forged ABORT bearing the peer's own (reflected) tag does not tear down the association")
     func forgedReflectedTagAbortIgnored() throws {
-        let (client, server) = try establishPair()
+        let (_, server) = try establishPair()
         #expect(server.state == .established)
 
         // A packet the SERVER sends carries verificationTag ==
