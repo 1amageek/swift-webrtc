@@ -95,9 +95,9 @@ let packageDependencies: [Package.Dependency] = {
         // The DTLS handshake/record engine is exposed through
         // swift-tls-sessions' Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
         // Its DTLS 1.2 mechanism is owned by swift-ssl/SSLDTLS.
-        .package(name: "swift-tls-sessions", path: "../swift-tls"),
-        .package(name: "swift-p2p-core", path: "../swift-p2p-core"),
-        .package(name: "swift-ssl", path: "../../swift-ssl"),
+        .package(name: "swift-tls-sessions", url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
+        .package(name: "swift-p2p-core", url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
+        .package(name: "swift-ssl", url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
         // `swift-p2p-core` also owns the P2PCrypto protocol adapter module.
     ]
     d += [
