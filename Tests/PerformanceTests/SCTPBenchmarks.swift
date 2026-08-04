@@ -4,15 +4,14 @@
 
 import Testing
 import Foundation
-@testable import SCTPCore
-
+@testable import WebRTC
 @Suite("SCTP Benchmarks")
 struct SCTPBenchmarks {
 
     // MARK: - Packet Encoding/Decoding
 
     @Test("Benchmark: SCTP packet encoding")
-    func benchmarkPacketEncode() {
+    func benchmarkPacketEncode() throws {
         let dataChunk = SCTPDataChunk(
             tsn: 12345,
             streamIdentifier: 0,
@@ -24,7 +23,7 @@ struct SCTPBenchmarks {
             sourcePort: 5000,
             destinationPort: 5001,
             verificationTag: 0x12345678,
-            chunks: [dataChunk.toChunk()]
+            chunks: [try dataChunk.toChunk()]
         )
 
         let result = benchmark("SCTPPacket.encode", iterations: 10000) {
@@ -46,7 +45,7 @@ struct SCTPBenchmarks {
             sourcePort: 5000,
             destinationPort: 5001,
             verificationTag: 0x12345678,
-            chunks: [dataChunk.toChunk()]
+            chunks: [try dataChunk.toChunk()]
         )
         let encoded = packet.encode()
 
@@ -70,7 +69,7 @@ struct SCTPBenchmarks {
             sourcePort: 5000,
             destinationPort: 5001,
             verificationTag: 0x12345678,
-            chunks: [dataChunk.toChunk()]
+            chunks: [try dataChunk.toChunk()]
         )
         let encoded = packet.encode()
 
@@ -252,10 +251,15 @@ struct SCTPBenchmarks {
                 secretKey: secretKey,
                 peerTag: 0x12345678,
                 localTag: 0x87654321,
+                localTieTag: 0,
+                peerTieTag: 0,
+                localInitialTSN: 999,
                 peerInitialTSN: 1000,
                 peerARWC: 65535,
                 outboundStreams: 10,
-                inboundStreams: 10
+                inboundStreams: 10,
+                localPort: 5_000,
+                peerPort: 5_000
             )
         }
         print(result)
@@ -269,10 +273,15 @@ struct SCTPBenchmarks {
             secretKey: secretKey,
             peerTag: 0x12345678,
             localTag: 0x87654321,
+            localTieTag: 0,
+            peerTieTag: 0,
+            localInitialTSN: 999,
             peerInitialTSN: 1000,
             peerARWC: 65535,
             outboundStreams: 10,
-            inboundStreams: 10
+            inboundStreams: 10,
+            localPort: 5_000,
+            peerPort: 5_000
         )
 
         let result = benchmark("SCTPCookie.validate", iterations: 10000) {

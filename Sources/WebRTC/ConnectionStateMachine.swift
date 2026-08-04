@@ -3,16 +3,14 @@
 /// Unified state management for ICE/DTLS/SCTP protocol layers.
 /// Coordinates state transitions and ensures consistent error propagation.
 
-import ICELite
-import SCTPCore
 
 /// Sub-protocol states tracked by the state machine
-public struct ProtocolStates: Sendable, Equatable {
-    public var ice: ICEState
-    public var dtls: DTLSState
-    public var sctp: SCTPAssociationState
+struct ProtocolStates: Sendable, Equatable {
+    var ice: ICEState
+    var dtls: DTLSState
+    var sctp: SCTPAssociationState
 
-    public init(
+    init(
         ice: ICEState = .new,
         dtls: DTLSState = .new,
         sctp: SCTPAssociationState = .closed
@@ -24,7 +22,7 @@ public struct ProtocolStates: Sendable, Equatable {
 }
 
 /// DTLS connection state (simplified view for state machine)
-public enum DTLSState: Sendable, Equatable {
+enum DTLSState: Sendable, Equatable {
     case new
     case handshaking
     case connected
@@ -33,7 +31,7 @@ public enum DTLSState: Sendable, Equatable {
 }
 
 /// Events that can trigger state transitions
-public enum ConnectionEvent: Sendable {
+enum ConnectionEvent: Sendable {
     // ICE events
     case iceConnected
     case iceFailed
@@ -48,6 +46,12 @@ public enum ConnectionEvent: Sendable {
     // SCTP events
     case sctpAssociating
     case sctpEstablished
+    case sctpShutdownStarted(SCTPAssociationState)
+    @available(
+        *,
+        deprecated,
+        message: "The connection owner must preserve SCTPError as WebRTCError.sctpProtocolFailed."
+    )
     case sctpFailed(String)
     case sctpClosed
 
@@ -61,23 +65,23 @@ public enum ConnectionEvent: Sendable {
 /// Manages the WebRTC connection lifecycle by coordinating state transitions
 /// across ICE, DTLS, and SCTP protocol layers. Any failure in a sub-protocol
 /// causes the entire connection to transition to the failed state.
-public struct ConnectionStateMachine: Sendable {
+struct ConnectionStateMachine: Sendable {
 
     /// Current unified connection state
-    public private(set) var state: WebRTCConnectionState
+    private(set) var state: WebRTCConnectionState
 
     /// Current sub-protocol states
-    public private(set) var protocolStates: ProtocolStates
+    private(set) var protocolStates: ProtocolStates
 
     /// Failure reason if in failed state
-    public var failureReason: String? {
+    var failureReason: String? {
         if case .failed(let reason) = state {
             return reason
         }
         return nil
     }
 
-    public init() {
+    init() {
         self.state = .new
         self.protocolStates = ProtocolStates()
     }
@@ -86,7 +90,7 @@ public struct ConnectionStateMachine: Sendable {
     /// - Parameter event: The event to process
     /// - Returns: The resulting state after processing the event
     @discardableResult
-    public mutating func process(_ event: ConnectionEvent) -> WebRTCConnectionState {
+    mutating func process(_ event: ConnectionEvent) -> WebRTCConnectionState {
         // Terminal states don't transition
         guard !isTerminal else { return state }
 
@@ -139,12 +143,24 @@ public struct ConnectionStateMachine: Sendable {
                 state = .connected
             }
 
+        case .sctpShutdownStarted(let sctpState):
+            switch sctpState {
+            case .shutdownPending, .shutdownSent, .shutdownReceived,
+                 .shutdownAckSent:
+                protocolStates.sctp = sctpState
+                if state == .connected {
+                    state = .closing
+                }
+            case .closed, .cookieWait, .cookieEchoed, .established:
+                break
+            }
+
         case .sctpFailed(let reason):
             protocolStates.sctp = .closed
             transitionToFailed("SCTP failed: \(reason)")
 
         case .sctpClosed:
-            protocolStates.sctp = .closed
+            transitionToClosed()
 
         // User events
         case .userClose:
@@ -158,7 +174,7 @@ public struct ConnectionStateMachine: Sendable {
     }
 
     /// Whether the state machine is in a terminal state (closed or failed)
-    public var isTerminal: Bool {
+    var isTerminal: Bool {
         switch state {
         case .closed, .failed:
             return true
@@ -168,12 +184,12 @@ public struct ConnectionStateMachine: Sendable {
     }
 
     /// Whether the connection is ready for application data
-    public var isConnected: Bool {
+    var isConnected: Bool {
         state == .connected
     }
 
     /// Whether ICE connectivity has been established
-    public var isICEConnected: Bool {
+    var isICEConnected: Bool {
         switch protocolStates.ice {
         case .connected, .completed:
             return true
@@ -183,12 +199,12 @@ public struct ConnectionStateMachine: Sendable {
     }
 
     /// Whether DTLS handshake is complete
-    public var isDTLSConnected: Bool {
+    var isDTLSConnected: Bool {
         protocolStates.dtls == .connected
     }
 
     /// Whether SCTP association is established
-    public var isSCTPEstablished: Bool {
+    var isSCTPEstablished: Bool {
         protocolStates.sctp == .established
     }
 
@@ -218,7 +234,7 @@ extension ConnectionStateMachine {
     /// completes (for encrypted application data like SCTP).
     ///
     /// WebRTC Direct skips ICE, so we cannot gate on ICE state alone.
-    public func shouldProcessDTLS() -> Bool {
+    func shouldProcessDTLS() -> Bool {
         // Don't process in terminal states
         guard !isTerminal else { return false }
 
@@ -245,7 +261,7 @@ extension ConnectionStateMachine {
     }
 
     /// Check if SCTP processing should be allowed
-    public func shouldProcessSCTP() -> Bool {
+    func shouldProcessSCTP() -> Bool {
         guard !isTerminal else { return false }
         return protocolStates.dtls == .connected
     }

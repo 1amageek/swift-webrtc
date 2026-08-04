@@ -14,6 +14,8 @@ public enum WebRTCConnectionState: Sendable, Equatable {
     case connected
     /// Connection disconnected (may recover)
     case disconnected
+    /// Graceful SCTP shutdown is in progress; new application sends are closed.
+    case closing
     /// Connection failed
     case failed(String)
     /// Connection closed
@@ -28,7 +30,8 @@ extension WebRTCConnectionState {
         switch self {
         case .failed, .closed:
             return true
-        case .new, .connecting, .dtlsHandshaking, .sctpConnecting, .connected, .disconnected:
+        case .new, .connecting, .dtlsHandshaking, .sctpConnecting,
+             .connected, .disconnected, .closing:
             return false
         }
     }
@@ -47,6 +50,7 @@ extension WebRTCConnectionState {
         case .sctpConnecting: return "sctpConnecting"
         case .connected: return "connected"
         case .disconnected: return "disconnected"
+        case .closing: return "closing"
         case .failed: return "failed"
         case .closed: return "closed"
         }

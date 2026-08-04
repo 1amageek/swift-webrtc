@@ -6,12 +6,8 @@
 /// Transport-agnostic: callers provide send handlers and feed incoming data
 /// to connections. This allows integration with any UDP transport (NIO, etc).
 
-import STUNCore
-import ICELite
-import SCTPCore
-import DataChannel
-#if !hasFeature(Embedded)
-import Foundation
+import Synchronization
+#if canImport(Logging)
 import Logging
 #endif
 
@@ -26,6 +22,7 @@ public final class WebRTCEndpoint: Sendable {
     }
 
     private let logger: WebRTCLogger
+    private let timer: WebRTCTimer
     private let endpointState: FacadeLock<EndpointState>
 
     private struct EndpointState: Sendable {
@@ -34,25 +31,35 @@ public final class WebRTCEndpoint: Sendable {
         var isClosed: Bool = false
     }
 
-    public init(certificate: WebRTCCertificate, logger: WebRTCLogger = WebRTCLogger(label: "webrtc")) {
+    public init(
+        certificate: WebRTCCertificate,
+        timer: WebRTCTimer = .platformDefault,
+        logger: WebRTCLogger = WebRTCLogger(label: "webrtc")
+    ) {
         self.certificate = certificate
+        self.timer = timer
         self.logger = logger
         self.endpointState = FacadeLock(EndpointState())
     }
 
-    /// Create an endpoint with a new self-signed certificate.
+    /// Create an endpoint with a new Pure Swift self-signed certificate.
     ///
-    /// Host-only: self-signed X.509 generation needs swift-certificates /
-    /// swift-asn1, which are unavailable under Embedded. Under Embedded the
-    /// embedder must supply a `WebRTCCertificate` (DER + raw key) externally and
-    /// construct the endpoint via `init(certificate:)`. There is no silent
-    /// fallback: the convenience constructor simply does not exist there.
-    #if !hasFeature(Embedded)
-    public static func create(logger: WebRTCLogger = WebRTCLogger(label: "webrtc")) throws -> WebRTCEndpoint {
-        let cert = try WebRTCCertificate.generateSelfSigned()
-        return WebRTCEndpoint(certificate: cert, logger: logger)
+    /// Certificate generation is available on Native, WASI, and Embedded. An
+    /// externally provisioned certificate remains available through
+    /// `init(certificate:)` for deployments that keep identity material outside
+    /// the process.
+    public static func create<Clock: WebRTCCertificateClock>(
+        clock: Clock = SystemWebRTCCertificateClock(),
+        timer: WebRTCTimer = .platformDefault,
+        logger: WebRTCLogger = WebRTCLogger(label: "webrtc")
+    ) throws(WebRTCCertificateError) -> WebRTCEndpoint {
+        let cert = try WebRTCCertificate.generateSelfSigned(clock: clock)
+        return WebRTCEndpoint(
+            certificate: cert,
+            timer: timer,
+            logger: logger
+        )
     }
-    #endif
 
     // MARK: - Client connections
 
@@ -60,25 +67,37 @@ public final class WebRTCEndpoint: Sendable {
     ///
     /// - Parameters:
     ///   - remoteFingerprint: Expected certificate fingerprint of the remote peer
-    ///   - sendHandler: Closure to send raw bytes to the remote peer
+    ///   - sendHandler: Consuming bounded-transport admission closure. Success
+    ///     means the transport accepted ownership; rejection is returned as a
+    ///     typed ``WebRTCDatagramSendFailure``.
     /// - Returns: A new client-side WebRTC connection
     public func connect(
         remoteFingerprint: CertificateFingerprint,
+        mediaConfiguration: WebRTCMediaConfiguration? = nil,
         sendHandler: @escaping WebRTCConnection.SendHandler
     ) throws(WebRTCError) -> WebRTCConnection {
-        let isClosed = endpointState.withLock { $0.isClosed }
-        guard !isClosed else {
-            throw WebRTCError.closed
-        }
-
-        let connection = WebRTCConnection.asClient(
+        let connection = try WebRTCConnection.asClient(
             certificate: certificate,
             remoteFingerprint: remoteFingerprint,
+            mediaConfiguration: mediaConfiguration,
             sendHandler: sendHandler,
+            timer: timer,
             logger: logger
         )
 
-        endpointState.withLock { $0.connections.append(connection) }
+        // Registration is the linearization point against `close()`. Construct
+        // outside the lock, then atomically check-and-register. If close won,
+        // dispose the unregistered candidate outside the critical section.
+        let registered = endpointState.withLock { state -> Bool in
+            guard !state.isClosed else { return false }
+            state.connections.append(connection)
+            return true
+        }
+        guard registered else {
+            connection.close()
+            throw WebRTCError.closed
+        }
+
         logger.info("Created client connection")
 
         return connection
@@ -89,18 +108,28 @@ public final class WebRTCEndpoint: Sendable {
     /// Create a server-side listener
     ///
     /// - Returns: A new WebRTC listener that accepts incoming connections
-    public func listen() throws(WebRTCError) -> WebRTCListener {
-        let isClosed = endpointState.withLock { $0.isClosed }
-        guard !isClosed else {
-            throw WebRTCError.closed
-        }
-
+    public func listen(
+        mediaConfiguration: WebRTCMediaConfiguration? = nil
+    ) throws(WebRTCError) -> WebRTCListener {
         let listener = WebRTCListener(
             certificate: certificate,
+            mediaConfiguration: mediaConfiguration,
+            timer: timer,
             logger: logger
         )
 
-        endpointState.withLock { $0.listeners.append(listener) }
+        // Use the same registration linearization point as `connect()`. A
+        // listener that loses to close is shut down before the failure escapes.
+        let registered = endpointState.withLock { state -> Bool in
+            guard !state.isClosed else { return false }
+            state.listeners.append(listener)
+            return true
+        }
+        guard registered else {
+            listener.close()
+            throw WebRTCError.closed
+        }
+
         logger.info("Created WebRTC listener")
 
         return listener

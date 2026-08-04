@@ -4,8 +4,7 @@
 
 import Testing
 import Foundation
-@testable import DataChannel
-@testable import SCTPCore
+@testable import WebRTC
 
 @Suite("DataChannel Benchmarks")
 struct DataChannelBenchmarks {
@@ -13,7 +12,7 @@ struct DataChannelBenchmarks {
     // MARK: - DCEP Encoding/Decoding
 
     @Test("Benchmark: DCEP Open encoding")
-    func benchmarkDCEPOpenEncode() {
+    func benchmarkDCEPOpenEncode() throws {
         let open = DCEPOpen(
             channelType: .reliable,
             priority: 0,
@@ -22,8 +21,8 @@ struct DataChannelBenchmarks {
             protocol_: ""
         )
 
-        let result = benchmark("DCEPOpen.encode", iterations: 10000) {
-            _ = open.encode()
+        let result = try benchmark("DCEPOpen.encode", iterations: 10000) {
+            _ = try open.encode()
         }
         print(result)
     }
@@ -34,7 +33,7 @@ struct DataChannelBenchmarks {
             channelType: .reliable,
             label: "test-channel"
         )
-        let encoded = open.encode()
+        let encoded = try open.encode()
 
         let result = try benchmark("DCEPOpen.decode", iterations: 10000) {
             _ = try DCEPOpen.decode(from: encoded)
@@ -50,7 +49,7 @@ struct DataChannelBenchmarks {
             label: longLabel,
             protocol_: "my-protocol"
         )
-        let encoded = open.encode()
+        let encoded = try open.encode()
 
         let result = try benchmark("DCEPOpen.decode (long label)", iterations: 10000) {
             _ = try DCEPOpen.decode(from: encoded)
@@ -76,15 +75,13 @@ struct DataChannelBenchmarks {
 
     @Test("Benchmark: Process incoming DCEP")
     func benchmarkProcessDCEP() throws {
-        // Raise resource caps high enough for the measured iteration count
-        // since this benchmark never drains pendingIncoming.
+        // Raise the channel cap high enough for the measured iteration count.
         let manager = DataChannelManager(
             isInitiator: false,
-            maxChannels: .max,
-            maxPendingIncoming: .max
+            maxChannels: .max
         )
         let open = DCEPOpen(channelType: .reliable, label: "test")
-        let encoded = open.encode()
+        let encoded = try open.encode()
 
         // Incoming OPENs must use even stream IDs (responder opens odd).
         var streamID: UInt16 = 0

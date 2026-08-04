@@ -1,23 +1,52 @@
 # WebRTC — CONTEXT
-Scope/role: the top-level WebRTC data-channel API (`Sources/WebRTC`) that integrates STUN/ICE-Lite, DTLS (via the swift-tls Tier-1 facade), SCTP, and DataChannel; the public entry point consumers import.
-Last reviewed: 2026-06-25
+Scope/role: the `WebRTC` library target and transport API (`Sources/WebRTC`) that
+integrates STUN/ICE-Lite, DTLS (via the swift-tls Tier-1 facade), SCTP/data
+channels, and authenticated RTP/RTCP. Codec framing, packetization, capture,
+and presentation remain externally composed.
+Last reviewed: 2026-08-05
 
 Invariants and design intent that the code does not state structurally. Read this
-before changing the DTLS-SRTP authentication path, the certificate/fingerprint
+before changing the DTLS certificate authentication path, the certificate/fingerprint
 ownership, or the SCTP/ICE buffering caps. The protocol stack is `UDP → STUN /
-ICE Lite → DTLS 1.2 → SCTP → Data Channels`; the lower layers split into an
-Embedded-clean `*WireCore`/`*Core` value type plus a caller-locked adapter. This
-top-level module's sources are Embedded-seamed (FacadeLock / AsyncTimer / logger /
-cert gating), and the full `WebRTC` target is part of the Embedded readiness gate.
+ICE Lite → DTLS 1.2 → SRTP/SRTCP or SCTP → Media/Data Channels`. Internal
+protocol boundaries remain domain-oriented source components inside this one
+target; pure value engines and caller-locked adapters still preserve their
+separate responsibilities. The module's sources are Embedded-seamed
+(`FacadeLock` / `AsyncTimer` / logger / certificate gating), and the full
+`WebRTC` target is part of the Embedded readiness gate.
+
+## Target DTLS boundary (implemented)
+
+- The stable dependency path is
+  `swift-webrtc -> swift-tls/DTLS -> swift-ssl`.
+- `swift-webrtc` owns SDP/security generations, ICE/STUN, DTLS role and
+  fingerprint binding, timer delivery, SRTP/SRTCP, SCTP/DataChannel, and
+  RTP/RTCP. It never owns a general DTLS record or cryptographic implementation.
+- `swift-tls` owns the public sans-I/O DTLS session contract, typed effects,
+  lifecycle, and capability suspension/resumption. `swift-ssl` owns the
+  canonical DTLS wire, transcript, key schedule, record, replay, flight, cookie,
+  exporter, authentication, and handshake mechanisms.
+- WebRTC DTLS 1.2 is a narrow interoperability profile. Its mechanism belongs in
+  `swift-ssl` and its public session profile belongs in `swift-tls`; it must not
+  become an implicit general TLS 1.2 fallback.
+- The current `DTLSEndpoint` consumes the `swift-tls` facade, whose active
+  mechanism targets depend on `swift-ssl`; no duplicate DTLS mechanism remains
+  in this target.
+
+See the workspace
+[`SECURE_TRANSPORT_ARCHITECTURE.md`](../../../../SECURE_TRANSPORT_ARCHITECTURE.md).
 
 ## Contracts (the load-bearing rules)
 
-- **WebRTC owns its DTLS-SRTP certificate layer locally.** The swift-tls Tier-1
+- **WebRTC owns its DTLS certificate layer locally.** The swift-tls Tier-1
   facade takes a `TLSIdentity` (raw key + DER chain) rather than generating
   certificates, so `WebRTCCertificate` (`Sources/WebRTC/WebRTCCertificate.swift`)
-  generates the self-signed ECDSA P-256 leaf and `CertificateFingerprint` computes
-  the SHA-256 fingerprint. Do not push certificate generation down into swift-tls;
-  the fingerprint is WebRTC's unit of peer identity and must stay here.
+  builds a Pure Swift self-signed ECDSA P-256 leaf when a
+  `WebRTCCertificateClock` is available and validates externally provisioned
+  DER + raw key material on every target.
+  `CertificateFingerprint` computes the SHA-256 fingerprint. Do not push
+  certificate ownership down into swift-tls; the fingerprint is WebRTC's unit
+  of peer identity and must stay here.
 - **DTLS is driven through the Tier-1 facade, never the legacy products.**
   `DTLSEndpoint` (`Sources/WebRTC/DTLSEndpoint.swift`) is an internal enum wrapping
   `DTLSClient` / `DTLSServer` behind one sans-IO surface (`startHandshake` /
@@ -29,39 +58,103 @@ cert gating), and the full `WebRTC` target is part of the Embedded readiness gat
   `DTLSEndpoint.make` honors `requireClientCertificate` only on the server role;
   the WebRTC server demands mutual DTLS authentication. Do not relax this.
 - **`WebRTCConnection` thread safety is lock-based, not actor-based.** Internal
-  state lives behind `connState.withLock` via the `FacadeLock` seam (host
-  `Synchronization.Mutex` / Embedded `Atomic` spinlock). Keep mutations inside the
+  state lives behind `connState.withLock` via the common
+  `Synchronization.Mutex`-backed `FacadeLock` on Native, WASM, and Embedded. Keep mutations inside the
   lock; do not hold the lock across an `await`.
-- **`incomingChannels` is an `AsyncStream` that MUST be finished on close/fail.**
-  `finishIncomingChannels()` calls the continuation's `finish()`; the fail-closed
-  handshake paths call it before throwing. A path that fails the connection without
-  finishing the stream leaves `for await` consumers hung.
+- **Retransmission Tasks have one tokenized owner registry.** DTLS flight and
+  SCTP T3 Tasks reserve an identity under `TimerTaskRegistry`, create the Task
+  outside that mutex, and attach its handle only if the identity is still
+  current. Immediate completion or concurrent close removes the placeholder and
+  makes attachment fail; an older Task cannot clear its successor. Terminal
+  teardown removes both handles under the registry mutex and cancels them after
+  releasing it. Task closures retain independent pumps, never the public facade.
+- **All deadlines use the injected `WebRTCTimer`.** The same driver reaches DTLS
+  flight backoff and SCTP retransmission. Repeated DTLS state with the same
+  generation preserves the current deadline; a timeout publishes the next
+  generation before retransmitted datagrams leave the flight transaction.
+  Cancellation is typed. Close rejects new egress admission; one datagram
+  admitted before a concurrent close may finish, while the replaced egress
+  epoch suppresses every later datagram in that batch.
+- **`claimDataChannelEvents()` is the sole ordered DataChannel event surface.**
+  OPEN, application DATA, and CLOSE are committed under the same connection
+  transaction, admitted to one bounded queue, and delivered only after the
+  connection lock is released. Exactly one claim succeeds and the returned
+  `WebRTCDataChannelEventConsuming` owner permits only one suspended `next()`;
+  a second claim or overlapping read is a typed failure. Copying the protocol
+  existential retains that same owner and cannot create a second iterator.
+  The connection staging ring and the consumer ring share one admission budget
+  of 1,024 events and 16 MiB of payload by default. Moving an event between
+  those rings transfers its existing reservation; it must not reserve twice or
+  materialize a second payload owner. Popping a ring slot clears the retained
+  owner immediately.
+  Terminal finish preserves buffered order so the owner may drain events before
+  observing close/failure. An owner that abandons that drain must call
+  `discardRemainingEvents()`; it releases every remaining reservation and
+  resumes a parked read with the terminal result. The first terminal cause
+  committed by the connection is the authoritative result observed by both the
+  connection and its consumer, even when close and transport failure race. Do
+  not add independent
+  channel/message/close callbacks:
+  separate surfaces can overtake one another under synchronous transport
+  re-entry and lose OPEN-adjacent DATA. Failure to consume the bounded queue is
+  terminal and typed; payloads are never silently dropped.
+- **Every DataChannel lifecycle has a monotonic local generation.** SCTP stream
+  identifiers may be reused only after reset, so DATA and CLOSE events carry
+  `(streamID, generation)`. Generation exhaustion fails explicitly and never
+  wraps; delayed events from an older lifecycle must not target a reused ID.
+- **Protected media uses the DTLS exporter, never DTLS application data.**
+  `DTLSEndpoint` negotiates the required `use_srtp` profile and exports RFC 5705
+  `EXTRACTOR-dtls_srtp` material. `WebRTCConnection` maps client/server key
+  directions into one SRTP context; RTP and RTCP handlers are downstream
+  of authentication, replay protection, decryption, and wire validation.
+- **Codec implementations do not become WebRTC dependencies.** `WebRTCMedia`
+  depends on `WebRTC` for RTP contracts, while `WebRTC` has no dependency on
+  `WebRTCMedia`. Its H.264 sender's typed sink may call `sendRTP`, but the
+  transport API must also accept other negotiated RTP codecs without an H.264
+  dependency.
+- **Protected media transfers one owner through the facade.** `receive` consumes
+  the UDP array, the SRTP component authenticates/decrypts it in place, and the RTP/RTCP
+  packet consumes that same storage into its handler. Reserved outbound RTP and
+  SRTCP likewise retain their owner through in-place protection and the
+  consuming transport callback. Storage-identity tests guard all four paths.
+  This guarantee ends at the WebRTC/TLS dependency boundary: the swift-tls
+  facade establishes one owned datagram before its mutex transaction, then
+  passes that owner into the engine without a second packet-sized copy.
+- **Media close is an admission boundary, not a quiescence barrier.** Handler
+  lookup and terminal detachment share `mediaHandlerState`; callbacks run after
+  that mutex is released. Terminal detachment also disables future handler
+  installation, which returns `.failure(.closed)` without retaining the
+  callback. A callback admitted before the detach may finish after `close()`
+  returns. This permits callback-reentrant close without waiting on itself.
 
 ## Invariants (must hold; tests guard them)
 
-- **DTLS-SRTP fingerprint authentication is fail-closed.**
+- **DTLS certificate fingerprint authentication is fail-closed.**
   `WebRTCConnection.onHandshakeComplete()` (`Sources/WebRTC/WebRTCConnection.swift`)
   computes the peer fingerprint from `DTLSEndpoint.remoteCertificateDER` and, when
   an `expectedFingerprint` is configured, accepts ONLY on an exact match. It
   rejects (throws `WebRTCError.dtlsHandshakeFailed`, drives the state machine to
-  failed, and finishes `incomingChannels`) on mismatch OR when the peer presented
-  no certificate. Never add a path that silently accepts an unverified peer. When
-  no expected fingerprint is set (identity bound by an upper layer), the handshake
-  proceeds and the verified fingerprint is surfaced via `remoteFingerprint`.
-- **The verified remote certificate is surfaced, not the negotiated one.**
-  `remoteCertificateDER` / `remoteFingerprint` reflect what the peer actually
-  presented during the handshake; both are `nil` until the handshake completes.
+  failed, and finishes the claimed DataChannel event stream) on mismatch OR when the peer presented
+  no certificate. Never add a path that silently accepts a mismatch. When no
+  expected fingerprint is set, the existing data-channel handshake proceeds so
+  an upper layer can bind identity, but protected media MUST remain unavailable
+  until that explicit binding occurs.
+- **Presented certificate bytes and verified identity are distinct.**
+  `remoteCertificateDER` snapshots what the peer presented when the handshake
+  completes, so terminal lease failure is never collapsed into an absent
+  certificate after close.
+  `remoteFingerprint` is populated only after it matches a configured expected
+  fingerprint; it remains `nil` when identity binding is deferred upward.
 - **`CertificateFingerprint.fromDigest` never re-hashes.** `fromDER` hashes the DER;
   `fromDigest` wraps an existing SHA-256 digest (e.g. extracted from a `/certhash`
   multihash) verbatim. Do not collapse the two — a hash-of-hash breaks peer
   matching.
-- **`WebRTCCertificate.init` is fail-closed on garbage DER (host).** On host it
-  parses the DER as an `X509.Certificate` before accepting it; unparseable bytes
-  throw. Under Embedded (no X.509), `init(derEncoded:rawPrivateKey:)` accepts the
-  externally-provisioned DER + raw key and computes the fingerprint via
-  `BoringSHA256`; no identity is fabricated if absent.
+- **`WebRTCCertificate.init` is fail-closed on malformed credentials.** Darwin
+  parses the DER as an `X509.Certificate`; portable targets parse the required
+  SubjectPublicKeyInfo and prove that the raw private scalar matches it. Every
+  target computes the fingerprint via `DefaultSHA256`; no identity is fabricated.
 - **ICE-Lite `validatedPeers` is capped FIFO.** `ICELiteStateMachine`
-  (`Sources/ICELiteCore/ICELiteStateMachine.swift`) caps the set at
+  (`Sources/WebRTC/Connectivity/ICE/ICELiteStateMachine.swift`) caps the set at
   `maxValidatedPeers` (1000); admitting a new key past the cap evicts the oldest
   entry (`validatedPeerOrder` is kept in lockstep). The cap bounds memory against a
   spoofed-source-address flood; it does NOT relax authentication. Do not remove the
@@ -71,7 +164,7 @@ cert gating), and the full `WebRTC` target is part of the Embedded readiness gat
   compared with serial-number arithmetic so wraparound is handled correctly. Do not
   replace these comparisons with plain `<` / `>`.
 - **SCTP reassembly/reorder buffers are count- and byte-capped.**
-  `FragmentReassembler` (`Sources/SCTPWireCore/FragmentReassembler.swift`) enforces
+  `FragmentReassembler` (`Sources/WebRTC/DataChannel/SCTP/FragmentReassembler.swift`) enforces
   `maxPendingFragments` (concurrent groups), `maxBufferedMessagesPerStream`, and a
   total `maxBufferedBytes` ceiling (16 MiB default). Overflow is surfaced as an
   error, not silently dropped. Keep all three caps; they resist memory-exhaustion
@@ -80,47 +173,72 @@ cert gating), and the full `WebRTC` target is part of the Embedded readiness gat
   parser always advances), COOKIE-ECHO replay is rejected, the negotiated inbound
   stream count is enforced, retransmissions are bounded (the association aborts at
   the maximum), and spoofed / reflected-tag ABORTs are discarded (RFC 4960 §8.5).
-- **Protocol demultiplexing follows RFC 5764 §5.1.2.** `WebRTCConnection.receive(_:)`
+- **SCTP and DataChannel state commit before external I/O.** Packet processing,
+  reciprocal reset state, DCEP state, and event-queue admission are one transaction.
+  The canonical event queue drains before response datagrams are emitted, and both
+  operations occur outside the connection mutex. This preserves OPEN/DATA/CLOSE
+  order even when `SendHandler` synchronously re-enters `receive(_:)`.
+- **Protocol demultiplexing follows RFC 7983.** `WebRTCConnection.receive(_:)`
   routes by first byte: `20–63` → DTLS record, `0–3` (plus the `isSTUN` check) →
-  STUN. STUN decoding is safe for sliced `Data` (a non-zero `startIndex` does not
-  trap or misread).
+  STUN, and `128–191` → the protected-media boundary. RFC 5761 then separates
+  RTP from RTCP. Neither kind reaches the internal RTP/RTCP parser or an
+  external handler until the SRTP component authenticates, checks replay state,
+  and decrypts it.
+  STUN decoding is safe for sliced `Data` (a non-zero `startIndex` does not trap
+  or misread).
+- **DTLS establishment is not media readiness.** Media configuration requires a
+  signaling-bound expected fingerprint. The local swift-tls integration must
+  also negotiate the configured extension 14 (`use_srtp`) profile and export
+  directional RFC 5705 material before `isMediaReady` becomes true. Never route
+  RTP/RTCP through DTLS application data.
 
 ## Embedded constraints (do not regress)
 
 - **The full `WebRTC` facade must Embedded-compile.** The facade files
   (`WebRTCConnection` / `WebRTCEndpoint` / `WebRTCListener` / `WebRTCCertificate`)
-  route their host-only deps through build-gated seams: `FacadeLock` (host `Mutex`
-  / Embedded `Atomic` spinlock), `WebRTCDefaultTimer` (the `AsyncTimer` seam — host
-  `ContinuousClock`+`Task.sleep`, Embedded platform monotonic clock + sliced park;
-  drives the SCTP T3-rtx tick), `WebRTCLogger` (host swift-log / Embedded no-op),
-  and a build-gated DTLS-SRTP fingerprint SHA-256 (host swift-crypto / Embedded
-  `P2PCrypto.BoringSHA256`). Do not reintroduce a bare `Mutex` /
+  route their host-only deps through build-gated seams: common `FacadeLock`
+  (`Synchronization.Mutex` on every supported platform), `WebRTCDefaultTimer` (the `AsyncTimer` seam — host
+  `ContinuousClock`+`Task.sleep`, WASI/Embedded platform monotonic clock + sliced
+  park; drives both DTLS flight and SCTP T3-rtx scheduling), `WebRTCLogger`
+  (host swift-log / Embedded no-op),
+  and the common `P2PCrypto.DefaultSHA256` certificate fingerprint path. Do not introduce target-specific state isolation /
   `Task.sleep` / `ContinuousClock` / `Logging.Logger` into the facade.
-- **Cert generation is host-only; the Embedded identity is externally provisioned.**
-  `WebRTCCertificate.generateSelfSigned` (swift-certificates / swift-asn1) and the
-  typed `privateKey` (`P256.Signing.PrivateKey`) are `#if !hasFeature(Embedded)`.
-  The package manifest must also drop swift-crypto / swift-certificates /
-  swift-asn1 / swift-log under `P2P_CORE_EMBEDDED=1`, so Embedded builds do not
-  retain unused host-only dependencies.
-  Under Embedded the embedder MUST supply the identity via
-  `init(derEncoded:rawPrivateKey:)` (DER + 32-byte raw P-256 scalar) — fail-closed,
-  never fabricated. `WebRTCEndpoint.create()` (which generates a cert) is likewise
-  host-only; use `init(certificate:)` under Embedded. The fail-closed DTLS-SRTP
-  fingerprint verification is preserved on BOTH builds.
-- **The adapter layer is dual-built, not host-only.** `STUNCore`, `ICELite`,
-  `SCTPCore`, and `DataChannel` hold Embedded-clean value engines behind
-  `FacadeLock` and route crypto/random/clock work through seams. Host-only
-  `Data` conveniences are gated out under Embedded; the `[UInt8]` surface remains
-  available.
-- **The Embedded-clean layers are `STUNWireCore`, `ICELiteCore`, `SCTPWireCore`,
-  `DataChannelCore`, plus the dual-built adapters and facade.** Do not introduce
-  Foundation / `any` / bare `Mutex` into `*WireCore` / `ICELiteCore`, and do not
-  bypass the adapter seams in `STUNCore` / `ICELite` / `SCTPCore` / `DataChannel`.
+- **Pure Swift identity generation is shared by every target.**
+  `WebRTCCertificate.generateSelfSigned` builds a v3 ECDSA P-256 leaf with the
+  shared DER writer and `P2PCrypto` provider. The same `[UInt8]` certificate and
+  raw scalar representation is used on Native, WASI, and Embedded. Its wall
+  clock is an injectable `WebRTCCertificateClock`, so Embedded deployments can
+  use an RTC without importing a platform clock into the facade. If no clock is
+  available, generation fails with `.clockUnavailable`. Deployments that
+  provision identity material externally can use
+  `init(derEncoded:rawPrivateKey:)`; the initializer validates the certificate
+  envelope, imports both keys, and fails closed on a mismatch. The fail-closed
+  DTLS fingerprint verification is preserved on every build.
+- **The adapter components are dual-built, not host-only.** STUN, ICE, SCTP,
+  and DataChannel hold Embedded-clean value engines behind `FacadeLock` and
+  route crypto/random/clock work through seams. Host-only `Data` conveniences
+  are gated out under Embedded; the `[UInt8]` surface remains available.
+- **Foundation-free protocol code remains isolated by domain directory.**
+  `Connectivity/{ICE,STUN}`, `DataChannel/SCTP`, and `Transport/{RTP,SRTP}`
+  live inside the `WebRTC` target; H.264 framing and packetization live in the
+  separate `WebRTCMedia` target. Do not introduce Foundation, existential
+  erasure, or target-specific synchronization into borrowed wire paths, and do
+  not bypass the crypto/random/clock seams used by the stateful adapters.
 
 ## Dependencies & seams
 
-- The Tier-1 `TLS` facade (`DTLSClient` / `DTLSServer`) is consumed from the
-  versioned `swift-tls` dependency.
+- The Tier-1 `TLS` facade (`DTLSClient` / `DTLSServer`) is consumed from
+  `swift-tls`. The development manifest points at coordinated sibling working
+  trees so unpublished commits can be validated together. A release must replace
+  those path dependencies with the published graph and pass the same matrix.
+- Certificate generation and validation use the shared Pure Swift DER and
+  `P2PCrypto` path. The WebRTC manifest has no Darwin-only certificate trait or
+  platform-specific crypto dependency; the package declares no traits and does
+  not need trait flags to select the identity contract.
+- The internal SRTP component owns RFC 3711 key derivation, in-place
+  transforms, indices, and replay windows. The surrounding `WebRTC`
+  orchestration owns negotiation, exporter direction mapping, demultiplexing,
+  plaintext wire parsing, and handler delivery.
 - **`SendHandler` is the only egress seam.** The library is transport-agnostic:
   callers inject a send closure and feed inbound bytes via `receive(_:)`. No UDP
   socket is bound inside the library.
@@ -131,12 +249,44 @@ cert gating), and the full `WebRTC` target is part of the Embedded readiness gat
   arithmetic. CRC-32C is the packet checksum (validation treats the checksum field
   as zero in place to avoid a copy). DCEP open/ack rides RFC 8831 / 8832.
 - **STUN (RFC 5389):** demultiplexed by first byte per RFC 5764 §5.1.2; optional
-  MESSAGE-INTEGRITY and FINGERPRINT attributes are handled in the `STUNCore`
-  adapter, not the wire core.
+  MESSAGE-INTEGRITY and FINGERPRINT attributes are handled in the stateful STUN
+  adapter, not the pure wire parser.
+
+## Outbound H.264 composition
+
+```text
+encoded access-unit owner
+  -> WebRTCMedia ByteStream borrowed NAL ranges
+  -> WebRTCMedia RTP/Payload RFC 6184 layouts
+  -> WebRTCMedia RTP one-owner plaintext packet with SRTP tail capacity
+  -> WebRTCMedia sender typed sink
+  -> WebRTCConnection.sendRTP
+  -> WebRTC SRTP in-place protection
+  -> SendHandler
+```
+
+The profile's `rtpProtectionTrailerByteCount` is the source of truth for the
+sender reserve. Sequence/timestamp state belongs to the `WebRTCMedia` sender,
+not the `WebRTC` transport. Packet pacing, UDP backpressure, and send ordering
+belong to the adapter surrounding its synchronous sink.
 
 ## Build
 
-- Host: `swift build` (Swift tools 6.2, platform floor v26). Tests:
-  `timeout 60 swift test` (per-module filters in `CLAUDE.md`).
-- Embedded facade: `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1 swiftly run +6.3.1
-  swift build --target WebRTC -c release -Xswiftc -warnings-as-errors`.
+- Native tests use `TOOLCHAINS=org.swift.64202607231a xcodebuild test` with the
+  Xcode scheme and an explicit execution timeout.
+- Normal and Embedded WASM use the exact 2026-07-23 Swift 6.4 toolchain and
+  matching SDK identifiers shown in `CLAUDE.md`. Both run the Tests-contained
+  `WebRTCPlatformIntegrationProbe` with `--build-system swiftbuild`; both
+  select the same P2PCrypto default backend.
+- The pinned Embedded compiler requires `-debug-info-format none` for this
+  executable-only async probe because its DWARF emitter asserts on conflicting
+  frame locations. Release optimization remains enabled for library targets.
+- The probe completes mutual in-memory DTLS, negotiates `use_srtp`, derives the
+  exporter keys, performs an authenticated SRTP H.264 byte round trip, verifies
+  typed transport rejection, and observes timer heartbeat/cancellation. It is
+  not real UDP, browser interoperability, target-parallel Mutex validation, or
+  a production event-loop timer claim.
+- The portable default timer parks the executor thread in bounded 20 ms platform
+  slices before yielding. It exists as a deterministic runtime fallback; a
+  production single-threaded WASI/Embedded integration must inject an
+  event-loop-integrated `WebRTCTimer` to meet low-latency scheduling budgets.

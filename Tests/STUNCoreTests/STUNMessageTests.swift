@@ -2,8 +2,7 @@
 
 import Testing
 import Foundation
-@testable import STUNCore
-
+@testable import WebRTC
 @Suite("STUN Message Tests")
 struct STUNMessageTests {
 

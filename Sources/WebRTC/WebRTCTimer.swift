@@ -3,12 +3,12 @@
 /// `WebRTCConnection` drives the periodic SCTP T3-rtx retransmission tick and any
 /// other deadline-based scheduling through the `AsyncTimer` seam (declared in
 /// `P2PCoreCrypto`) rather than `Task.sleep` / `ContinuousClock`, both of which
-/// are `@available(*, unavailable)` under Embedded Swift. The connection stores a
-/// concrete `WebRTCDefaultTimer` (no `any`); this file is the only place that
-/// selects which concrete timer the build uses.
+/// are `@available(*, unavailable)` under Embedded Swift. `WebRTCTimer` erases
+/// one concrete implementation without an existential; this file selects the
+/// package-provided default.
 ///
-///   host  (default):   WebRTCDefaultTimer = WebRTCHostTimer   (ContinuousClock + Task.sleep)
-///   Embedded (-c rel): WebRTCDefaultTimer = WebRTCEmbeddedTimer (platform clock + park)
+///   native host:       WebRTCDefaultTimer = WebRTCHostTimer
+///   WASI / Embedded:   WebRTCDefaultTimer = WebRTCPortableTimer
 ///
 /// The webrtc package defines its own timers (rather than depending on
 /// swift-p2p-transport's `DefaultAsyncTimer`) so the Embedded build is driven by
@@ -25,13 +25,21 @@ extension Duration {
     /// (unlike `ContinuousClock`), so this works in both builds.
     var facadeNanoseconds: UInt64 {
         let (seconds, attoseconds) = components
-        let secNanos = UInt64(max(0, seconds)) &* 1_000_000_000
+        let positiveSeconds = UInt64(max(0, seconds))
+        let (secNanos, secondsOverflow) = positiveSeconds
+            .multipliedReportingOverflow(by: 1_000_000_000)
+        if secondsOverflow {
+            return UInt64.max
+        }
         let fracNanos = UInt64(max(0, attoseconds) / 1_000_000_000)
-        return secNanos &+ fracNanos
+        let (total, additionOverflow) = secNanos.addingReportingOverflow(
+            fracNanos
+        )
+        return additionOverflow ? UInt64.max : total
     }
 }
 
-#if !hasFeature(Embedded)
+#if !hasFeature(Embedded) && !canImport(WASILibc)
 import _Concurrency
 
 /// The host default timer: `ContinuousClock` for time, `Task.sleep` for the wait.
@@ -84,19 +92,21 @@ import Musl
 import WASILibc
 #endif
 
-/// The Embedded default timer: the platform monotonic clock for time.
-typealias WebRTCDefaultTimer = WebRTCEmbeddedTimer
+/// The WASI / Embedded default timer over the platform monotonic clock.
+typealias WebRTCDefaultTimer = WebRTCPortableTimer
 
-/// An Embedded-clean `AsyncTimer` over the POSIX C library.
+/// An Embedded-clean `AsyncTimer` over the platform C library.
 ///
 /// `monotonicNanos()` reads the platform monotonic clock. `sleep(untilNanos:)`
-/// parks in fixed slices, honoring cancellation between slices. Embedded-clean:
+/// parks in fixed slices, yielding after every slice and honoring cancellation
+/// between slices. Embedded-clean:
 /// only the platform C library + `_Concurrency`; no
 /// Foundation, no NIO, no `any`, no `ContinuousClock`, no `Task.sleep`.
 ///
-/// A production embedder is expected to inject its own timer parked on the
-/// platform's real executor rather than blocking a thread.
-struct WebRTCEmbeddedTimer: AsyncTimer {
+/// A production embedder should inject its own timer parked on the platform's
+/// real executor. This fallback blocks only for one bounded slice before
+/// cooperatively yielding to other tasks.
+struct WebRTCPortableTimer: AsyncTimer {
 
     init() {}
 
@@ -123,6 +133,7 @@ struct WebRTCEmbeddedTimer: AsyncTimer {
             if now >= deadlineNanos { return }
             let remaining = deadlineNanos - now
             Self.nanosleepFor(min(remaining, sliceNanos))
+            await Task.yield()
         }
     }
 
@@ -158,13 +169,20 @@ struct WebRTCEmbeddedTimer: AsyncTimer {
         var eventCount: __wasi_size_t = 0
         let result = __wasi_poll_oneoff(&subscription, &event, 1, &eventCount)
         precondition(result == 0, "WASI clock sleep failed")
+        precondition(eventCount == 1, "WASI clock sleep produced no event")
+        precondition(event.error == 0, "WASI clock event failed")
         #else
-        var req = timespec(
+        var request = timespec(
             tv_sec: Int(nanos / 1_000_000_000),
             tv_nsec: Int(nanos % 1_000_000_000)
         )
-        var rem = timespec()
-        _ = nanosleep(&req, &rem)
+        var remaining = timespec()
+        while nanosleep(&request, &remaining) != 0 {
+            guard errno == EINTR else {
+                preconditionFailure("POSIX monotonic sleep failed")
+            }
+            request = remaining
+        }
         #endif
     }
 }

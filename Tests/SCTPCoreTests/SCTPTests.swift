@@ -2,15 +2,17 @@
 
 import Testing
 import Foundation
-@testable import SCTPCore
-
+import P2PCoreBytes
+import P2PCoreCrypto
+import P2PCrypto
+@testable import WebRTC
 @Suite("SCTP Packet Tests")
 struct SCTPPacketTests {
 
     @Test("SCTP chunk encode/decode roundtrip")
     func chunkRoundtrip() throws {
         let value = Data([0x01, 0x02, 0x03, 0x04])
-        let chunk = SCTPChunk(chunkType: SCTPChunkType.data.rawValue, flags: 0x03, value: value)
+        let chunk = try SCTPChunk(chunkType: SCTPChunkType.data.rawValue, flags: 0x03, value: value)
 
         let encoded = chunk.encode()
         let decoded = try SCTPChunk.decode(from: encoded)
@@ -67,16 +69,31 @@ struct SCTPPacketTests {
             advertisedReceiverWindowCredit: 65535
         )
 
-        let encoded = sack.encode()
+        let encoded = try sack.encode()
         let decoded = try SCTPSackChunk.decode(from: encoded)
 
         #expect(decoded.cumulativeTSNAck == 10)
         #expect(decoded.advertisedReceiverWindowCredit == 65535)
     }
 
+    @Test("SACK construction rejects a value larger than the chunk length field")
+    func oversizedSackThrows() {
+        let sack = SCTPSackChunk(
+            cumulativeTSNAck: 10,
+            gapAckBlocks: Array(
+                repeating: (start: UInt16(1), end: UInt16(1)),
+                count: 16_380
+            )
+        )
+
+        #expect(throws: SCTPWireError.self) {
+            _ = try sack.toChunk()
+        }
+    }
+
     @Test("SCTP packet encode/decode")
     func packetRoundtrip() throws {
-        let chunk = SCTPChunk(chunkType: SCTPChunkType.cookieAck.rawValue, value: Data())
+        let chunk = try SCTPChunk(chunkType: SCTPChunkType.cookieAck.rawValue, value: Data())
         let packet = SCTPPacket(
             sourcePort: 5000,
             destinationPort: 5000,
@@ -110,10 +127,15 @@ struct SCTPPacketTests {
             secretKey: secretKey,
             peerTag: 0x12345678,
             localTag: 0x9ABCDEF0,
+            localTieTag: 0,
+            peerTieTag: 0,
+            localInitialTSN: 24,
             peerInitialTSN: 42,
             peerARWC: 65535,
             outboundStreams: 8,
-            inboundStreams: 8
+            inboundStreams: 8,
+            localPort: 5_000,
+            peerPort: 5_000
         )
 
         #expect(cookie.validate(secretKey: secretKey))
@@ -122,6 +144,70 @@ struct SCTPPacketTests {
         encoded[encoded.startIndex] ^= 0xFF
         let tampered = try SCTPCookie.decode(from: encoded)
         #expect(!tampered.validate(secretKey: secretKey))
+    }
+
+    @Test("Non-generic cookie crypto matches the former generic HMAC seam")
+    func cookieCryptoDifferentialFixture() {
+        let secretKey = Array("01234567890123456789012345678901".utf8)
+        let timestamp: UInt64 = 0x0102_0304_0506_0708
+        let peerTag: UInt32 = 0x1234_5678
+        let localTag: UInt32 = 0x9ABC_DEF0
+        let localTieTag: UInt32 = 0x0102_0304
+        let peerTieTag: UInt32 = 0x0506_0708
+        let localInitialTSN: UInt32 = 24
+        let peerInitialTSN: UInt32 = 42
+        let peerARWC: UInt32 = 65_535
+        let outboundStreams: UInt16 = 8
+        let inboundStreams: UInt16 = 16
+        let extensionFlags: UInt32 = 1
+        let localPort: UInt16 = 5_000
+        let peerPort: UInt16 = 5_001
+
+        let cookie = SCTPCookieCore.generate(
+            secretKey: secretKey,
+            timestamp: timestamp,
+            peerTag: peerTag,
+            localTag: localTag,
+            localTieTag: localTieTag,
+            peerTieTag: peerTieTag,
+            localInitialTSN: localInitialTSN,
+            peerInitialTSN: peerInitialTSN,
+            peerARWC: peerARWC,
+            outboundStreams: outboundStreams,
+            inboundStreams: inboundStreams,
+            extensionFlags: extensionFlags,
+            localPort: localPort,
+            peerPort: peerPort,
+            crypto: makeSCTPCookieCryptoContext()
+        )
+        let legacyInput = SCTPCookieCore.signableInput(
+            timestamp: timestamp,
+            peerTag: peerTag,
+            localTag: localTag,
+            localTieTag: localTieTag,
+            peerTieTag: peerTieTag,
+            localInitialTSN: localInitialTSN,
+            peerInitialTSN: peerInitialTSN,
+            peerARWC: peerARWC,
+            outboundStreams: outboundStreams,
+            inboundStreams: inboundStreams,
+            extensionFlags: extensionFlags,
+            localPort: localPort,
+            peerPort: peerPort
+        )
+        let legacyMAC = legacyCookieAuthenticationCode(
+            message: legacyInput,
+            key: secretKey,
+            as: DefaultHMACSHA256.self
+        )
+
+        #expect(cookie.hmac == legacyMAC)
+        #expect(cookie.validateBinding(
+            secretKey: secretKey,
+            nowMillis: timestamp,
+            maxAgeMillis: 60_000,
+            crypto: makeSCTPCookieCryptoContext()
+        ))
     }
 
     // MARK: - Finding 1: zero-length chunk must not loop / OOM
@@ -155,7 +241,7 @@ struct SCTPPacketTests {
 
     @Test("Default decode rejects a packet with a corrupt CRC-32C")
     func decodeRejectsBadChecksum() throws {
-        let chunk = SCTPChunk(chunkType: SCTPChunkType.cookieAck.rawValue, value: Data())
+        let chunk = try SCTPChunk(chunkType: SCTPChunkType.cookieAck.rawValue, value: Data())
         let packet = SCTPPacket(
             sourcePort: 5000, destinationPort: 5000,
             verificationTag: 0xABCD1234, chunks: [chunk])
@@ -178,10 +264,15 @@ struct SCTPPacketTests {
             secretKey: secretKey,
             peerTag: 0x12345678,
             localTag: 0x9ABCDEF0,
+            localTieTag: 0,
+            peerTieTag: 0,
+            localInitialTSN: 24,
             peerInitialTSN: 42,
             peerARWC: 65535,
             outboundStreams: 8,
-            inboundStreams: 8
+            inboundStreams: 8,
+            localPort: 5_000,
+            peerPort: 5_000
         )
 
         var encoded = cookie.encode()
@@ -199,6 +290,14 @@ struct SCTPPacketTests {
         let futureCookie = try SCTPCookie.decode(from: encoded)
         #expect(!futureCookie.validate(secretKey: secretKey))
     }
+}
+
+private func legacyCookieAuthenticationCode<MAC: MessageAuthenticationCode>(
+    message: [UInt8],
+    key: [UInt8],
+    as macType: MAC.Type
+) -> [UInt8] {
+    MAC.authenticationCode(for: message.span, key: key.span)
 }
 
 /// Regression coverage for the ordered-delivery Stream-Sequence-Number (SSN)

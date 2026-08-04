@@ -1,10 +1,17 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.4
 import PackageDescription
 
 // Embedded toggle controls the experimental Embedded feature + WMO for the
 // Embedded-clean cores. Lifetimes is enabled in BOTH modes because Span-returning
 // members of the P2PCoreBytes dependency require @_lifetime.
 let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
+let wasiEnabled = Context.environment["P2P_CORE_WASM"] == "1"
+let portableEnabled = embeddedEnabled || wasiEnabled
+
+// Logging remains available on Linux even though identity crypto is portable.
+let loggingPlatforms: [Platform] = [
+    .macOS, .macCatalyst, .iOS, .tvOS, .watchOS, .visionOS, .linux,
+]
 
 let coreSettings: [SwiftSetting] = {
     var s: [SwiftSetting] = [.enableExperimentalFeature("Lifetimes")]
@@ -14,106 +21,88 @@ let coreSettings: [SwiftSetting] = {
     return s
 }()
 
-// The Tier-1 `WebRTC` facade's dependencies. The DTLS facade (`TLS`) and the
-// Embedded-clean cores dual-build under `P2P_CORE_EMBEDDED`. Host-only packages
-// — swift-certificates / swift-asn1 (self-signed X.509 generation) and swift-log
-// (logging) — are dropped under Embedded, where the facade gates the matching
-// imports behind `#if !hasFeature(Embedded)` and uses the no-op logger shim +
-// the externally-provisioned-identity path. Under Embedded the facade hashes the
-// DTLS-SRTP fingerprint via `P2PCrypto`'s `BoringSHA256` (preserving
-// fail-closed verification) and schedules its retransmission tick through
-// `P2PCoreCrypto`'s `AsyncTimer` seam.
-//
-// The adapter layer (`STUNCore` / `ICELite` / `SCTPCore` / `DataChannel`) is now
-// cored + dual-built: each adapter is a `final class & Sendable` holding an
-// Embedded-clean value-type engine behind a `FacadeLock`, driving the `*WireCore`
-// codecs through the crypto/random/clock seams. All eight adapter/core targets
-// Embedded-compile under `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1`.
-//
-// The `WebRTC` facade now Embedded-compiles end to end: a full
-// `P2P_CORE_EMBEDDED=1 P2P_CRYPTO_EMBEDDED=1 swift build --target WebRTC -c release`
-// builds clean. The facade exposes a `[UInt8]` public surface (with host-only
-// `Data` convenience overloads gated `#if !hasFeature(Embedded)`, so swift-libp2p's
-// `Data`-based consumers are unaffected); Foundation / Logging / swift-crypto /
-// swift-certificates are host-only `#if`-gated imports, the fingerprint SHA-256 is
-// routed through `P2PCrypto`'s `BoringSHA256`, the retransmission driver
-// uses the `AsyncTimer` seam, and every throwing entry point is typed-throws
-// (`throws(WebRTCError)`) with static / structured error reasons (no
-// `String(describing:)`). See CONTEXT.md.
-let webrtcFacadeDependencies: [Target.Dependency] = {
-    var d: [Target.Dependency] = [
-        "STUNCore", "ICELite", "SCTPCore", "DataChannel",
-        // The DTLS handshake/record engine is driven through swift-tls's Tier-1
-        // `TLS` facade (`DTLSClient`/`DTLSServer`).
-        .product(name: "TLS", package: "swift-tls"),
-        // Time + deadline-sleep seam for the retransmission driver (dual-build).
-        .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
-    ]
-    if embeddedEnabled {
-        d += [
-            // Embedded fingerprint SHA-256 + the `Span` currency it consumes.
-            .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
-            .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
-        ]
-    } else {
-        d += [
-            .product(name: "Crypto", package: "swift-crypto"),
-            .product(name: "X509", package: "swift-certificates"),
-            .product(name: "SwiftASN1", package: "swift-asn1"),
-            .product(name: "Logging", package: "swift-log"),
-        ]
+// Keep production libraries optimized in release builds. The pinned Swift 6.4
+// WASM snapshot miscompiles local generic Array value-witness destruction in
+// the executable-only runtime probe, so compile only that harness at `-Onone`.
+// Its Embedded code generation also asserts while emitting conflicting DWARF
+// locations; the documented Embedded command therefore selects SwiftPM's
+// `-debug-info-format none` build option.
+// The probe still links and exercises the release-built WebRTC/TLS/crypto code.
+let platformProbeSettings: [SwiftSetting] = {
+    var s = coreSettings
+    if portableEnabled {
+        s += [.unsafeFlags(["-Onone"])]
     }
+    return s
+}()
+
+// The Swift 6.4 Embedded WASM SDK ships Unicode normalization/grapheme data as
+// an optional static library. WebRTC's public diagnostics and ICE credentials
+// exercise String operations that reference those symbols, so every Embedded
+// executable consuming the facade must receive this link dependency. Keep the
+// target-independent Swift sources unchanged; this is a platform link contract.
+let embeddedWebRTCLinkerSettings: [LinkerSetting] = embeddedEnabled
+    ? [.linkedLibrary("swiftUnicodeDataTables")]
+    : []
+
+// Dependencies for the single secure-transport module. STUN, ICE, SCTP,
+// DataChannel, RTP, RTCP, and SRTP are implementation directories within
+// `WebRTC`; they are not separately consumable Swift modules.
+//
+// The DTLS facade (`TLS`) and the portable protocol implementation dual-build
+// under `P2P_CORE_EMBEDDED`. Certificate generation, parsing, and fingerprinting
+// use the same Pure Swift path on Native, WASI, and Embedded. Native, WASI, and
+// Embedded schedule both DTLS flight and SCTP
+// retransmission deadlines through an injected `P2PCoreCrypto.AsyncTimer`.
+//
+// `WebRTC` Embedded-compiles end to end: a full
+// `P2P_CORE_EMBEDDED=1 swift build --target WebRTC -c release`
+// builds the same module. The facade exposes a `[UInt8]` public surface (with host-only
+// `Data` convenience overloads gated by `canImport(Foundation)`, so swift-libp2p's
+// `Data`-based consumers are unaffected); Foundation / Logging are optional imports, the fingerprint SHA-256 is
+// routed through `P2PCrypto`'s `DefaultSHA256`, the retransmission driver
+// uses the `AsyncTimer` seam, and the public facade's throwing entry points use
+// typed throws (`throws(WebRTCError)`). Host builds retain underlying error
+// descriptions where available; Embedded builds use stable operation context
+// without reflection. See CONTEXT.md.
+let webRTCDependencies: [Target.Dependency] = {
+    var d: [Target.Dependency] = [
+        // The DTLS handshake/record engine is exposed through
+        // swift-tls-sessions' Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
+        // Its DTLS 1.2 mechanism is owned by swift-ssl.
+        .product(name: "TLS", package: "swift-tls-sessions"),
+        // Time + deadline-sleep seam for the retransmission driver (dual-build).
+        .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+        // Concrete AES-CTR and HMAC-SHA1 provider used by SRTPCore.
+        .product(name: "P2PCrypto", package: "swift-p2p-core"),
+        // Externally-provisioned identity parsing and portable fingerprinting
+        // are required by WASI/Embedded and remain available on hosts.
+        .product(name: "P2PCoreBytes", package: "swift-ssl"),
+        .product(name: "P2PCoreDER", package: "swift-p2p-core"),
+    ]
+    d += [
+        .product(
+            name: "Logging",
+            package: "swift-log",
+            condition: .when(platforms: loggingPlatforms)
+        ),
+    ]
     return d
 }()
 
-// The Embedded-clean crypto seam providers each caller-locked adapter needs. On
-// host the `MessageAuthenticationCode` / `RandomSource` seams resolve to the
-// swift-crypto–backed `P2PCrypto` providers; under Embedded they
-// resolve to the BoringSSL-backed `P2PCrypto` providers. `P2PCoreCrypto`
-// (the seam protocols) is needed in both modes. swift-crypto is still pulled in
-// on host for the historical `Data` wrappers' direct use; it is dropped under
-// Embedded.
-func adapterSeamDependencies(extra: [Target.Dependency] = []) -> [Target.Dependency] {
-    var d: [Target.Dependency] = [
-        .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
-    ]
-    if embeddedEnabled {
-        d += [.product(name: "P2PCrypto", package: "swift-p2p-crypto")]
-    } else {
-        d += [
-            .product(name: "P2PCrypto", package: "swift-p2p-crypto"),
-            .product(name: "Crypto", package: "swift-crypto"),
-        ]
-    }
-    return d + extra
-}
-
-let sctpAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["SCTPWireCore"])
-let stunAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["STUNWireCore"])
-let iceAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["STUNCore", "ICELiteCore"])
-let dataChannelAdapterDependencies: [Target.Dependency] = adapterSeamDependencies(extra: ["SCTPCore", "DataChannelCore"])
-
 let packageDependencies: [Package.Dependency] = {
     var d: [Package.Dependency] = [
-        // The DTLS handshake/record engine is driven through swift-tls's Tier-1
-        // `TLS` facade (`DTLSClient`/`DTLSServer`).
-        .package(url: "https://github.com/1amageek/swift-tls.git", from: "1.3.2"),
-        .package(url: "https://github.com/1amageek/swift-p2p-core.git", from: "0.2.1"),
-        // Provides `P2PCrypto.BoringSHA256` for the Embedded DTLS-SRTP
-        // fingerprint (fail-closed on both builds).
-        .package(url: "https://github.com/1amageek/swift-p2p-crypto.git", from: "0.1.1"),
+        // The DTLS handshake/record engine is exposed through
+        // swift-tls-sessions' Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
+        // Its DTLS 1.2 mechanism is owned by swift-ssl/SSLDTLS.
+        .package(name: "swift-tls-sessions", path: "../swift-tls"),
+        .package(name: "swift-p2p-core", path: "../swift-p2p-core"),
+        .package(name: "swift-ssl", path: "../../swift-ssl"),
+        // `swift-p2p-core` also owns the P2PCrypto protocol adapter module.
     ]
-    if !embeddedEnabled {
-        d += [
-            .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),
-            // WebRTC owns its DTLS-SRTP leaf certificate (self-signed ECDSA P-256)
-            // and its SHA-256 fingerprint locally, because the `TLS` facade takes a
-            // `TLSIdentity` (DER + raw key) rather than generating certificates.
-            .package(url: "https://github.com/apple/swift-certificates.git", from: "1.17.1"),
-            .package(url: "https://github.com/apple/swift-asn1.git", from: "1.5.1"),
-            .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
-        ]
-    }
+    d += [
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
+    ]
     return d
 }()
 
@@ -125,119 +114,157 @@ let package = Package(
     ],
     products: [
         .library(name: "WebRTC", targets: ["WebRTC"]),
-        .library(name: "STUNWireCore", targets: ["STUNWireCore"]),
-        .library(name: "STUNCore", targets: ["STUNCore"]),
-        .library(name: "ICELiteCore", targets: ["ICELiteCore"]),
-        .library(name: "ICELite", targets: ["ICELite"]),
-        .library(name: "SCTPWireCore", targets: ["SCTPWireCore"]),
-        .library(name: "SCTPCore", targets: ["SCTPCore"]),
-        .library(name: "DataChannelCore", targets: ["DataChannelCore"]),
-        .library(name: "DataChannel", targets: ["DataChannel"]),
+        .library(name: "WebRTCMedia", targets: ["WebRTCMedia"]),
     ],
     dependencies: packageDependencies,
     targets: [
-        // ---- Embedded-clean STUN wire codec (dual-build: host + Embedded) ----
-        .target(
-            name: "STUNWireCore",
-            dependencies: [
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
-            ],
-            path: "Sources/STUNWireCore",
-            swiftSettings: coreSettings
-        ),
-        // ---- Caller-locked STUN adapter (dual-build: host + Embedded) ----
-        // Keeps the Data-based STUN API; routes MESSAGE-INTEGRITY HMAC-SHA1 and
-        // CSPRNG through the seams (host: swift-crypto; Embedded: BoringSSL).
-        .target(
-            name: "STUNCore",
-            dependencies: stunAdapterDependencies,
-            path: "Sources/STUNCore",
-            swiftSettings: coreSettings
-        ),
-        // ---- Embedded-clean ICE Lite state machine (dual-build: host + Embedded) ----
-        .target(
-            name: "ICELiteCore",
-            dependencies: ["STUNWireCore"],
-            path: "Sources/ICELiteCore",
-            swiftSettings: coreSettings
-        ),
-        // ---- Caller-locked ICE Lite adapter (dual-build: host + Embedded) ----
-        // Holds the Embedded-clean `ICELiteStateMachine` behind a `FacadeLock`;
-        // the wire decode + crypto (FINGERPRINT / MESSAGE-INTEGRITY) route through
-        // STUNCore's seams. Gated `Data`/`Foundation` boundary only.
-        .target(
-            name: "ICELite",
-            dependencies: iceAdapterDependencies,
-            path: "Sources/ICELite",
-            swiftSettings: coreSettings
-        ),
-        // ---- Embedded-clean SCTP wire codec (dual-build: host + Embedded) ----
-        .target(
-            name: "SCTPWireCore",
-            dependencies: [
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
-                .product(name: "P2PCoreCrypto", package: "swift-p2p-core"),
-            ],
-            path: "Sources/SCTPWireCore",
-            swiftSettings: coreSettings
-        ),
-        // ---- Caller-locked SCTP association adapter (dual-build: host + Embedded) ----
-        // Holds the Embedded-clean value-type `SCTPAssociationEngine` behind a
-        // `FacadeLock`. Host: swift-crypto cookie HMAC + `FoundationEssentialsRandom` +
-        // `ContinuousClock` boundary. Embedded: `BoringHMACSHA256` + `BoringRandom`
-        // + platform monotonic clock; the `Data`/`ContinuousClock` wrappers are gated out.
-        .target(
-            name: "SCTPCore",
-            dependencies: sctpAdapterDependencies,
-            path: "Sources/SCTPCore",
-            swiftSettings: coreSettings
-        ),
-        // ---- Embedded-clean DCEP wire codec (dual-build: host + Embedded) ----
-        .target(
-            name: "DataChannelCore",
-            dependencies: [
-                .product(name: "P2PCoreBytes", package: "swift-p2p-core"),
-            ],
-            path: "Sources/DataChannelCore",
-            swiftSettings: coreSettings
-        ),
-        // ---- Caller-locked DCEP / data-channel adapter (dual-build: host + Embedded) ----
-        // Holds the Embedded-clean `DataChannelManagerState` value type behind a
-        // `FacadeLock`, driving DataChannelCore's DCEP codec. Gated `Data`/`Foundation`
-        // boundary only.
-        .target(
-            name: "DataChannel",
-            dependencies: dataChannelAdapterDependencies,
-            path: "Sources/DataChannel",
-            swiftSettings: coreSettings
-        ),
-        // ---- Tier-1 facade: WebRTCEndpoint/Connection/Listener/DataChannel ----
-        // Dual-build orchestrator. Host: `Mutex` / `ContinuousClock` / swift-log /
-        // swift-certificates. Embedded: those host-only deps are dropped (gated
-        // `#if !hasFeature(Embedded)`); the lock becomes an `Atomic` spinlock, the
-        // retransmission timer the platform-clock-backed `WebRTCEmbeddedTimer`,
-        // the logger a no-op shim, and the DTLS-SRTP fingerprint a `BoringSHA256`.
-        // The externally-provisioned-identity path replaces X.509 generation.
+        // Public secure WebRTC transport. Connectivity, SCTP/DataChannel,
+        // RTP/RTCP, and SRTP implementations are source subdirectories of this
+        // single module rather than separately consumable Swift libraries.
         .target(
             name: "WebRTC",
-            dependencies: webrtcFacadeDependencies,
+            dependencies: webRTCDependencies,
             path: "Sources/WebRTC",
-            exclude: ["CONTEXT.md"],
+            exclude: [
+                "CONTEXT.md",
+                "Transport/RTP/CONTEXT.md",
+                "Transport/SRTP/CONTEXT.md",
+            ],
+            swiftSettings: coreSettings,
+            linkerSettings: embeddedWebRTCLinkerSettings
+        ),
+        // Optional H.264 composition module. It consumes package-scoped RTP
+        // primitives from WebRTC and preserves borrowed ranges and packet owners.
+        .target(
+            name: "WebRTCMedia",
+            dependencies: [
+                "WebRTC",
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
+            ],
+            path: "Sources/WebRTCMedia",
+            exclude: [
+                "CONTEXT.md",
+                "H264/ByteStream/CONTEXT.md",
+                "H264/RTP/CONTEXT.md",
+                "H264/RTP/Payload/CONTEXT.md",
+                "H264/RTP/Receiver/CONTEXT.md",
+                "H264/RTP/Sender/CONTEXT.md",
+            ],
             swiftSettings: coreSettings
         ),
+        // Test-only executable used to prove that the complete portable path
+        // links and runs without XCTest/Swift Testing. Embedded WASM does not
+        // provide the Testing module, so a Tests-contained executable is the
+        // runtime gate for external certificate provisioning, mutual DTLS,
+        // use_srtp/exporter setup, typed transport failure, timer cancellation,
+        // and the authenticated H.264 sender-to-receiver path. It is
+        // intentionally not a library product and does not exercise real UDP.
+        .executableTarget(
+            name: "WebRTCPlatformIntegrationProbe",
+            dependencies: [
+                "WebRTC",
+                "WebRTCMedia",
+                .product(name: "P2PCoreDER", package: "swift-p2p-core"),
+            ],
+            path: "Tests/WebRTCPlatformIntegrationProbe",
+            swiftSettings: platformProbeSettings
+        ),
         // Tests
-        .testTarget(name: "STUNCoreTests", dependencies: ["STUNCore"], path: "Tests/STUNCoreTests"),
-        .testTarget(name: "ICELiteTests", dependencies: ["ICELite", "STUNCore"], path: "Tests/ICELiteTests"),
-        .testTarget(name: "ICELiteCoreTests", dependencies: ["ICELiteCore"], path: "Tests/ICELiteCoreTests"),
-        .testTarget(name: "SCTPCoreTests", dependencies: ["SCTPCore"], path: "Tests/SCTPCoreTests"),
-        .testTarget(name: "DataChannelTests", dependencies: ["DataChannel", "SCTPCore"], path: "Tests/DataChannelTests"),
-        .testTarget(name: "WebRTCTests", dependencies: ["WebRTC"], path: "Tests/WebRTCTests"),
+        .testTarget(
+            name: "RTPWireCoreTests",
+            dependencies: ["WebRTC"],
+            path: "Tests/RTPWireCoreTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "H264ByteStreamCoreTests",
+            dependencies: ["WebRTCMedia"],
+            path: "Tests/H264ByteStreamCoreTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "H264RTPPayloadCoreTests",
+            dependencies: ["WebRTCMedia"],
+            path: "Tests/H264RTPPayloadCoreTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "H264RTPTests",
+            dependencies: ["WebRTCMedia", "WebRTC"],
+            path: "Tests/H264RTPTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "H264RTPSenderTests",
+            dependencies: ["WebRTCMedia", "WebRTC"],
+            path: "Tests/H264RTPSenderTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "H264RTPReceiverTests",
+            dependencies: [
+                "WebRTCMedia",
+                "WebRTC",
+            ],
+            path: "Tests/H264RTPReceiverTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "SRTPCoreTests",
+            dependencies: [
+                "WebRTC",
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+            ],
+            path: "Tests/SRTPCoreTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(name: "STUNCoreTests", dependencies: ["WebRTC"], path: "Tests/STUNCoreTests"),
+        .testTarget(name: "ICELiteTests", dependencies: ["WebRTC"], path: "Tests/ICELiteTests"),
+        .testTarget(name: "ICELiteCoreTests", dependencies: ["WebRTC"], path: "Tests/ICELiteCoreTests"),
+        .testTarget(
+            name: "SCTPCoreTests",
+            dependencies: [
+                "WebRTC",
+                .product(name: "P2PCoreBytes", package: "swift-ssl"),
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+            ],
+            path: "Tests/SCTPCoreTests"
+        ),
+        .testTarget(
+            name: "DataChannelTests",
+            dependencies: ["WebRTC"],
+            path: "Tests/DataChannelTests"
+        ),
+        .testTarget(
+            name: "WebRTCTests",
+            dependencies: [
+                "WebRTC",
+                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
+                .product(name: "P2PCoreDER", package: "swift-p2p-core"),
+            ],
+            path: "Tests/WebRTCTests"
+        ),
+        .testTarget(
+            name: "RTPWireCorePerformanceTests",
+            dependencies: ["WebRTC"],
+            path: "Tests/RTPWireCorePerformanceTests",
+            swiftSettings: coreSettings
+        ),
+        .testTarget(
+            name: "H264RTPPayloadCorePerformanceTests",
+            dependencies: ["WebRTCMedia"],
+            path: "Tests/H264RTPPayloadCorePerformanceTests",
+            swiftSettings: coreSettings
+        ),
         // Performance Tests
         .testTarget(
             name: "PerformanceTests",
-            dependencies: ["STUNCore", "ICELite", "SCTPCore", "DataChannel", "WebRTC"],
-            path: "Tests/PerformanceTests"
+            dependencies: ["WebRTC"],
+            path: "Tests/PerformanceTests",
+            swiftSettings: coreSettings
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

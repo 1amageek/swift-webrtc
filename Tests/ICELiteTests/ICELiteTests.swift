@@ -2,8 +2,7 @@
 
 import Testing
 import Foundation
-@testable import ICELite
-@testable import STUNCore
+@testable import WebRTC
 
 @Suite("ICE Lite Tests")
 struct ICELiteTests {

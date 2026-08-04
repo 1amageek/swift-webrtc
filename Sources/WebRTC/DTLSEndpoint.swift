@@ -32,11 +32,25 @@ enum DTLSEndpoint: Sendable {
     static func make(
         certificate: WebRTCCertificate,
         isClient: Bool,
-        requireClientCertificate: Bool
+        requireClientCertificate: Bool,
+        mediaConfiguration: WebRTCMediaConfiguration? = nil
     ) throws(TLSError) -> DTLSEndpoint {
+        let srtpConfiguration: DTLSSRTPConfiguration?
+        if let mediaConfiguration {
+            switch mediaConfiguration.protectionProfile {
+            case .aes128CMHMACSHA180:
+                srtpConfiguration = try DTLSSRTPConfiguration(
+                    protectionProfiles: [.aes128CMHMACSHA180]
+                )
+            }
+        } else {
+            srtpConfiguration = nil
+        }
+
         let configuration = DTLSConfiguration(
             identity: certificate.tlsIdentity,
-            requireClientCertificate: requireClientCertificate
+            requireClientCertificate: requireClientCertificate,
+            srtp: srtpConfiguration
         )
         if isClient {
             return .client(try DTLSClient(configuration: configuration))
@@ -75,11 +89,31 @@ enum DTLSEndpoint: Sendable {
         }
     }
 
-    /// Datagrams to retransmit on a flight timeout.
-    func handleTimeout() throws(TLSError) -> [[UInt8]] {
+    /// Timer token for the current DTLS flight.
+    var retransmissionState: DTLSRetransmissionState {
         switch self {
-        case .client(let c): return try c.handleTimeout()
-        case .server(let s): return try s.handleTimeout()
+        case .client(let client): return client.retransmissionState
+        case .server(let server): return server.retransmissionState
+        }
+    }
+
+    /// Handles a flight timeout only if `generation` still owns the timer.
+    func handleTimeout(
+        generation: UInt64
+    ) throws(TLSError) -> DTLSTimeoutResult {
+        switch self {
+        case .client(let client):
+            return try client.handleTimeout(generation: generation)
+        case .server(let server):
+            return try server.handleTimeout(generation: generation)
+        }
+    }
+
+    /// Stops DTLS state and returns a close_notify datagram when one can be encoded.
+    func close() throws(TLSError) -> [UInt8] {
+        switch self {
+        case .client(let client): return try client.close()
+        case .server(let server): return try server.close()
         }
     }
 
@@ -99,6 +133,20 @@ enum DTLSEndpoint: Sendable {
         switch self {
         case .client(let c): return c.remoteCertificateDER
         case .server(let s): return s.remoteCertificateDER
+        }
+    }
+
+    /// Direction-safe SRTP master key and salt material.
+    ///
+    /// The DTLS facade permits this only after a completed `use_srtp`
+    /// negotiation. `WebRTCConnection` additionally gates access on peer
+    /// fingerprint authentication before constructing any media context.
+    func srtpKeyingMaterial() throws(TLSError) -> DTLSSRTPKeyingMaterial {
+        switch self {
+        case .client(let client):
+            return try client.srtpKeyingMaterial()
+        case .server(let server):
+            return try server.srtpKeyingMaterial()
         }
     }
 }

@@ -2,7 +2,6 @@
 
 import Testing
 @testable import WebRTC
-
 @Suite("CertificateFingerprint Tests")
 struct CertificateFingerprintTests {
 

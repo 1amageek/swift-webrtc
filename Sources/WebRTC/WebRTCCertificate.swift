@@ -11,16 +11,50 @@
 /// certificate, `digitalSignature` key usage, not a CA, valid for one year.
 
 import TLS
-#if !hasFeature(Embedded)
-import Foundation
-import Crypto
-@preconcurrency import X509
-import SwiftASN1
-#else
 import P2PCoreBytes
 import P2PCoreCrypto
 import P2PCrypto
+import P2PCoreDER
+#if canImport(Foundation)
+import Foundation
 #endif
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(WASILibc)
+import WASILibc
+#endif
+
+/// Supplies Unix wall-clock seconds for certificate validity windows.
+///
+/// Certificate generation is a provisioning operation, not a packet-path
+/// operation. The clock is therefore injectable so Embedded deployments can
+/// provide their board or RTC implementation without making the protocol
+/// facade depend on a platform-specific time API.
+public protocol WebRTCCertificateClock: Sendable {
+    func nowUnixSeconds() -> Int64?
+}
+
+/// The system wall clock when the target provides a C time service.
+///
+/// Targets without a wall-clock implementation return `nil`; callers then get
+/// the typed `.clockUnavailable` failure instead of a certificate with a fake
+/// validity interval. Embedded applications can pass their own clock to
+/// `generateSelfSigned(clock:)`.
+public struct SystemWebRTCCertificateClock: WebRTCCertificateClock {
+    public init() {}
+
+    public func nowUnixSeconds() -> Int64? {
+        #if canImport(Darwin) || canImport(Glibc) || canImport(Musl) || canImport(WASILibc)
+        return Int64(time(nil))
+        #else
+        return nil
+        #endif
+    }
+}
 
 /// Fingerprint hash algorithm. WebRTC mandates SHA-256 in current deployments.
 public enum FingerprintAlgorithm: String, Sendable, Hashable {
@@ -31,9 +65,9 @@ public enum FingerprintAlgorithm: String, Sendable, Hashable {
 /// multiaddr component.
 ///
 /// The public surface is `[UInt8]`-based so it is Embedded-clean (Foundation
-/// `Data` is unavailable under Embedded). Host-only `Data` convenience overloads
-/// (gated `#if !hasFeature(Embedded)`) preserve the historical ergonomics for
-/// callers that work in `Data`.
+/// `Data` is unavailable under Embedded). Non-Embedded `Data` convenience
+/// overloads preserve the historical ergonomics for callers that work in
+/// `Data`.
 public struct CertificateFingerprint: Sendable, Hashable, Equatable {
     /// The hash algorithm used.
     public let algorithm: FingerprintAlgorithm
@@ -49,18 +83,12 @@ public struct CertificateFingerprint: Sendable, Hashable, Equatable {
     /// Compute a fingerprint from a DER-encoded X.509 certificate by hashing it.
     ///
     /// The SHA-256 is routed through a build-gated seam so DTLS-SRTP fingerprint
-    /// verification (RFC 8122) is byte-identical and fail-closed on BOTH host and
-    /// Embedded: host uses swift-crypto's `SHA256`, Embedded uses the BoringSSL
-    /// `BoringSHA256`. There is no platform on which fingerprint computation
-    /// silently degrades.
+    /// verification (RFC 8122) is byte-identical and fail-closed on every
+    /// supported platform through `P2PCrypto.DefaultSHA256`. There is no
+    /// platform on which fingerprint computation silently degrades.
     public static func fromDER(_ data: [UInt8]) -> CertificateFingerprint {
-        #if !hasFeature(Embedded)
-        let hash = SHA256.hash(data: data)
+        let hash = DefaultSHA256.hash(data.span)
         return CertificateFingerprint(algorithm: .sha256, bytes: [UInt8](hash))
-        #else
-        let hash = BoringSHA256.hash(data.span)
-        return CertificateFingerprint(algorithm: .sha256, bytes: [UInt8](hash))
-        #endif
     }
 
     /// Create from an existing SHA-256 digest (e.g. extracted from a multihash
@@ -153,19 +181,19 @@ public struct CertificateFingerprint: Sendable, Hashable, Equatable {
         return s
     }
 
-    #if !hasFeature(Embedded)
-    /// Host-only `Data` convenience initializer.
+    #if canImport(Foundation)
+    /// Foundation `Data` convenience initializer.
     public init(algorithm: FingerprintAlgorithm, bytes: Data) {
         self.init(algorithm: algorithm, bytes: [UInt8](bytes))
     }
 
-    /// Host-only `Data` convenience: compute a fingerprint from a DER-encoded
+    /// Non-Embedded `Data` convenience: compute a fingerprint from a DER-encoded
     /// X.509 certificate. Wraps the `[UInt8]` core.
     public static func fromDER(_ data: Data) -> CertificateFingerprint {
         fromDER([UInt8](data))
     }
 
-    /// Host-only `Data` convenience: wrap an existing SHA-256 digest without
+    /// Non-Embedded `Data` convenience: wrap an existing SHA-256 digest without
     /// re-hashing. Wraps the `[UInt8]` core.
     public static func fromDigest(_ digest: Data) -> CertificateFingerprint {
         fromDigest([UInt8](digest))
@@ -176,16 +204,14 @@ public struct CertificateFingerprint: Sendable, Hashable, Equatable {
 /// A WebRTC DTLS certificate: an ECDSA P-256 leaf certificate, its private key,
 /// and the SHA-256 fingerprint of the DER encoding.
 ///
-/// ## Host vs Embedded
+/// ## Locally generated vs externally provisioned identity
 ///
-/// On host, the certificate can be self-signed locally (`generateSelfSigned`)
-/// using swift-certificates / swift-asn1, and the typed `privateKey`
-/// (`P256.Signing.PrivateKey`) is exposed for callers that want it. Under
-/// Embedded, X.509 generation is unavailable: the embedder MUST supply the DER
-/// certificate and the raw P-256 private-key scalar externally via
-/// `init(derEncoded:rawPrivateKey:)`. There is no silent fallback — neither build
-/// fabricates an identity it was not given. The DTLS facade is fed the raw key
-/// scalar + DER chain via `tlsIdentity` identically on both builds.
+    /// On every supported target, the certificate can be self-signed locally
+    /// (`generateSelfSigned`) using the shared Pure Swift DER and P-256 backend. The
+    /// same constructor and key representation are used on Native, WASI, and
+/// Embedded; there is no host-only certificate generator or silent fallback.
+/// The DTLS facade is fed the raw key scalar + DER chain via `tlsIdentity` on
+/// every build.
 public struct WebRTCCertificate: Sendable {
     /// The DER-encoded X.509 leaf certificate.
     public let derEncoded: [UInt8]
@@ -197,98 +223,210 @@ public struct WebRTCCertificate: Sendable {
     /// SHA-256 fingerprint of `derEncoded`.
     public let fingerprint: CertificateFingerprint
 
-    #if !hasFeature(Embedded)
-    /// The ECDSA P-256 signing private key (host-only typed view).
-    public let privateKey: P256.Signing.PrivateKey
-
-    /// Wrap an externally-generated DER certificate and its typed private key.
-    public init(derEncoded: [UInt8], privateKey: P256.Signing.PrivateKey) throws {
-        // Validate the DER parses as an X.509 certificate (fail-closed on garbage).
-        _ = try X509.Certificate(derEncoded: derEncoded)
-        self.derEncoded = derEncoded
-        self.privateKey = privateKey
-        self.rawPrivateKey = [UInt8](privateKey.rawRepresentation)
-        self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
-    }
-
-    /// Host-only `Data` convenience: wrap a DER certificate and typed private key.
-    public init(derEncoded: Data, privateKey: P256.Signing.PrivateKey) throws {
-        try self.init(derEncoded: [UInt8](derEncoded), privateKey: privateKey)
-    }
-
     /// Generate a self-signed ECDSA P-256 certificate (WebRTC convention).
-    ///
-    /// Host-only: self-signed X.509 generation needs swift-certificates /
-    /// swift-asn1, which are unavailable under Embedded. Under Embedded use
-    /// `init(derEncoded:rawPrivateKey:)` with an externally-provisioned identity.
-    public static func generateSelfSigned(commonName: String = "webrtc") throws -> WebRTCCertificate {
-        let privateKey = P256.Signing.PrivateKey()
-
-        let subject = try DistinguishedName {
-            CommonName(commonName)
+    /// The certificate builder is Pure Swift and is available on every target.
+    public static func generateSelfSigned<Clock: WebRTCCertificateClock>(
+        clock: Clock = SystemWebRTCCertificateClock()
+    ) throws(WebRTCCertificateError) -> WebRTCCertificate {
+        guard let now = clock.nowUnixSeconds() else {
+            throw .clockUnavailable
         }
-
-        let now = Date()
-        let certificate = try X509.Certificate(
-            version: .v3,
-            serialNumber: Certificate.SerialNumber(),
-            publicKey: .init(privateKey.publicKey),
-            notValidBefore: now,
-            notValidAfter: now.addingTimeInterval(365 * 24 * 60 * 60),
-            issuer: subject,
-            subject: subject,
-            signatureAlgorithm: .ecdsaWithSHA256,
-            extensions: Certificate.Extensions {
-                Critical(BasicConstraints.notCertificateAuthority)
-                Critical(KeyUsage(digitalSignature: true))
-            },
-            issuerPrivateKey: .init(privateKey)
+        let signingKey: DefaultCryptoProvider.P256Signature.SigningKey
+        do {
+            signingKey = try DefaultCryptoProvider.P256Signature.generateSigningKey()
+        } catch {
+            throw .generationFailed
+        }
+        let publicPoint = DefaultCryptoProvider.P256Signature.rawRepresentation(
+            of: DefaultCryptoProvider.P256Signature.verifyingKey(for: signingKey)
         )
-
-        var serializer = DER.Serializer()
-        try certificate.serialize(into: &serializer)
-
-        return try WebRTCCertificate(
-            derEncoded: serializer.serializedBytes,
-            privateKey: privateKey
+        let spki: [UInt8]
+        do {
+            spki = try SubjectPublicKeyInfoDER.encodeP256(uncompressedPoint65: publicPoint)
+        } catch {
+            throw .generationFailed
+        }
+        let serial = DefaultCryptoProvider.random.randomBytes(16).map { $0 & 0x7F }
+        let certificate: [UInt8]
+        do {
+            certificate = try Self.buildSelfSignedCertificate(
+                spki: spki,
+                serial: serial,
+                notBefore: now - 60,
+                notAfter: now + 365 * 24 * 60 * 60,
+                signingKey: signingKey
+            )
+        } catch {
+            throw .generationFailed
+        }
+        return try self.init(
+            derEncoded: certificate,
+            rawPrivateKey: DefaultCryptoProvider.P256Signature.rawRepresentation(of: signingKey)
         )
     }
-    #endif
 
     /// Wrap an externally-provisioned DER certificate and raw P-256 key scalar.
     ///
-    /// This is the Embedded provisioning path (and is also available on host): the
-    /// embedder supplies the DER leaf and the 32-byte private-key scalar directly.
-    /// The fingerprint is computed fail-closed from the DER. No certificate or key
-    /// is fabricated — if the embedder has no identity, none is created.
+    /// This is the WASI / Embedded provisioning path (and is also available on
+    /// Native platforms): the embedder supplies the DER leaf and the 32-byte
+    /// private-key scalar directly. The fingerprint is computed from the DER. No
+    /// certificate or key is fabricated — if the embedder has no identity, none
+    /// is created.
     ///
-    /// On host this validates the DER and recovers the typed key, so it `throws`
-    /// (preserving the historical untyped-throws host API). Under Embedded there is
-    /// no X.509 / typed-key validation available to fail (and untyped `throws` is
-    /// rejected by Embedded Swift), so the Embedded variant is non-throwing — it
-    /// simply records the provisioned bytes and computes the fingerprint.
-    #if !hasFeature(Embedded)
-    public init(derEncoded: [UInt8], rawPrivateKey: [UInt8]) throws {
-        // On host, validate the DER parses as an X.509 certificate and recover the
-        // typed key (fail-closed on garbage DER or a malformed key scalar).
-        _ = try X509.Certificate(derEncoded: derEncoded)
-        self.privateKey = try P256.Signing.PrivateKey(rawRepresentation: rawPrivateKey)
-        self.derEncoded = derEncoded
-        self.rawPrivateKey = rawPrivateKey
-        self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
-    }
-    #else
-    public init(derEncoded: [UInt8], rawPrivateKey: [UInt8]) {
-        self.derEncoded = derEncoded
-        self.rawPrivateKey = rawPrivateKey
-        self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
-    }
-    #endif
+    /// On every platform this validates the X.509 envelope, extracts its
+    /// SubjectPublicKeyInfo, imports both keys, and proves that the private scalar
+    /// matches the certificate public key before accepting the credential.
+    public init(
+        derEncoded: [UInt8],
+        rawPrivateKey: [UInt8]
+    ) throws(WebRTCCertificateError) {
+        let parsed: SubjectPublicKeyInfoDER.Parsed
+        do {
+            parsed = try X509CertificateDER.subjectPublicKeyInfo(in: derEncoded)
+        } catch {
+            throw .malformedCredential
+        }
+        guard parsed.curve == .p256 else {
+            throw .malformedCredential
+        }
 
-    #if !hasFeature(Embedded)
-    /// Host-only `Data` convenience: wrap a DER certificate and raw P-256 key
-    /// scalar. Wraps the `[UInt8]` provisioning initializer.
-    public init(derEncoded: Data, rawPrivateKey: [UInt8]) throws {
+        let signingKey: DefaultCryptoProvider.P256Signature.SigningKey
+        let verifyingKey: DefaultCryptoProvider.P256Signature.VerifyingKey
+        do {
+            signingKey = try DefaultCryptoProvider.P256Signature.signingKey(
+                rawRepresentation: rawPrivateKey.span
+            )
+            verifyingKey = try DefaultCryptoProvider.P256Signature.verifyingKey(
+                rawRepresentation: parsed.keyBytes.span
+            )
+        } catch {
+            throw .malformedPrivateKey
+        }
+
+        // A signature round trip proves both that the scalar is usable and that
+        // it corresponds to the SPKI without calling a derivation API that may
+        // assume an already-validated scalar. This one-time construction cost is
+        // outside the packet path.
+        let challenge: [UInt8] = [
+            0x57, 0x65, 0x62, 0x52, 0x54, 0x43, 0x20, 0x69,
+            0x64, 0x65, 0x6E, 0x74, 0x69, 0x74, 0x79,
+        ]
+        let signature: [UInt8]
+        do {
+            signature = try DefaultCryptoProvider.P256Signature.sign(
+                challenge.span,
+                with: signingKey
+            )
+        } catch {
+            throw .malformedPrivateKey
+        }
+        guard DefaultCryptoProvider.P256Signature.isValid(
+            signature: signature.span,
+            for: challenge.span,
+            with: verifyingKey
+        ) else {
+            throw .credentialKeyMismatch
+        }
+
+        self.derEncoded = derEncoded
+        self.rawPrivateKey = rawPrivateKey
+        self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
+    }
+
+    private static func buildSelfSignedCertificate(
+        spki: [UInt8],
+        serial: [UInt8],
+        notBefore: Int64,
+        notAfter: Int64,
+        signingKey: DefaultCryptoProvider.P256Signature.SigningKey
+    ) throws(CryptoError) -> [UInt8] {
+        let signatureAlgorithm = DERWriter.sequence([DERWriter.encodeOID(.ecdsaSHA256)])
+        let version = DERWriter.encode(.context0, DERWriter.encodeInteger([0x02]))
+        let basicConstraintsOID = DERWriter.encodeOID(ObjectID([0x55, 0x1D, 0x13]))
+        let keyUsageOID = DERWriter.encodeOID(ObjectID([0x55, 0x1D, 0x0F]))
+        let basicConstraints = DERWriter.sequence([
+            basicConstraintsOID,
+            DERWriter.encodeBoolean(true),
+            DERWriter.encodeOctetString(DERWriter.sequence([])),
+        ])
+        let digitalSignature = DERWriter.encode(.bitString, [0x07, 0x80])
+        let keyUsage = DERWriter.sequence([
+            keyUsageOID,
+            DERWriter.encodeBoolean(true),
+            DERWriter.encodeOctetString(digitalSignature),
+        ])
+        let extensions = DERWriter.encode(
+            .context3,
+            DERWriter.sequence([basicConstraints, keyUsage])
+        )
+        let validity = DERWriter.sequence([
+            Self.utcTime(notBefore),
+            Self.utcTime(notAfter),
+        ])
+        let tbs = DERWriter.sequence([
+            version,
+            DERWriter.encodeInteger(serial),
+            signatureAlgorithm,
+            DERWriter.sequence([]),
+            validity,
+            DERWriter.sequence([]),
+            spki,
+            extensions,
+        ])
+        let signature = try DefaultCryptoProvider.P256Signature.sign(tbs.span, with: signingKey)
+        return DERWriter.sequence([
+            tbs,
+            signatureAlgorithm,
+            DERWriter.encodeBitString(signature),
+        ])
+    }
+
+    private static func utcTime(_ epochSeconds: Int64) -> [UInt8] {
+        // DERTime is intentionally internal to the shared codec; this fixed
+        // Gregorian conversion keeps certificate creation target-independent.
+        let days = epochSeconds / 86_400
+        let seconds = epochSeconds % 86_400
+        let civil = Self.civilDate(daysSince1970: days)
+        let hour = seconds / 3_600
+        let minute = (seconds % 3_600) / 60
+        let second = seconds % 60
+        var content: [UInt8] = []
+        content.reserveCapacity(13)
+        Self.appendTwoDigits(civil.year % 100, to: &content)
+        Self.appendTwoDigits(civil.month, to: &content)
+        Self.appendTwoDigits(civil.day, to: &content)
+        Self.appendTwoDigits(hour, to: &content)
+        Self.appendTwoDigits(minute, to: &content)
+        Self.appendTwoDigits(second, to: &content)
+        content.append(contentsOf: [0x5A])
+        return DERWriter.encode(.utcTime, content)
+    }
+
+    private static func appendTwoDigits(_ value: Int64, to output: inout [UInt8]) {
+        let clamped = value < 0 ? 0 : value % 100
+        output.append(UInt8(0x30 + (clamped / 10)))
+        output.append(UInt8(0x30 + (clamped % 10)))
+    }
+
+    private static func civilDate(daysSince1970: Int64) -> (year: Int64, month: Int64, day: Int64) {
+        let z = daysSince1970 + 719_468
+        let era = (z >= 0 ? z : z - 146_096) / 146_097
+        let doe = z - era * 146_097
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365
+        let year = yoe + era * 400
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        let mp = (5 * doy + 2) / 153
+        let day = doy - (153 * mp + 2) / 5 + 1
+        let month = mp + (mp < 10 ? 3 : -9)
+        return (year + (month <= 2 ? 1 : 0), month, day)
+    }
+
+    #if canImport(Foundation)
+    /// Foundation `Data` convenience for an externally provisioned identity.
+    public init(
+        derEncoded: Data,
+        rawPrivateKey: [UInt8]
+    ) throws(WebRTCCertificateError) {
         try self.init(derEncoded: [UInt8](derEncoded), rawPrivateKey: rawPrivateKey)
     }
     #endif

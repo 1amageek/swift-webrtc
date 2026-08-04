@@ -4,8 +4,7 @@
 
 import Testing
 import Foundation
-@testable import STUNCore
-
+@testable import WebRTC
 @Suite("STUN Benchmarks")
 struct STUNBenchmarks {
 

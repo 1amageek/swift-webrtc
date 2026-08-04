@@ -3,8 +3,7 @@
 
 import Testing
 import Foundation
-@testable import SCTPCore
-
+@testable import WebRTC
 @Suite("SCTP Association Tests")
 struct SCTPAssociationTests {
 
@@ -55,7 +54,7 @@ struct SCTPAssociationTests {
         }
     }
 
-    @Test("Packet carrying INIT must use verification tag 0")
+    @Test("Out-of-the-blue INIT with a nonzero tag gets a reflected ABORT")
     func initPacketRequiresZeroTag() throws {
         let server = SCTPAssociation()
         let initChunk = SCTPInitChunk(initiateTag: 0x1234, initialTSN: 1)
@@ -66,9 +65,14 @@ struct SCTPAssociationTests {
             chunks: [initChunk.toChunk()]
         )
 
-        #expect(throws: SCTPError.self) {
-            _ = try server.processPacket(packet)
-        }
+        let (responses, received) = try server.processPacket(packet)
+        let response = try #require(responses.first)
+        let abort = try #require(response.chunks.first)
+        #expect(received.isEmpty)
+        #expect(response.verificationTag == 0xDEADBEEF)
+        #expect(abort.chunkType == SCTPChunkType.abort.rawValue)
+        #expect(abort.flags & 0x01 == 0x01)
+        #expect(server.state == .closed)
     }
 
     @Test("ABORT closes the association and surfaces an error")
@@ -85,7 +89,7 @@ struct SCTPAssociationTests {
             sourcePort: valid.sourcePort,
             destinationPort: valid.destinationPort,
             verificationTag: valid.verificationTag,
-            chunks: [SCTPChunk(chunkType: SCTPChunkType.abort.rawValue, value: Data())]
+            chunks: [try SCTPChunk(chunkType: SCTPChunkType.abort.rawValue, value: Data())]
         )
 
         #expect(throws: SCTPError.self) {
@@ -143,7 +147,7 @@ struct SCTPAssociationTests {
             sourcePort: valid.sourcePort,
             destinationPort: valid.destinationPort,
             verificationTag: valid.verificationTag,
-            chunks: [fragment.toChunk()]
+            chunks: [try fragment.toChunk()]
         )
 
         let (responses, received) = try server.processPacket(packet)
@@ -153,7 +157,10 @@ struct SCTPAssociationTests {
             .flatMap(\.chunks)
             .first { $0.chunkType == SCTPChunkType.sack.rawValue })
         let sack = try SCTPSackChunk.decode(from: sackChunk.value)
-        #expect(sack.advertisedReceiverWindowCredit == 65535 - 1000)
+        #expect(
+            sack.advertisedReceiverWindowCredit
+                == UInt32(FragmentReassembler.defaultMaxBufferedBytes - 1000)
+        )
     }
 
     @Test("SACK acknowledgment clears the retransmission queue")
@@ -174,6 +181,108 @@ struct SCTPAssociationTests {
         #expect(!client.hasUnacknowledgedData)
     }
 
+    @Test("Out-of-the-blue SACK produces a reflected-tag ABORT")
+    func closedSackProducesReflectedAbort() throws {
+        let association = SCTPAssociation(localPort: 5000, remotePort: 6000)
+        let reflectedTag: UInt32 = 0xDEAD_BEEF
+        let sack = try SCTPChunk(
+            chunkType: SCTPChunkType.sack.rawValue,
+            value: Data()
+        )
+        let packet = SCTPPacket(
+            sourcePort: 6000,
+            destinationPort: 5000,
+            verificationTag: reflectedTag,
+            chunks: [sack]
+        )
+
+        let (responses, received) = try association.processPacket(packet)
+        let response = try #require(responses.first)
+        let abort = try #require(response.chunks.first)
+
+        #expect(responses.count == 1)
+        #expect(received.isEmpty)
+        #expect(association.state == .closed)
+        #expect(response.sourcePort == 5000)
+        #expect(response.destinationPort == 6000)
+        #expect(response.verificationTag == reflectedTag)
+        #expect(abort.chunkType == SCTPChunkType.abort.rawValue)
+        #expect(abort.flags & 0x01 == 0x01)
+    }
+
+    @Test("Out-of-the-blue packet containing ABORT and SACK is discarded")
+    func closedAbortAndSackAreDiscarded() throws {
+        let association = SCTPAssociation()
+        let abort = try SCTPChunk(
+            chunkType: SCTPChunkType.abort.rawValue,
+            value: Data()
+        )
+        let sack = try SCTPChunk(
+            chunkType: SCTPChunkType.sack.rawValue,
+            value: Data()
+        )
+        let packet = SCTPPacket(
+            sourcePort: 5000,
+            destinationPort: 5000,
+            verificationTag: 0x1234_5678,
+            chunks: [abort, sack]
+        )
+
+        let (responses, received) = try association.processPacket(packet)
+
+        #expect(responses.isEmpty)
+        #expect(received.isEmpty)
+        #expect(association.state == .closed)
+    }
+
+    @Test("COOKIE-WAIT discards malformed SACK before decoding")
+    func cookieWaitDiscardsMalformedSack() throws {
+        let association = SCTPAssociation()
+        let initPacket = association.generateInit()
+        let initChunk = try SCTPInitChunk.decode(from: initPacket.chunks[0].value)
+        let malformedSack = try SCTPChunk(
+            chunkType: SCTPChunkType.sack.rawValue,
+            value: Data()
+        )
+        let packet = SCTPPacket(
+            sourcePort: 5000,
+            destinationPort: 5000,
+            verificationTag: initChunk.initiateTag,
+            chunks: [malformedSack]
+        )
+
+        let (responses, received) = try association.processPacket(packet)
+
+        #expect(responses.isEmpty)
+        #expect(received.isEmpty)
+        #expect(association.state == .cookieWait)
+    }
+
+    @Test("ESTABLISHED processes SACK and reports malformed input")
+    func establishedRejectsMalformedSack() throws {
+        let (client, server) = try establishPair()
+        let validHeader = try server.sendData(
+            streamID: 0,
+            payloadProtocolIdentifier: 53,
+            data: Data("header".utf8)
+        )
+        let malformedSack = try SCTPChunk(
+            chunkType: SCTPChunkType.sack.rawValue,
+            value: Data()
+        )
+        let packet = SCTPPacket(
+            sourcePort: validHeader.sourcePort,
+            destinationPort: validHeader.destinationPort,
+            verificationTag: validHeader.verificationTag,
+            chunks: [malformedSack]
+        )
+
+        #expect(throws: SCTPError.self) {
+            _ = try client.processPacket(packet)
+        }
+        #expect(client.state == .established)
+    }
+
     @Test("Unknown chunk with upper bits 00 stops packet processing")
     func unknownChunkStopAction() throws {
         let (client, server) = try establishPair()
@@ -181,7 +290,7 @@ struct SCTPAssociationTests {
         // Chunk type 0x3F: upper two bits 00 → stop processing this packet.
         // The DATA chunk bundled after it must NOT be processed (no SACK).
         let valid = try client.sendData(streamID: 0, payloadProtocolIdentifier: 53, data: Data("x".utf8))
-        let unknown = SCTPChunk(chunkType: 0x3F, value: Data())
+        let unknown = try SCTPChunk(chunkType: 0x3F, value: Data())
         let packet = SCTPPacket(
             sourcePort: valid.sourcePort,
             destinationPort: valid.destinationPort,
@@ -198,10 +307,9 @@ struct SCTPAssociationTests {
     func unknownChunkSkipAction() throws {
         let (client, server) = try establishPair()
 
-        // Chunk type 0xFF (not a recognized type): upper bits 11 → skip
-        // the chunk and keep processing.
+        // Chunk type 0xFF: upper bits 11 → report, skip, and continue.
         let valid = try client.sendData(streamID: 0, payloadProtocolIdentifier: 53, data: Data("x".utf8))
-        let unknown = SCTPChunk(chunkType: 0xFF, value: Data())
+        let unknown = try SCTPChunk(chunkType: 0xFF, flags: 0xA5, value: Data([0x01]))
         let packet = SCTPPacket(
             sourcePort: valid.sourcePort,
             destinationPort: valid.destinationPort,
@@ -214,7 +322,351 @@ struct SCTPAssociationTests {
         let sackCount = responses.reduce(0) { count, packet in
             count + packet.chunks.filter { $0.chunkType == SCTPChunkType.sack.rawValue }.count
         }
+        let errors = responses.flatMap(\.chunks).filter {
+            $0.chunkType == SCTPChunkType.error.rawValue
+        }
         #expect(sackCount == 1)
+        let cause = try SCTPUnrecognizedChunkErrorCause.decode(from: #require(errors.first))
+        #expect(errors.count == 1)
+        #expect(cause.unrecognizedChunk.chunkType == 0xFF)
+        #expect(cause.unrecognizedChunk.flags == 0xA5)
+        #expect(cause.unrecognizedChunk.value == [0x01])
+    }
+
+    @Test("Unknown chunk with upper bits 01 reports and stops")
+    func unknownChunkReportStopAction() throws {
+        let (client, server) = try establishPair()
+        let valid = try client.sendData(
+            streamID: 0,
+            payloadProtocolIdentifier: 53,
+            data: Data("x".utf8)
+        )
+        let unknown = try SCTPChunk(chunkType: 0x7F, value: Data([0x02]))
+        let packet = SCTPPacket(
+            sourcePort: valid.sourcePort,
+            destinationPort: valid.destinationPort,
+            verificationTag: valid.verificationTag,
+            chunks: [unknown] + valid.chunks
+        )
+
+        let (responses, received) = try server.processPacket(packet)
+        let chunks = responses.flatMap(\.chunks)
+        let error = try #require(chunks.first)
+        let cause = try SCTPUnrecognizedChunkErrorCause.decode(from: error)
+
+        #expect(received.isEmpty)
+        #expect(chunks.count == 1)
+        #expect(cause.unrecognizedChunk.chunkType == 0x7F)
+        #expect(cause.unrecognizedChunk.value == [0x02])
+    }
+
+    @Test("Unknown chunk with upper bits 10 skips without reporting")
+    func unknownChunkSkipWithoutReportAction() throws {
+        let (client, server) = try establishPair()
+        let valid = try client.sendData(
+            streamID: 0,
+            payloadProtocolIdentifier: 53,
+            data: Data("x".utf8)
+        )
+        let unknown = try SCTPChunk(chunkType: 0xBF, value: Data([0x03]))
+        let packet = SCTPPacket(
+            sourcePort: valid.sourcePort,
+            destinationPort: valid.destinationPort,
+            verificationTag: valid.verificationTag,
+            chunks: [unknown] + valid.chunks
+        )
+
+        let (responses, received) = try server.processPacket(packet)
+        let chunks = responses.flatMap(\.chunks)
+
+        #expect(received.count == 1)
+        #expect(chunks.filter { $0.chunkType == SCTPChunkType.sack.rawValue }.count == 1)
+        #expect(chunks.allSatisfy { $0.chunkType != SCTPChunkType.error.rawValue })
+    }
+
+    @Test("INIT unknown parameter action 00 stops without reporting")
+    func initUnknownParameterStopAction() throws {
+        try verifyInitParameterAction(
+            type: 0x3FFE,
+            expectsReport: false,
+            expectsFollowingParameterProcessing: false
+        )
+    }
+
+    @Test("INIT unknown parameter action 01 reports and stops")
+    func initUnknownParameterReportStopAction() throws {
+        try verifyInitParameterAction(
+            type: 0x7FFE,
+            expectsReport: true,
+            expectsFollowingParameterProcessing: false
+        )
+    }
+
+    @Test("INIT unknown parameter action 10 skips without reporting")
+    func initUnknownParameterSkipAction() throws {
+        try verifyInitParameterAction(
+            type: 0xBFFE,
+            expectsReport: false,
+            expectsFollowingParameterProcessing: true
+        )
+    }
+
+    @Test("INIT unknown parameter action 11 reports and continues")
+    func initUnknownParameterReportContinueAction() throws {
+        try verifyInitParameterAction(
+            type: 0xFFFE,
+            expectsReport: true,
+            expectsFollowingParameterProcessing: true
+        )
+    }
+
+    @Test("INIT-ACK unknown parameter action 00 stops without reporting")
+    func initAckUnknownParameterStopAction() throws {
+        try verifyInitAckParameterAction(
+            type: 0x3FFE,
+            expectsReport: false,
+            expectsFollowingParameterProcessing: false
+        )
+    }
+
+    @Test("INIT-ACK unknown parameter action 01 reports and stops")
+    func initAckUnknownParameterReportStopAction() throws {
+        try verifyInitAckParameterAction(
+            type: 0x7FFE,
+            expectsReport: true,
+            expectsFollowingParameterProcessing: false
+        )
+    }
+
+    @Test("INIT-ACK unknown parameter action 10 skips without reporting")
+    func initAckUnknownParameterSkipAction() throws {
+        try verifyInitAckParameterAction(
+            type: 0xBFFE,
+            expectsReport: false,
+            expectsFollowingParameterProcessing: true
+        )
+    }
+
+    @Test("INIT-ACK unknown parameter action 11 reports and continues")
+    func initAckUnknownParameterReportContinueAction() throws {
+        try verifyInitAckParameterAction(
+            type: 0xFFFE,
+            expectsReport: true,
+            expectsFollowingParameterProcessing: true
+        )
+    }
+
+    @Test("INIT-ACK stop actions still echo a mandatory cookie after the unknown parameter")
+    func initAckStopActionsFindFollowingCookie() throws {
+        try verifyInitAckParameterAction(
+            type: 0x3FFE,
+            expectsReport: false,
+            expectsFollowingParameterProcessing: false,
+            cookiePrecedesUnknown: false
+        )
+        try verifyInitAckParameterAction(
+            type: 0x7FFE,
+            expectsReport: true,
+            expectsFollowingParameterProcessing: false,
+            cookiePrecedesUnknown: false
+        )
+    }
+
+    @Test("Unrecognized parameter codecs preserve complete TLVs and padding")
+    func unrecognizedParameterCodecsRoundTrip() throws {
+        let first = unknownParameter(type: 0x7FFE, value: [0xA1])
+        let second = unknownParameter(type: 0xFFFE, value: [0xB1, 0xB2])
+
+        let encoded = try SCTPUnrecognizedParameter(
+            unrecognizedParameter: first
+        ).encodeParameterBytes()
+        #expect(encoded.count == 12)
+        #expect(encoded[0..<4] == [0x00, 0x08, 0x00, 0x09])
+        let decoded = try SCTPUnrecognizedParameter.decode(
+            from: encoded,
+            offset: 0,
+            length: 9
+        )
+        #expect(decoded.unrecognizedParameter == first)
+
+        let chunk = try SCTPUnrecognizedParametersErrorCause(
+            unrecognizedParameters: [first, second]
+        ).toChunk()
+        let cause = try SCTPUnrecognizedParametersErrorCause.decode(
+            from: chunk
+        )
+        #expect(cause.unrecognizedParameters == [first, second])
+    }
+
+    private func verifyInitParameterAction(
+        type: UInt16,
+        expectsReport: Bool,
+        expectsFollowingParameterProcessing: Bool
+    ) throws {
+        let client = SCTPAssociation()
+        let server = SCTPAssociation()
+        let generated = client.generateInit()
+        let fixedFields = Array(try #require(generated.chunks.first).value.prefix(16))
+        let unknown = unknownParameter(type: type, value: [0xA5])
+
+        var value = fixedFields
+        appendPadded(unknown, to: &value)
+        value.append(contentsOf: try SCTPSupportedExtensionsParameter(
+            chunkTypes: [SCTPChunkType.reConfig.rawValue]
+        ).encodeParameterBytes())
+        let packet = SCTPPacket(
+            sourcePort: generated.sourcePort,
+            destinationPort: generated.destinationPort,
+            verificationTag: generated.verificationTag,
+            chunks: [try SCTPChunk(
+                chunkType: SCTPChunkType.initChunk.rawValue,
+                value: value
+            )]
+        )
+
+        let (initAckResponses, _) = try server.processPacket(packet)
+        let initAck = try #require(initAckResponses.first)
+        let initAckChunk = try #require(initAck.chunks.first)
+        let reports = try unrecognizedParameterReports(in: initAckChunk)
+        #expect(reports == (expectsReport ? [unknown] : []))
+
+        let (cookieEchoResponses, _) = try client.processPacket(initAck)
+        let cookieEcho = try #require(cookieEchoResponses.first)
+        let (cookieAckResponses, _) = try server.processPacket(cookieEcho)
+        let cookieAck = try #require(cookieAckResponses.first)
+        _ = try client.processPacket(cookieAck)
+
+        #expect(
+            server.supportsStreamReconfiguration
+                == expectsFollowingParameterProcessing
+        )
+    }
+
+    private func verifyInitAckParameterAction(
+        type: UInt16,
+        expectsReport: Bool,
+        expectsFollowingParameterProcessing: Bool,
+        cookiePrecedesUnknown: Bool = true
+    ) throws {
+        let client = SCTPAssociation()
+        let generated = client.generateInit()
+        let generatedInit = try SCTPInitChunk.decode(
+            from: try #require(generated.chunks.first).value
+        )
+        let unknown = unknownParameter(type: type, value: [0xC5])
+
+        var value = SCTPInitChunk(
+            initiateTag: 0x2222_2222,
+            advertisedReceiverWindowCredit: 64 * 1_024,
+            numberOfOutboundStreams: 32,
+            numberOfInboundStreams: 32,
+            initialTSN: 200
+        ).encodeBytes()
+        let cookie = stateCookieParameter([0x10, 0x20, 0x30, 0x40])
+        if cookiePrecedesUnknown {
+            appendPadded(cookie, to: &value)
+            appendPadded(unknown, to: &value)
+        } else {
+            appendPadded(unknown, to: &value)
+            appendPadded(cookie, to: &value)
+        }
+        value.append(contentsOf: try SCTPSupportedExtensionsParameter(
+            chunkTypes: [SCTPChunkType.reConfig.rawValue]
+        ).encodeParameterBytes())
+
+        let packet = SCTPPacket(
+            sourcePort: generated.sourcePort,
+            destinationPort: generated.destinationPort,
+            verificationTag: generatedInit.initiateTag,
+            chunks: [try SCTPChunk(
+                chunkType: SCTPChunkType.initAck.rawValue,
+                value: value
+            )]
+        )
+        let (responses, _) = try client.processPacket(packet)
+        let response = try #require(responses.first)
+
+        #expect(responses.count == 1)
+        #expect(
+            response.encodedByteCount
+                <= SCTPAssociationLimits.defaultMaximumPacketByteCount
+        )
+        #expect(response.chunks.first?.chunkType == SCTPChunkType.cookieEcho.rawValue)
+        #expect(
+            client.supportsStreamReconfiguration
+                == expectsFollowingParameterProcessing
+        )
+
+        let errorChunks = response.chunks.filter {
+            $0.chunkType == SCTPChunkType.error.rawValue
+        }
+        if expectsReport {
+            let error = try #require(errorChunks.first)
+            let cause = try SCTPUnrecognizedParametersErrorCause.decode(
+                from: error
+            )
+            #expect(errorChunks.count == 1)
+            #expect(cause.unrecognizedParameters == [unknown])
+        } else {
+            #expect(errorChunks.isEmpty)
+        }
+    }
+
+    private func unknownParameter(
+        type: UInt16,
+        value: [UInt8]
+    ) -> [UInt8] {
+        let length = UInt16(4 + value.count)
+        return [
+            UInt8(type >> 8),
+            UInt8(type & 0xFF),
+            UInt8(length >> 8),
+            UInt8(length & 0xFF),
+        ] + value
+    }
+
+    private func stateCookieParameter(_ cookie: [UInt8]) -> [UInt8] {
+        let length = UInt16(4 + cookie.count)
+        return [
+            0x00,
+            0x07,
+            UInt8(length >> 8),
+            UInt8(length & 0xFF),
+        ] + cookie
+    }
+
+    private func appendPadded(
+        _ parameter: [UInt8],
+        to bytes: inout [UInt8]
+    ) {
+        bytes.append(contentsOf: parameter)
+        while (bytes.count & 3) != 0 {
+            bytes.append(0)
+        }
+    }
+
+    private func unrecognizedParameterReports(
+        in initAck: SCTPChunk
+    ) throws -> [[UInt8]] {
+        let value = initAck.value
+        var reports: [[UInt8]] = []
+        var offset = 16
+        while offset < value.count {
+            let type = UInt16(value[offset]) << 8
+                | UInt16(value[offset + 1])
+            let length = Int(UInt16(value[offset + 2]) << 8
+                | UInt16(value[offset + 3]))
+            if type == SCTPUnrecognizedParameter.parameterType {
+                reports.append(try SCTPUnrecognizedParameter.decode(
+                    from: value,
+                    offset: offset,
+                    length: length
+                ).unrecognizedParameter)
+            }
+            let end = offset + length
+            offset = end == value.count ? end : offset + ((length + 3) & ~3)
+        }
+        return reports
     }
 
     @Test("Local initiate tag is never zero")
@@ -224,7 +676,7 @@ struct SCTPAssociationTests {
         }
     }
 
-    // MARK: - Finding 3: COOKIE-ECHO replay rejected
+    // MARK: - COOKIE-ECHO retransmission
 
     /// Drive INIT/INIT-ACK and capture the client's COOKIE-ECHO packet.
     private func cookieEcho(client: SCTPAssociation, server: SCTPAssociation) throws -> SCTPPacket {
@@ -235,8 +687,8 @@ struct SCTPAssociationTests {
         return try #require(cookieEchoResponses.first)
     }
 
-    @Test("Replayed COOKIE-ECHO is rejected")
-    func replayedCookieEchoRejected() throws {
+    @Test("Retransmitted COOKIE-ECHO receives another COOKIE-ACK")
+    func retransmittedCookieEchoIsAcknowledged() throws {
         let client = SCTPAssociation()
         let server = SCTPAssociation()
 
@@ -247,10 +699,40 @@ struct SCTPAssociationTests {
         #expect(firstResponses.contains { $0.chunks.contains { $0.chunkType == SCTPChunkType.cookieAck.rawValue } })
         #expect(server.state == .established)
 
-        // Replaying the SAME COOKIE-ECHO must be rejected (consumed-cookie cache).
-        #expect(throws: SCTPError.self) {
-            _ = try server.processPacket(cookieEcho)
-        }
+        // COOKIE-ACK might have been lost. RFC 9260 Table 12 Action D requires
+        // another COOKIE-ACK without replacing the established TCB.
+        let (retransmitResponses, retransmitData) = try server.processPacket(cookieEcho)
+        #expect(retransmitResponses.contains {
+            $0.chunks.contains { $0.chunkType == SCTPChunkType.cookieAck.rawValue }
+        })
+        #expect(retransmitData.isEmpty)
+        #expect(server.state == .established)
+    }
+
+    @Test("Invalid COOKIE-ECHO MAC is silently discarded without TCB mutation")
+    func invalidCookieMACIsSilentlyDiscarded() throws {
+        let client = SCTPAssociation()
+        let server = SCTPAssociation()
+        let cookieEcho = try cookieEcho(client: client, server: server)
+        let originalChunk = try #require(cookieEcho.chunks.first)
+        var tamperedValue = originalChunk.value
+        tamperedValue[tamperedValue.count - 1] ^= 0x01
+        let tamperedChunk = try SCTPChunk(
+            chunkType: originalChunk.chunkType,
+            flags: originalChunk.flags,
+            value: Data(tamperedValue)
+        )
+        let tamperedPacket = SCTPPacket(
+            sourcePort: cookieEcho.sourcePort,
+            destinationPort: cookieEcho.destinationPort,
+            verificationTag: cookieEcho.verificationTag,
+            chunks: [tamperedChunk]
+        )
+
+        let (responses, receivedData) = try server.processPacket(tamperedPacket)
+        #expect(responses.isEmpty)
+        #expect(receivedData.isEmpty)
+        #expect(server.state != .established)
     }
 
     // MARK: - Finding 3: INIT while established does not reset TSN tracking
@@ -320,7 +802,7 @@ struct SCTPAssociationTests {
             payloadProtocolIdentifier: 53, userData: Data("x".utf8))
         let badPacket = SCTPPacket(
             sourcePort: ok.sourcePort, destinationPort: ok.destinationPort,
-            verificationTag: ok.verificationTag, chunks: [bad.toChunk()])
+            verificationTag: ok.verificationTag, chunks: [try bad.toChunk()])
 
         #expect(throws: SCTPError.self) {
             _ = try server.processPacket(badPacket)
@@ -345,7 +827,7 @@ struct SCTPAssociationTests {
         var sawFailure = false
         for _ in 0..<20 {
             now = now + .seconds(120)
-            switch client.getPendingRetransmissions(now: now) {
+            switch client.pollOutboundPackets(now: now) {
             case .success:
                 continue
             case .failure:
@@ -373,7 +855,7 @@ struct SCTPAssociationTests {
         var value = SCTPInitChunk(initiateTag: 0x1111_1111, initialTSN: 1).encode()
         value.append(contentsOf: [0x00, 0x07]) // type = State Cookie
         value.append(contentsOf: [0x00, 0x02]) // length = 2 (invalid)
-        let chunk = SCTPChunk(chunkType: SCTPChunkType.initAck.rawValue, value: value)
+        let chunk = try SCTPChunk(chunkType: SCTPChunkType.initAck.rawValue, value: value)
         let packet = SCTPPacket(
             sourcePort: 5000, destinationPort: 5000,
             verificationTag: clientLocalTag, chunks: [chunk])
@@ -403,7 +885,7 @@ struct SCTPAssociationTests {
             sourcePort: serverPacket.sourcePort,
             destinationPort: serverPacket.destinationPort,
             verificationTag: reflectedPeerTag,
-            chunks: [SCTPChunk(chunkType: SCTPChunkType.abort.rawValue, value: Data())])
+            chunks: [try SCTPChunk(chunkType: SCTPChunkType.abort.rawValue, value: Data())])
 
         // Verification-tag validation rejects it (it is not our local tag and
         // reflected-tag ABORTs are no longer accepted), so the association
@@ -425,7 +907,7 @@ struct SCTPAssociationTests {
             sourcePort: clientPacket.sourcePort,
             destinationPort: clientPacket.destinationPort,
             verificationTag: clientPacket.verificationTag,
-            chunks: [SCTPChunk(chunkType: SCTPChunkType.abort.rawValue, value: Data())])
+            chunks: [try SCTPChunk(chunkType: SCTPChunkType.abort.rawValue, value: Data())])
 
         #expect(throws: SCTPError.self) {
             _ = try server.processPacket(abort)
@@ -452,13 +934,16 @@ struct RetransmissionQueueTests {
         var queue = RetransmissionQueue()
         let sentTime = ContinuousClock.now
 
-        try queue.enqueue(makeChunk(tsn: 10), sentTime: sentTime)
-        try queue.enqueue(makeChunk(tsn: 11), sentTime: sentTime)
-
-        // TSN 11 is gap-acked (offset 2 from cumulative 9); TSN 10 is missing
-        for _ in 0..<3 {
-            _ = queue.acknowledge(cumulativeTSN: 9, gapBlocks: [(start: 2, end: 2)])
+        for tsn: UInt32 in 10...13 {
+            try queue.enqueue(makeChunk(tsn: tsn), sentTime: sentTime)
         }
+
+        // Each SACK newly acknowledges a higher TSN while TSN 10 remains the
+        // same hole. RFC 4960 §7.2.4 increments miss indications against the
+        // Highest TSN Newly Acknowledged, not repeated identical SACKs.
+        _ = queue.acknowledge(cumulativeTSN: 9, gapBlocks: [(start: 2, end: 2)])
+        _ = queue.acknowledge(cumulativeTSN: 9, gapBlocks: [(start: 2, end: 3)])
+        _ = queue.acknowledge(cumulativeTSN: 9, gapBlocks: [(start: 2, end: 4)])
 
         // RTO (3s) has not expired, so only the fast-retransmit-marked
         // chunk should be returned
@@ -501,9 +986,10 @@ struct RetransmissionQueueTests {
         let initialRTO = queue.currentRTO
         switch queue.pendingRetransmissions(now: sentTime + initialRTO + .milliseconds(1)) {
         case .success(let chunks):
-            #expect(chunks.map(\.tsn) == [10, 11])
-            // One timeout event with two expired chunks doubles RTO once,
-            // not once per chunk (RFC 4960 §6.3.3 E2)
+            // The timeout marks both chunks but RFC 9260 §7.2.3 permits one
+            // physical packet until its acknowledgment advances recovery.
+            #expect(chunks.map(\.tsn) == [10])
+            // One path-level timeout doubles RTO once, not once per chunk.
             #expect(queue.currentRTO == initialRTO * 2)
         case .failure(let error):
             Issue.record("Unexpected failure: \(error)")

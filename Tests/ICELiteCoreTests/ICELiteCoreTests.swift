@@ -1,8 +1,7 @@
 /// Tests for the Embedded-clean ICE Lite state machine core.
 
 import Testing
-@testable import ICELiteCore
-
+@testable import WebRTC
 @Suite("ICE Lite Validated-Peer Cap Tests")
 struct ICELiteValidatedPeerCapTests {
 
