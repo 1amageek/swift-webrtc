@@ -239,10 +239,10 @@ struct WebRTCLoopbackTests {
         Issue.record("Connection did not become terminal within the wait budget")
     }
 
-    private func waitForCheckpoint(_ gate: LifecycleGate) async {
-        for _ in 0..<10_000 {
+    private func waitForCheckpoint(_ gate: LifecycleGate) async throws {
+        for _ in 0..<1_000 {
             if gate.didEnter { return }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(1))
         }
         Issue.record("Lifecycle checkpoint did not run within the wait budget")
     }
@@ -613,7 +613,7 @@ struct WebRTCLoopbackTests {
             return .timeout
         }
 
-        await waitForCheckpoint(handshakeGate)
+        try await waitForCheckpoint(handshakeGate)
         #expect(handshakeGate.didEnter)
         let emittedBeforeClose = clientOutbox.withLock { $0.count }
         client.close()
@@ -817,7 +817,7 @@ struct WebRTCLoopbackTests {
             }
             return nil
         }
-        await waitForCheckpoint(sctpGate)
+        try await waitForCheckpoint(sctpGate)
         #expect(sctpGate.didEnter)
 
         try client.shutdown()
@@ -1348,7 +1348,7 @@ struct WebRTCLoopbackTests {
             return nil
         }
 
-        await waitForCheckpoint(eventGate)
+        try await waitForCheckpoint(eventGate)
         #expect(eventGate.didEnter)
         server.close()
 
