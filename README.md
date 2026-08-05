@@ -45,16 +45,16 @@ authenticated plaintext RTP packet owner
 
 `swift-webrtc` owns SDP/security generations, ICE/STUN, DTLS role and fingerprint
 binding, timer delivery, SRTP/SRTCP, SCTP/DataChannel, and RTP/RTCP. It
-consumes the public DTLS session through `swift-tls-sessions/DTLS`, while
+consumes the public DTLS session through `swift-tls/DTLS`, while
 `swift-ssl` owns the Pure Swift cryptographic, PKI, wire, record, replay,
 flight, exporter, and handshake mechanisms.
 
 ```text
-swift-libp2p -> swift-webrtc -> swift-tls-sessions / DTLS -> swift-ssl
+swift-libp2p -> swift-webrtc -> swift-tls / DTLS -> swift-ssl
 ```
 
 WebRTC DTLS 1.2 interoperability is a deliberately narrow profile, not a general
-TLS 1.2 fallback. The `swift-tls-sessions` facade is the public session boundary;
+TLS 1.2 fallback. The `swift-tls` facade is the public session boundary;
 its mechanism implementation is supplied by `swift-ssl`. See the
 [workspace secure-transport architecture](../../SECURE_TRANSPORT_ARCHITECTURE.md).
 
@@ -62,7 +62,7 @@ its mechanism implementation is supplied by `swift-ssl`. See the
 
 - Pure Swift WebRTC Direct data channel stack — no C/C++ WebRTC dependency
 - STUN / ICE Lite for server-side connectivity checks ([RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389), [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445))
-- DTLS 1.2 driven through the swift-tls-sessions Tier-1 `TLS` facade ([RFC 6347](https://www.rfc-editor.org/rfc/rfc6347))
+- DTLS 1.2 driven through the swift-tls Tier-1 `TLS` facade ([RFC 6347](https://www.rfc-editor.org/rfc/rfc6347))
 - SCTP association, stream management, and reassembly ([RFC 4960](https://datatracker.ietf.org/doc/html/rfc4960))
 - Data channels with the Data Channel Establishment Protocol ([RFC 8831](https://datatracker.ietf.org/doc/html/rfc8831), [RFC 8832](https://datatracker.ietf.org/doc/html/rfc8832))
 - Mutual DTLS certificate authentication with fail-closed fingerprint verification ([RFC 8122](https://www.rfc-editor.org/rfc/rfc8122))
@@ -287,7 +287,7 @@ Sources/
   callers may instead use another codec adapter or raw negotiated RTP.
 
 DTLS is driven through the Tier-1 `TLS` facade of
-`swift-tls-sessions` (`DTLSClient` / `DTLSServer`).
+`swift-tls` (`DTLSClient` / `DTLSServer`).
 WebRTC owns its DTLS certificate layer locally — `WebRTCCertificate`
 (self-signed ECDSA P-256 → DER + `TLSIdentity`) and `CertificateFingerprint`
 (SHA-256, SDP / `/certhash`) — because the facade takes a `TLSIdentity` rather
@@ -341,7 +341,7 @@ The current benchmark targets cover the established data-channel paths, the RTP
 parser's payload-size-independence gate, and the H.264 final-payload bulk-copy
 regression gate. Media ownership tests also compare buffer base addresses across
 reserved RTP/SRTCP egress and authenticated RTP/RTCP ingress. These tests prove
-the audited owner paths, not all dependencies: the current swift-tls-sessions Tier-1 DTLS
+the audited owner paths, not all dependencies: the current swift-tls Tier-1 DTLS
 facade still materializes record/application arrays internally. End-to-end
 Jetson allocation and latency measurements are downstream Jetson/Lume
 integration gates; they do not block release of this transport foundation.
