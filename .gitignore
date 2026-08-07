@@ -16,10 +16,12 @@ DerivedData/
 
 # Swift Package Manager
 .build/
+.build-*/
 .swiftpm/xcode/
 .swiftpm/configuration/
 Package.resolved
 Packages/
+*.xcresult/
 
 # Environment / Secrets
 .env

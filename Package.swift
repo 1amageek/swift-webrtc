@@ -7,6 +7,7 @@ import PackageDescription
 let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
 let wasiEnabled = Context.environment["P2P_CORE_WASM"] == "1"
 let portableEnabled = embeddedEnabled || wasiEnabled
+let includesBenchmarks = Context.environment["SWIFT_WEBRTC_ENABLE_BENCHMARKS"] == "1"
 
 // Logging remains available on Linux even though identity crypto is portable.
 let loggingPlatforms: [Platform] = [
@@ -95,9 +96,18 @@ let packageDependencies: [Package.Dependency] = {
         // The DTLS handshake/record engine is exposed through
         // swift-tls' Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
         // Its DTLS 1.2 mechanism is owned by swift-ssl/SSLDTLS.
-        .package(url: "https://github.com/1amageek/swift-tls.git", branch: "main"),
-        .package(name: "swift-p2p-core", url: "https://github.com/1amageek/swift-p2p-core.git", branch: "main"),
-        .package(name: "swift-ssl", url: "https://github.com/1amageek/swift-ssl.git", branch: "main"),
+        .package(
+            url: "https://github.com/1amageek/swift-tls.git",
+            from: "1.3.3"
+        ),
+        .package(
+            url: "https://github.com/1amageek/swift-p2p-core.git",
+            from: "0.3.2"
+        ),
+        .package(
+            url: "https://github.com/1amageek/swift-ssl.git",
+            from: "0.1.1"
+        ),
         // `swift-p2p-core` also owns the P2PCrypto protocol adapter module.
     ]
     d += [
@@ -246,6 +256,7 @@ let package = Package(
             ],
             path: "Tests/WebRTCTests"
         ),
+    ] + (includesBenchmarks ? [
         .testTarget(
             name: "RTPWireCorePerformanceTests",
             dependencies: ["WebRTC"],
@@ -265,6 +276,6 @@ let package = Package(
             path: "Tests/PerformanceTests",
             swiftSettings: coreSettings
         ),
-    ],
+    ] : []),
     swiftLanguageModes: [.v6]
 )

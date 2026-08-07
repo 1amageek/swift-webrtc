@@ -255,7 +255,7 @@ public final class WebRTCConnection: Sendable {
 
     private struct ConnState: Sendable {
         var stateMachine: ConnectionStateMachine = ConnectionStateMachine()
-        var iceAgent: ICELiteAgent
+        var iceAgent: WebRTCICEAgent
         var sctpAssociation: SCTPAssociation
         var channelManager: DataChannelManager
         var isClient: Bool
@@ -637,7 +637,7 @@ public final class WebRTCConnection: Sendable {
         }
 
         func completeNetworkTeardown() {
-            let iceAgent = connState.withLock { state -> ICELiteAgent? in
+            let iceAgent = connState.withLock { state -> WebRTCICEAgent? in
                 guard state.stateMachine.isTerminal,
                       state.terminalOwnerTeardownPhase == .complete,
                       state.areTerminalEventsFinished,
@@ -1271,7 +1271,9 @@ public final class WebRTCConnection: Sendable {
     public static func asClient(
         certificate: WebRTCCertificate,
         remoteFingerprint expectedFingerprint: CertificateFingerprint,
+        iceConfiguration: WebRTCICEConfiguration = .prevalidated,
         mediaConfiguration: WebRTCMediaConfiguration? = nil,
+        negotiatedDataChannels: [WebRTCNegotiatedDataChannel] = [],
         sendHandler: @escaping SendHandler,
         timer: WebRTCTimer = .platformDefault,
         logger: WebRTCLogger = WebRTCLogger(label: "webrtc.connection")
@@ -1280,7 +1282,9 @@ public final class WebRTCConnection: Sendable {
             certificate: certificate,
             isClient: true,
             expectedFingerprint: expectedFingerprint,
+            iceConfiguration: iceConfiguration,
             mediaConfiguration: mediaConfiguration,
+            negotiatedDataChannels: negotiatedDataChannels,
             sendHandler: sendHandler,
             timer: timer,
             logger: logger
@@ -1302,7 +1306,9 @@ public final class WebRTCConnection: Sendable {
     public static func asServer(
         certificate: WebRTCCertificate,
         remoteFingerprint expectedFingerprint: CertificateFingerprint? = nil,
+        iceConfiguration: WebRTCICEConfiguration = .prevalidated,
         mediaConfiguration: WebRTCMediaConfiguration? = nil,
+        negotiatedDataChannels: [WebRTCNegotiatedDataChannel] = [],
         sendHandler: @escaping SendHandler,
         timer: WebRTCTimer = .platformDefault,
         logger: WebRTCLogger = WebRTCLogger(label: "webrtc.connection")
@@ -1311,7 +1317,9 @@ public final class WebRTCConnection: Sendable {
             certificate: certificate,
             isClient: false,
             expectedFingerprint: expectedFingerprint,
+            iceConfiguration: iceConfiguration,
             mediaConfiguration: mediaConfiguration,
+            negotiatedDataChannels: negotiatedDataChannels,
             sendHandler: sendHandler,
             timer: timer,
             logger: logger
@@ -1322,13 +1330,30 @@ public final class WebRTCConnection: Sendable {
         certificate: WebRTCCertificate,
         isClient: Bool,
         expectedFingerprint: CertificateFingerprint?,
+        iceConfiguration: WebRTCICEConfiguration = .prevalidated,
         mediaConfiguration: WebRTCMediaConfiguration?,
+        negotiatedDataChannels: [WebRTCNegotiatedDataChannel] = [],
         sendHandler: @escaping SendHandler,
         timer: WebRTCTimer = .platformDefault,
         logger: WebRTCLogger,
         sctpClock: any SCTPMonotonicClock = SCTPSystemMonotonicClock(),
         lifecycleHooks: WebRTCLifecycleHooks = WebRTCLifecycleHooks()
     ) throws(WebRTCError) {
+        let iceCredentials = iceConfiguration.credentials
+        guard iceCredentials.localUfrag.count >= 4,
+              iceCredentials.localPassword.count >= 22 else {
+            throw .iceFailed("Local ICE credentials do not meet RFC 8445 length requirements")
+        }
+        if iceConfiguration.role == .controlling {
+            guard let remoteUfrag = iceCredentials.remoteUfrag,
+                  remoteUfrag.count >= 4,
+                  let remotePassword = iceCredentials.remotePassword,
+                  remotePassword.count >= 22 else {
+                throw .iceFailed(
+                    "Controlling ICE requires valid remote credentials"
+                )
+            }
+        }
         guard mediaConfiguration == nil || expectedFingerprint != nil else {
             throw .mediaPeerAuthenticationRequired
         }
@@ -1353,10 +1378,23 @@ public final class WebRTCConnection: Sendable {
         self.logger = logger
         self.lifecycleHooks = lifecycleHooks
         self.timer = timer
+        let channelManager = DataChannelManager(isInitiator: isClient)
+        for channel in negotiatedDataChannels {
+            do throws(DataChannelError) {
+                _ = try channelManager.openNegotiatedChannel(
+                    id: channel.id,
+                    label: channel.label,
+                    ordered: channel.ordered,
+                    reliability: channel.reliability
+                )
+            } catch {
+                throw .dataChannelFailed(error)
+            }
+        }
         let connState = SharedMutex(ConnState(
-            iceAgent: ICELiteAgent(),
+            iceAgent: WebRTCICEAgent(configuration: iceConfiguration),
             sctpAssociation: SCTPAssociation(clock: sctpClock),
-            channelManager: DataChannelManager(isInitiator: isClient),
+            channelManager: channelManager,
             isClient: isClient,
             verifiedRemoteFingerprint: nil,
             presentedRemoteCertificateDER: nil,
@@ -1438,6 +1476,102 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
+    /// Performs the nominated-pair ICE connectivity check for a controlling
+    /// connection, including RFC 5389 retransmission with the same transaction.
+    ///
+    /// The method returns only after an authenticated Binding Success Response
+    /// has been processed by ``receive(_:remoteAddress:)``. Lite and explicitly
+    /// prevalidated connections have no active check and return immediately.
+    public func establishICEConnectivity(
+        timeout: Duration = .seconds(10)
+    ) async throws(WebRTCError) {
+        let deadline: UInt64 = {
+            let now = timer.monotonicNanos()
+            let delta = timeout.facadeNanoseconds
+            let (sum, overflow) = now.addingReportingOverflow(delta)
+            return overflow ? UInt64.max : sum
+        }()
+        var retransmissionNanos: UInt64 = 100_000_000
+
+        while true {
+            let action = connState.withLock {
+                state -> Result<[UInt8]?, WebRTCError> in
+                switch state.iceAgent.state {
+                case .connected, .completed:
+                    state.stateMachine.process(.iceConnected)
+                    return .success(nil)
+                case .failed:
+                    return .failure(.iceFailed(
+                        state.iceAgent.failureReason
+                            ?? "ICE connectivity check failed"
+                    ))
+                case .closed:
+                    return .failure(.closed)
+                case .new, .checking:
+                    guard let check = state.iceAgent.connectivityCheck()
+                    else {
+                        return .success(nil)
+                    }
+                    switch check {
+                    case .send(let bytes):
+                        return .success(bytes)
+                    case .connected:
+                        state.stateMachine.process(.iceConnected)
+                        return .success(nil)
+                    case .failed(let reason):
+                        return .failure(.iceFailed(reason))
+                    }
+                }
+            }
+
+            let datagram: [UInt8]?
+            switch action {
+            case .success(let bytes):
+                datagram = bytes
+            case .failure(let error):
+                failConnection(error, context: "ICE connectivity check failed")
+                throw error
+            }
+            guard let datagram else { return }
+
+            do {
+                try sendDatagram(datagram)
+            } catch {
+                failConnection(error, context: "ICE connectivity check send failed")
+                throw error
+            }
+
+            let now = timer.monotonicNanos()
+            if now >= deadline {
+                let error = WebRTCError.iceFailed(
+                    "ICE connectivity check timed out"
+                )
+                connState.withLock { state in
+                    state.iceAgent.fail("ICE connectivity check timed out")
+                    state.stateMachine.process(.iceFailed)
+                }
+                failConnection(error, context: "ICE connectivity check timed out")
+                throw error
+            }
+            let (candidateWake, wakeOverflow) = now.addingReportingOverflow(
+                retransmissionNanos
+            )
+            let wake = min(
+                deadline,
+                wakeOverflow ? UInt64.max : candidateWake
+            )
+            do {
+                try await timer.sleep(untilNanos: wake)
+            } catch {
+                throw .closed
+            }
+            retransmissionNanos = min(
+                retransmissionNanos &* 2,
+                1_600_000_000
+            )
+        }
+    }
+
     /// Install or clear the authenticated RTP delivery callback.
     ///
     /// A terminal connection rejects registration and does not retain the
@@ -1475,6 +1609,11 @@ public final class WebRTCConnection: Sendable {
     /// Start the connection process (client-side: initiates DTLS handshake)
     public func start() throws(WebRTCError) {
         let startResult = connState.withLock { state -> StartResult in
+            if state.iceAgent.requiresConnectivityCheckBeforeDTLS,
+               state.iceAgent.state != .connected,
+               state.iceAgent.state != .completed {
+                return .invalidState(state.stateMachine.state)
+            }
             switch state.stateMachine.state {
             case .new, .connecting:
                 state.stateMachine.process(.dtlsHandshakeStarted)
@@ -1610,10 +1749,37 @@ public final class WebRTCConnection: Sendable {
         // for DTLS content types 20-63 as well.
 
         if firstByte >= 20 && firstByte <= 63 {
-            // P1.5: Validate ICE state before DTLS processing
-            let (shouldProcess, currentState) = connState.withLock { state in
-                (state.stateMachine.shouldProcessDTLS(), state.stateMachine.state)
+            // Validate ICE before DTLS processing. A server can receive the
+            // first ClientHello immediately after connectivity succeeds and
+            // before its asynchronous owner resumes to call start(). Claim the
+            // server handshake atomically with admission so the packet is not
+            // discarded while the endpoint itself is ready to accept it.
+            let admission: (Bool, WebRTCConnectionState) = connState.withLock {
+                state -> (Bool, WebRTCConnectionState) in
+                if !state.isClient {
+                    let connectivityAdmitsDTLS: Bool
+                    switch state.iceAgent.state {
+                    case .checking, .connected, .completed:
+                        connectivityAdmitsDTLS = true
+                    case .new, .failed, .closed:
+                        connectivityAdmitsDTLS = false
+                    }
+                    if connectivityAdmitsDTLS {
+                        switch state.stateMachine.state {
+                        case .new, .connecting:
+                            state.stateMachine.process(.dtlsHandshakeStarted)
+                        case .dtlsHandshaking, .sctpConnecting, .connected,
+                             .disconnected, .closing, .failed, .closed:
+                            break
+                        }
+                    }
+                }
+                return (
+                    state.stateMachine.shouldProcessDTLS(),
+                    state.stateMachine.state
+                )
             }
+            let (shouldProcess, currentState) = admission
             if !shouldProcess {
                 logger.warning("Ignoring DTLS packet (\(data.count)B): state=\(currentState)")
                 return
@@ -2122,6 +2288,16 @@ public final class WebRTCConnection: Sendable {
             }
 
             return stunResponse
+        }
+
+        let iceFailure = connState.withLock { state -> WebRTCError? in
+            guard state.iceAgent.state == .failed else { return nil }
+            return .iceFailed(
+                state.iceAgent.failureReason ?? "ICE connectivity check failed"
+            )
+        }
+        if let iceFailure {
+            throw iceFailure
         }
 
         if let response {

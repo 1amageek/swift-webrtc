@@ -35,16 +35,16 @@ enum DTLSEndpoint: Sendable {
         requireClientCertificate: Bool,
         mediaConfiguration: WebRTCMediaConfiguration? = nil
     ) throws(TLSError) -> DTLSEndpoint {
-        let srtpConfiguration: DTLSSRTPConfiguration?
-        if let mediaConfiguration {
-            switch mediaConfiguration.protectionProfile {
-            case .aes128CMHMACSHA180:
-                srtpConfiguration = try DTLSSRTPConfiguration(
-                    protectionProfiles: [.aes128CMHMACSHA180]
-                )
-            }
-        } else {
-            srtpConfiguration = nil
+        let srtpConfiguration: DTLSSRTPConfiguration
+        switch mediaConfiguration?.protectionProfile {
+        case .aes128CMHMACSHA180, nil:
+            // WebRTC endpoints negotiate use_srtp even when the only upper
+            // layer is SCTP/DataChannel. Pion rejects a completed DTLS
+            // handshake with no selected SRTP profile before it starts SCTP.
+            // The exporter material remains unused when media is disabled.
+            srtpConfiguration = try DTLSSRTPConfiguration(
+                protectionProfiles: [.aes128CMHMACSHA180]
+            )
         }
 
         let configuration = DTLSConfiguration(

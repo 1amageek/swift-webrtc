@@ -4,7 +4,7 @@ A pure Swift WebRTC Direct implementation with data channels and an
 authenticated RTP/RTCP transport. It does not embed a C/C++ WebRTC stack;
 portable cryptography is supplied by `swift-ssl` through
 `swift-p2p-core`'s `P2PCrypto` module. The current development
-working tree also contains zero-copy-oriented H.264 sender and bounded receiver
+release also contains zero-copy-oriented H.264 sender and bounded receiver
 pipelines exposed through one optional media facade:
 
 ```
@@ -24,13 +24,11 @@ authenticated plaintext RTP packet owner
   → one exact decoder-bound access-unit owner
 ```
 
-> **Release status.** The latest stable tag is `1.5.3`; it contains the data
-> channel stack, but not the media facade described below. That product
-> currently exists only in this uncommitted development working tree
-> and depends on coordinated unreleased changes in swift-p2p-core, swift-ssl,
-> and swift-tls.
+> **Release status.** Current release: `2.0.0`. It publishes the unified
+> `WebRTC` transport and optional `WebRTCMedia` composition product against
+> tagged Pure Swift dependencies.
 >
-> **Media status.** The unreleased tree implements RTP/RTCP wire parsing,
+> **Media status.** The release implements RTP/RTCP wire parsing,
 > DTLS `use_srtp`, the RFC 5705 exporter, AES-CM/HMAC-SHA1-80 SRTP/SRTCP, and
 > authenticated RTP/RTCP send/receive on `WebRTCConnection`. Its H.264 sender
 > path extracts borrowed Annex B/AVCC NAL ranges, packetizes Single NAL/STAP-A/
@@ -61,7 +59,9 @@ its mechanism implementation is supplied by `swift-ssl`. See the
 ## Features
 
 - Pure Swift WebRTC Direct data channel stack — no C/C++ WebRTC dependency
-- STUN / ICE Lite for server-side connectivity checks ([RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389), [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445))
+- SDP offers/answers, ICE candidates, and browser-compatible trickle ICE JSON
+- STUN Binding, controlled ICE Lite, and nominated-pair controlling ICE ([RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389), [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445))
+- Sans-I/O TURN allocation, refresh, permission, Send Indication, and Data Indication transactions
 - DTLS 1.2 driven through the swift-tls Tier-1 `TLS` facade ([RFC 6347](https://www.rfc-editor.org/rfc/rfc6347))
 - SCTP association, stream management, and reassembly ([RFC 4960](https://datatracker.ietf.org/doc/html/rfc4960))
 - Data channels with the Data Channel Establishment Protocol ([RFC 8831](https://datatracker.ietf.org/doc/html/rfc8831), [RFC 8832](https://datatracker.ietf.org/doc/html/rfc8832))
@@ -85,8 +85,7 @@ its mechanism implementation is supplied by `swift-ssl`. See the
 
 ## Requirements
 
-These requirements describe the current development working tree; stable tags
-retain their own manifest requirements.
+These requirements describe the `2.0.0` release.
 
 - Swift 6.4 development snapshot `2026-07-23`
 - macOS 26+ / iOS 26+ / tvOS 26+ / watchOS 26+ / visionOS 26+
@@ -96,15 +95,12 @@ retain their own manifest requirements.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "1.5.3"),
+    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "2.0.0"),
 ]
 ```
 
-This installs the stable data-channel release. Do not expect the unreleased
-media product from that tag. The media-capable changes have been validated
-against coordinated local working trees. Before the next release, publish the
-compatible dependency commits, replace the development path dependencies with
-public URLs, and rerun the complete matrix against that public graph.
+This installs the unified transport and optional H.264 media products using the
+tagged Pure Swift dependency graph.
 
 ## Quick Start
 
@@ -187,7 +183,7 @@ for await connection in listener.connections {
 > layer must bind them to identity before they are trusted, and
 > `remoteFingerprint` remains `nil`.
 
-### Unreleased H.264 media composition
+### H.264 media composition
 
 ```swift
 import WebRTC
@@ -241,10 +237,9 @@ focused test targets; they are not separate importable modules.
 | **WebRTC** | ICE, DTLS, SCTP, data channels, DTLS-SRTP, and authenticated RTP/RTCP owner transfer |
 | **WebRTCMedia** | Optional H.264 Annex B/AVCC framing, RFC 6184 packetization, sender policy, and bounded receiver |
 
-This product and module reduction is a major-version API boundary. The stable
-`1.5.x` line exposed lower protocol products directly. Consumers must migrate
-lower protocol imports to `WebRTC`, and H.264 imports to `WebRTCMedia`, before
-the next major release.
+This product and module reduction is the `2.0.0` major-version API boundary.
+The `1.5.x` line exposed lower protocol products directly. Consumers migrate
+lower protocol imports to `WebRTC`, and H.264 imports to `WebRTCMedia`.
 
 ## Architecture
 
@@ -337,14 +332,12 @@ wire parser reads it and a media handler receives it.
 
 ## Performance
 
-The current benchmark targets cover the established data-channel paths, the RTP
-parser's payload-size-independence gate, and the H.264 final-payload bulk-copy
-regression gate. Media ownership tests also compare buffer base addresses across
-reserved RTP/SRTCP egress and authenticated RTP/RTCP ingress. These tests prove
-the audited owner paths, not all dependencies: the current swift-tls Tier-1 DTLS
-facade still materializes record/application arrays internally. End-to-end
-Jetson allocation and latency measurements are downstream Jetson/Lume
-integration gates; they do not block release of this transport foundation.
+The opt-in benchmark targets cover the established data-channel paths, the RTP
+parser's payload-size-independence gate, the H.264 final-payload bulk-copy gate,
+and TURN payload-owner copy budgets. They are excluded from the default test
+graph unless `SWIFT_WEBRTC_ENABLE_BENCHMARKS=1` is set. Media ownership tests
+also compare buffer base addresses across reserved RTP/SRTCP egress and
+authenticated RTP/RTCP ingress.
 
 | Suite | Coverage |
 |---|---|
@@ -354,6 +347,18 @@ integration gates; they do not block release of this transport foundation.
 | `STUNBenchmarks` | Message encode/decode, FINGERPRINT, MESSAGE-INTEGRITY |
 | `ICEBenchmarks` | STUN request processing, credential generation, peer validation |
 | `DataChannelBenchmarks` | DCEP encode/decode, channel open/lookup |
+| `TURNBenchmarks` | Send/Data Indication payload-owner copies and 1,200-byte throughput |
+
+Current arm64 Release snapshot (2026-08-07, pinned Swift 6.4 toolchain):
+
+| Measurement | Result |
+|---|---:|
+| TURN Send Indication payload-owner copies | 0 at 1, 1,200, and 16,384 bytes |
+| TURN Data Indication additional payload allocations | 0 at 1, 1,200, and 16,384 bytes |
+| TURN Send Indication, 1,200 bytes | 3,534.10 MB/s; 339.55 ns/op |
+| RTP parse, 12 / 1,200 / 65,535 bytes | 8.356 / 8.360 / 8.356 ns; normalized slope -0.000244 |
+| H.264 final materialization, 4 KiB | 72.23 ns bulk; 7,292.42 ns scalar; ratio 0.00990 |
+| H.264 final materialization, 64 KiB | 586.43 ns bulk; 116,270.02 ns scalar; ratio 0.00504 |
 
 ### Running benchmarks
 
@@ -361,11 +366,13 @@ integration gates; they do not block release of this transport foundation.
 SWIFT_TOOLCHAIN_USR="$(dirname "$(dirname "$(xcrun --toolchain org.swift.64202607231a --find swift)")")"
 
 # Build the package with the pinned Swift 6.4 snapshot
+SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
   xcodebuild build -scheme swift-webrtc-Package \
   -configuration Release -destination 'platform=macOS'
 
 # Run the data-channel benchmarks with an explicit timeout
+SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
   xcodebuild test -scheme swift-webrtc-Package \
   -configuration Release \
@@ -376,6 +383,7 @@ TOOLCHAINS=org.swift.64202607231a \
   "LD_RUNPATH_SEARCH_PATHS=\$(inherited) ${SWIFT_TOOLCHAIN_USR}/lib/swift/macosx/testing"
 
 # Run the independent RTP asymptotic gate
+SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
   xcodebuild test -scheme swift-webrtc-Package \
   -configuration Release \
@@ -386,6 +394,7 @@ TOOLCHAINS=org.swift.64202607231a \
   "LD_RUNPATH_SEARCH_PATHS=\$(inherited) ${SWIFT_TOOLCHAIN_USR}/lib/swift/macosx/testing"
 
 # Run the H.264 final-materialization regression gate
+SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
   xcodebuild test -scheme swift-webrtc-Package \
   -configuration Release \

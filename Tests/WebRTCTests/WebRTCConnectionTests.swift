@@ -11,6 +11,29 @@ import Synchronization
 @Suite("WebRTC Connection Demultiplex Tests")
 struct WebRTCConnectionDemultiplexTests {
 
+    @Test("Controlling DTLS cannot start before ICE succeeds")
+    func dtlsStartRequiresICE() throws {
+        let clientCertificate = try WebRTCTestIdentity.make()
+        let serverCertificate = try WebRTCTestIdentity.make()
+        let credentials = ICECredentials(
+            localUfrag: "clientUfrag",
+            localPassword: "clientPassword456789012345",
+            remoteUfrag: "serverUfrag",
+            remotePassword: "serverPassword456789012345"
+        )
+        let connection = try WebRTCConnection.asClient(
+            certificate: clientCertificate,
+            remoteFingerprint: serverCertificate.fingerprint,
+            iceConfiguration: .controlling(credentials: credentials),
+            sendHandler: { _ in .success(()) }
+        )
+
+        #expect(throws: WebRTCError.self) {
+            try connection.start()
+        }
+        #expect(connection.state == WebRTCConnectionState.new)
+    }
+
     @Test("An asynchronous datagram failure preserves its typed cause")
     func asynchronousDatagramFailureIsTerminal() throws {
         let certificate = try WebRTCTestIdentity.make()
@@ -73,6 +96,40 @@ struct WebRTCConnectionDemultiplexTests {
         try connection.start()
         // Server is now in DTLS handshake state, waiting for ClientHello
         #expect(connection.state == .dtlsHandshaking)
+    }
+
+    @Test("An inbound ClientHello claims an unstarted server handshake exactly once")
+    func inboundClientHelloStartsServerHandshake() throws {
+        let clientCertificate = try WebRTCTestIdentity.make()
+        let serverCertificate = try WebRTCTestIdentity.make()
+        let clientDatagrams = Mutex<[[UInt8]]>([])
+        let serverDatagrams = Mutex<[[UInt8]]>([])
+        let client = try WebRTCConnection.asClient(
+            certificate: clientCertificate,
+            remoteFingerprint: serverCertificate.fingerprint,
+            sendHandler: { datagram in
+                clientDatagrams.withLock { $0.append(datagram) }
+                return .success(())
+            }
+        )
+        let server = try WebRTCConnection.asServer(
+            certificate: serverCertificate,
+            remoteFingerprint: clientCertificate.fingerprint,
+            sendHandler: { datagram in
+                serverDatagrams.withLock { $0.append(datagram) }
+                return .success(())
+            }
+        )
+
+        try client.start()
+        let clientHello = try #require(clientDatagrams.withLock { $0.first })
+        try server.receive(clientHello)
+
+        #expect(server.state == .dtlsHandshaking)
+        #expect(!serverDatagrams.withLock { $0.isEmpty })
+        #expect(throws: WebRTCError.self) {
+            try server.start()
+        }
     }
 
     @Test("Client start fails terminally when transport rejects the initial flight")

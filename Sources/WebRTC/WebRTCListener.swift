@@ -32,7 +32,9 @@ public final class WebRTCListener: Sendable {
     // MARK: - Private state
 
     private let certificate: WebRTCCertificate
+    private let iceConfiguration: WebRTCICEConfiguration
     private let mediaConfiguration: WebRTCMediaConfiguration?
+    private let negotiatedDataChannels: [WebRTCNegotiatedDataChannel]
     private let timer: WebRTCTimer
     private let logger: WebRTCLogger
     private let listenerState: FacadeLock<ListenerState>
@@ -48,12 +50,16 @@ public final class WebRTCListener: Sendable {
 
     public init(
         certificate: WebRTCCertificate,
+        iceConfiguration: WebRTCICEConfiguration = .prevalidated,
         mediaConfiguration: WebRTCMediaConfiguration? = nil,
+        negotiatedDataChannels: [WebRTCNegotiatedDataChannel] = [],
         timer: WebRTCTimer = .platformDefault,
         logger: WebRTCLogger = WebRTCLogger(label: "webrtc.listener")
     ) {
         self.certificate = certificate
+        self.iceConfiguration = iceConfiguration
         self.mediaConfiguration = mediaConfiguration
+        self.negotiatedDataChannels = negotiatedDataChannels
         self.timer = timer
         self.localFingerprint = certificate.fingerprint
         self.logger = logger
@@ -67,13 +73,16 @@ public final class WebRTCListener: Sendable {
 
     private func serverConnection(
         remoteFingerprint: CertificateFingerprint?,
+        iceConfiguration: WebRTCICEConfiguration?,
         sendHandler: @escaping WebRTCConnection.SendHandler
     ) -> Result<WebRTCConnection, WebRTCError> {
         do {
             return .success(try WebRTCConnection.asServer(
                 certificate: certificate,
                 remoteFingerprint: remoteFingerprint,
+                iceConfiguration: iceConfiguration ?? self.iceConfiguration,
                 mediaConfiguration: mediaConfiguration,
+                negotiatedDataChannels: negotiatedDataChannels,
                 sendHandler: sendHandler,
                 timer: timer,
                 logger: logger
@@ -110,6 +119,7 @@ public final class WebRTCListener: Sendable {
     public func acceptConnection(
         peerID: String,
         remoteFingerprint: CertificateFingerprint? = nil,
+        iceConfiguration: WebRTCICEConfiguration? = nil,
         sendHandler: @escaping WebRTCConnection.SendHandler
     ) throws(WebRTCError) -> WebRTCConnection? {
         // Check-and-claim is ONE critical section: a concurrent accept for the
@@ -141,6 +151,7 @@ public final class WebRTCListener: Sendable {
                 let connection: WebRTCConnection
                 switch serverConnection(
                     remoteFingerprint: remoteFingerprint,
+                    iceConfiguration: iceConfiguration,
                     sendHandler: sendHandler
                 ) {
                 case .success(let created):
@@ -155,6 +166,7 @@ public final class WebRTCListener: Sendable {
             let connection: WebRTCConnection
             switch serverConnection(
                 remoteFingerprint: remoteFingerprint,
+                iceConfiguration: iceConfiguration,
                 sendHandler: sendHandler
             ) {
             case .success(let created):

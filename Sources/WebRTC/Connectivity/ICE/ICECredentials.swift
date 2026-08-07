@@ -20,17 +20,35 @@ public struct ICECredentials: Sendable, Equatable {
     public let localPassword: String
 
     /// Remote username fragment
-    var remoteUfrag: String?
+    public internal(set) var remoteUfrag: String?
 
     /// Remote password
-    var remotePassword: String?
+    public internal(set) var remotePassword: String?
 
-    init(
-        localUfrag: String? = nil,
-        localPassword: String? = nil
+    /// Generates a fresh cryptographically random local credential pair.
+    public init() {
+        self.localUfrag = Self.generateUfrag()
+        self.localPassword = Self.generatePassword()
+        self.remoteUfrag = nil
+        self.remotePassword = nil
+    }
+
+    /// Creates an explicit local and remote ICE credential pair.
+    ///
+    /// Protocol integrations use this initializer when signaling, or an
+    /// implicit-signaling profile, has already established both credential
+    /// pairs. Validation is performed when the credentials are installed on a
+    /// connection so invalid input is reported as a typed ``WebRTCError``.
+    public init(
+        localUfrag: String,
+        localPassword: String,
+        remoteUfrag: String? = nil,
+        remotePassword: String? = nil
     ) {
-        self.localUfrag = localUfrag ?? Self.generateUfrag()
-        self.localPassword = localPassword ?? Self.generatePassword()
+        self.localUfrag = localUfrag
+        self.localPassword = localPassword
+        self.remoteUfrag = remoteUfrag
+        self.remotePassword = remotePassword
     }
 
     /// Generate a random ufrag (4+ characters, ICE spec)

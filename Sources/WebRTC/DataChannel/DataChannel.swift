@@ -80,6 +80,9 @@ final class DataChannelManager: Sendable {
         var channels: [UInt16: DataChannel] = [:]
         var nextStreamID: UInt16
         var nextChannelGeneration: UInt64? = 1
+        /// In-band negotiated stream identifiers are never returned to the
+        /// DCEP allocator, even after their channel is reset.
+        var reservedNegotiatedStreamIDs: Set<UInt16> = []
         var implicitlyAcknowledgedChannels: Set<UInt16> = []
         var resetProgress: [UInt16: ResetProgress] = [:]
     }
@@ -182,7 +185,8 @@ final class DataChannelManager: Sendable {
                 start: s.nextStreamID,
                 parityStart: parityStart,
                 maximumStreamID: isInitiator ? UInt16.max - 1 : UInt16.max - 2,
-                taken: s.channels
+                taken: s.channels,
+                reserved: s.reservedNegotiatedStreamIDs
             )
             let maximumStreamID = isInitiator ? UInt16.max - 1 : UInt16.max - 2
             s.nextStreamID = streamID > maximumStreamID - 2
@@ -200,6 +204,47 @@ final class DataChannelManager: Sendable {
             )
             s.channels[streamID] = channel
             return (channel, dcepBytes)
+        }
+    }
+
+    /// Registers a data channel negotiated out of band with an exact SCTP
+    /// stream identifier. No DCEP OPEN or ACK is generated.
+    ///
+    /// The identifier remains permanently reserved for this association after
+    /// reset so a normal DCEP channel cannot inherit protocol traffic delayed
+    /// from the negotiated channel's previous lifetime.
+    func openNegotiatedChannel(
+        id: UInt16,
+        label: String = "",
+        ordered: Bool = true,
+        protocol channelProtocol: String = "",
+        reliability: DataChannelReliability = .reliable
+    ) throws(DataChannelError) -> DataChannel {
+        guard label.utf8.count <= maxLabelOrProtocolLength,
+              channelProtocol.utf8.count <= maxLabelOrProtocolLength else {
+            throw .labelOrProtocolTooLong(limit: maxLabelOrProtocolLength)
+        }
+
+        return try managerState.withLock { state throws(DataChannelError) in
+            guard state.channels[id] == nil,
+                  !state.reservedNegotiatedStreamIDs.contains(id) else {
+                throw .streamAlreadyInUse(streamID: id)
+            }
+            guard state.channels.count < maxChannels else {
+                throw .tooManyChannels(limit: maxChannels)
+            }
+            let channel = DataChannel(
+                id: id,
+                generation: try Self.allocateGeneration(state: &state),
+                label: label,
+                protocol: channelProtocol,
+                ordered: ordered,
+                reliability: reliability,
+                state: .open
+            )
+            state.reservedNegotiatedStreamIDs.insert(id)
+            state.channels[id] = channel
+            return channel
         }
     }
 
@@ -358,7 +403,8 @@ final class DataChannelManager: Sendable {
         start: UInt16,
         parityStart: UInt16,
         maximumStreamID: UInt16,
-        taken: [UInt16: DataChannel]
+        taken: [UInt16: DataChannel],
+        reserved: Set<UInt16>
     ) throws(DataChannelError) -> UInt16 {
         guard start <= maximumStreamID,
               start % 2 == parityStart % 2 else {
@@ -366,7 +412,7 @@ final class DataChannelManager: Sendable {
         }
         var candidate = start
         repeat {
-            if taken[candidate] == nil {
+            if taken[candidate] == nil, !reserved.contains(candidate) {
                 return candidate
             }
             candidate = candidate > maximumStreamID - 2
@@ -676,7 +722,8 @@ final class DataChannelManager: Sendable {
     ) {
         state.channels.removeValue(forKey: channelID)
         state.implicitlyAcknowledgedChannels.remove(channelID)
-        if channelID % 2 == localParity {
+        if channelID % 2 == localParity,
+           !state.reservedNegotiatedStreamIDs.contains(channelID) {
             state.nextStreamID = channelID
         }
         state.resetProgress.removeValue(forKey: channelID)

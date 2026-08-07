@@ -2,6 +2,11 @@ name: CI
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  SWIFT_SNAPSHOT: swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a
+  SWIFT_COMPILER_COMMIT: ef761e567dc94ee
+  TOOLCHAINS: org.swift.64202607231a
+  STANDARD_WASM_SDK: swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm
+  EMBEDDED_WASM_SDK: swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm-embedded
 
 on:
   push:
@@ -15,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  macos:
     name: macOS tests
     runs-on: macos-26
     timeout-minutes: 30
@@ -23,16 +28,86 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Swift version
-        run: swift --version
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build
-        run: swift build
-
-      - name: Run tests
+      - name: Install pinned Swift toolchain
         run: |
-          python3 -c 'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
-            1200 swift test --disable-sandbox --no-parallel
+          set -euo pipefail
+          toolchain="$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain"
+          if [[ ! -d "$toolchain" ]]; then
+            package="$RUNNER_TEMP/${SWIFT_SNAPSHOT}-osx.pkg"
+            curl -fsSL --retry 3 \
+              "https://download.swift.org/swift-6.4.x-branch/xcode/${SWIFT_SNAPSHOT}/${SWIFT_SNAPSHOT}-osx.pkg" \
+              -o "$package"
+            installer -pkg "$package" -target CurrentUserHomeDirectory
+          fi
+          xcrun swiftc --version | tee "$RUNNER_TEMP/swift-version.txt"
+          grep -F "Swift ${SWIFT_COMPILER_COMMIT}" "$RUNNER_TEMP/swift-version.txt"
+
+      - name: Test package with Xcode
+        run: |
+          set -euo pipefail
+          python3 -c \
+            'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
+            1200 xcodebuild test \
+              -scheme swift-webrtc-Package \
+              -destination 'platform=macOS' \
+              -parallel-testing-enabled NO \
+              "LD_RUNPATH_SEARCH_PATHS=$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain/usr/lib/swift/macosx/testing"
+
+  wasm:
+    name: Standard and Embedded WebAssembly probes
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install pinned Swift toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain"
+          if [[ ! -d "$toolchain" ]]; then
+            package="$RUNNER_TEMP/${SWIFT_SNAPSHOT}-osx.pkg"
+            curl -fsSL --retry 3 \
+              "https://download.swift.org/swift-6.4.x-branch/xcode/${SWIFT_SNAPSHOT}/${SWIFT_SNAPSHOT}-osx.pkg" \
+              -o "$package"
+            installer -pkg "$package" -target CurrentUserHomeDirectory
+          fi
+          xcrun swiftc --version | tee "$RUNNER_TEMP/swift-version.txt"
+          grep -F "Swift ${SWIFT_COMPILER_COMMIT}" "$RUNNER_TEMP/swift-version.txt"
+
+      - name: Install matching WebAssembly SDK
+        run: |
+          set -euo pipefail
+          metadata="$(curl -fsSL --retry 3 https://www.swift.org/api/v1/install/dev/6.4.x/wasm-sdk.json)"
+          entry="$(jq -cer --arg snapshot "$SWIFT_SNAPSHOT" '.[] | select(.dir == $snapshot)' <<< "$metadata")"
+          download="$(jq -er '.download' <<< "$entry")"
+          checksum="$(jq -er '.checksum' <<< "$entry")"
+          sdk_url="https://download.swift.org/swift-6.4.x-branch/wasm-sdk/${SWIFT_SNAPSHOT}/${download}"
+          xcrun swift sdk install \
+            --swift-sdks-path "$RUNNER_TEMP/swift-sdks" \
+            "$sdk_url" \
+            --checksum "$checksum"
+          echo "SWIFT_SDKS_PATH=$RUNNER_TEMP/swift-sdks" >> "$GITHUB_ENV"
+
+      - name: Run standard WebAssembly integration probe
+        run: |
+          set -euo pipefail
+          P2P_CORE_WASM=1 xcrun swift run \
+            --swift-sdks-path "$SWIFT_SDKS_PATH" \
+            --swift-sdk "$STANDARD_WASM_SDK" \
+            --build-system swiftbuild \
+            --scratch-path "$RUNNER_TEMP/swift-webrtc-wasm" \
+            -c release \
+            WebRTCPlatformIntegrationProbe
+
+      - name: Run Embedded WebAssembly integration probe
+        run: |
+          set -euo pipefail
+          P2P_CORE_EMBEDDED=1 xcrun swift run \
+            --swift-sdks-path "$SWIFT_SDKS_PATH" \
+            --swift-sdk "$EMBEDDED_WASM_SDK" \
+            --build-system swiftbuild \
+            --scratch-path "$RUNNER_TEMP/swift-webrtc-embedded" \
+            -c release \
+            -debug-info-format none \
+            WebRTCPlatformIntegrationProbe

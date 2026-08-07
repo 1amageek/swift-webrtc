@@ -113,6 +113,34 @@ struct DataChannelManagerTests {
         #expect(channel.id == 1) // Odd for responder
     }
 
+    @Test("Negotiated channel zero is open without DCEP and never reused")
+    func negotiatedChannelZeroIsPermanentlyReserved() throws {
+        let initiator = DataChannelManager(isInitiator: true)
+        let negotiated = try initiator.openNegotiatedChannel(id: 0)
+
+        #expect(negotiated.id == 0)
+        #expect(negotiated.state == .open)
+        #expect(try initiator.sendPolicy(id: 0).unordered == false)
+
+        let (firstDCEPChannel, _) = try initiator.openChannelBytes(label: "app")
+        #expect(firstDCEPChannel.id == 2)
+
+        let responder = DataChannelManager(isInitiator: false)
+        _ = try responder.openNegotiatedChannel(id: 0)
+        let (firstResponderChannel, _) = try responder.openChannelBytes(label: "app")
+        #expect(firstResponderChannel.id == 1)
+    }
+
+    @Test("Negotiated channel rejects duplicate registration")
+    func negotiatedChannelRejectsDuplicateRegistration() throws {
+        let manager = DataChannelManager(isInitiator: true)
+        _ = try manager.openNegotiatedChannel(id: 0)
+
+        #expect(throws: DataChannelError.self) {
+            _ = try manager.openNegotiatedChannel(id: 0)
+        }
+    }
+
     @Test("Process incoming DCEP Open")
     func processIncomingOpen() throws {
         let manager = DataChannelManager(isInitiator: false)
@@ -402,6 +430,26 @@ struct DataChannelManagerTests {
             _ = try manager.processIncomingDCEPBytes(
                 streamID: implicit.id,
                 data: DCEPAck().encodeBytes()
+            )
+        }
+    }
+
+    @Test("Pion four-byte DCEP ACK opens a local channel")
+    func pionPaddedAcknowledgementIsAccepted() throws {
+        let manager = DataChannelManager(isInitiator: true)
+        let (channel, _) = try manager.openChannelBytes(label: "pion")
+
+        let (_, opened) = try manager.processIncomingDCEPBytes(
+            streamID: channel.id,
+            data: [DCEPMessageType.dataChannelAck.rawValue, 0, 0, 0]
+        )
+
+        #expect(opened?.id == channel.id)
+        #expect(opened?.state == .open)
+        #expect(throws: DataChannelError.self) {
+            _ = try manager.processIncomingDCEPBytes(
+                streamID: channel.id,
+                data: [DCEPMessageType.dataChannelAck.rawValue, 0, 0, 1]
             )
         }
     }

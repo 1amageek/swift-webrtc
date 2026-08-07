@@ -157,7 +157,17 @@ struct DCEPAck: Sendable {
     }
 
     static func decode(from data: [UInt8]) throws(DataChannelWireError) -> DCEPAck {
-        guard data.count == 1, data[0] == DCEPMessageType.dataChannelAck.rawValue else {
+        // RFC 8832 defines a one-byte ACK. pion/datachannel, including the
+        // version used by go-libp2p WebRTC, emits a four-byte value with three
+        // zero octets after the message type. Accept that deployed encoding
+        // without accepting arbitrary trailing application data.
+        let isRFCEncoding = data.count == 1
+        let isPionEncoding = data.count == 4
+            && data[1] == 0
+            && data[2] == 0
+            && data[3] == 0
+        guard (isRFCEncoding || isPionEncoding),
+              data[0] == DCEPMessageType.dataChannelAck.rawValue else {
             throw .decode(.invalidFormat("Not a DCEP Ack message"))
         }
         return DCEPAck()

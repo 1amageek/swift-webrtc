@@ -53,9 +53,8 @@ struct ICELiteTests {
         agent.setRemoteCredentials(ufrag: remoteUfrag, password: remotePassword)
 
         // Create a STUN binding request with proper USERNAME and MESSAGE-INTEGRITY
-        // USERNAME format: remoteUfrag:localUfrag (from the sender's perspective)
-        // The sender uses their ufrag as remoteUfrag and our ufrag as localUfrag
-        let username = "\(remoteUfrag):\(agent.credentials.localUfrag)"
+        // The sender addresses this agent first, followed by its own fragment.
+        let username = "\(agent.credentials.localUfrag):\(remoteUfrag)"
         let key = agent.credentials.stunKey
 
         // Use ICE-CONTROLLING since ICE Lite is always controlled
@@ -102,10 +101,8 @@ struct ICELiteTests {
         agent.setRemoteCredentials(ufrag: remoteUfrag, password: remotePassword)
 
         let key = agent.credentials.stunKey
-        // USERNAME = "<peerUfragWeExpectAsRemote>:<ourLocalUfrag>". The sender
-        // here uses the WRONG remote half ("wrongRemote") but the correct local
-        // half — must be rejected once the remote ufrag is known.
-        let username = "wrongRemote:\(agent.credentials.localUfrag)"
+        // The receiver fragment is correct, but the sender fragment is wrong.
+        let username = "\(agent.credentials.localUfrag):wrongRemote"
         let msg = STUNMessage.bindingRequest(username: username, iceControlling: 1)
         let encoded = msg.encodeWithIntegrity(key: key)
 
@@ -127,7 +124,7 @@ struct ICELiteTests {
         agent.setRemoteCredentials(ufrag: remoteUfrag, password: "remotePassword456789012345")
 
         let key = agent.credentials.stunKey
-        let username = "\(remoteUfrag):\(agent.credentials.localUfrag)"
+        let username = "\(agent.credentials.localUfrag):\(remoteUfrag)"
         let msg = STUNMessage.bindingRequest(username: username, iceControlling: 1)
         let encoded = msg.encodeWithIntegrity(key: key)
 

@@ -73,13 +73,17 @@ public final class WebRTCEndpoint: Sendable {
     /// - Returns: A new client-side WebRTC connection
     public func connect(
         remoteFingerprint: CertificateFingerprint,
+        iceConfiguration: WebRTCICEConfiguration = .prevalidated,
         mediaConfiguration: WebRTCMediaConfiguration? = nil,
+        negotiatedDataChannels: [WebRTCNegotiatedDataChannel] = [],
         sendHandler: @escaping WebRTCConnection.SendHandler
     ) throws(WebRTCError) -> WebRTCConnection {
         let connection = try WebRTCConnection.asClient(
             certificate: certificate,
             remoteFingerprint: remoteFingerprint,
+            iceConfiguration: iceConfiguration,
             mediaConfiguration: mediaConfiguration,
+            negotiatedDataChannels: negotiatedDataChannels,
             sendHandler: sendHandler,
             timer: timer,
             logger: logger
@@ -109,11 +113,15 @@ public final class WebRTCEndpoint: Sendable {
     ///
     /// - Returns: A new WebRTC listener that accepts incoming connections
     public func listen(
-        mediaConfiguration: WebRTCMediaConfiguration? = nil
+        iceConfiguration: WebRTCICEConfiguration = .prevalidated,
+        mediaConfiguration: WebRTCMediaConfiguration? = nil,
+        negotiatedDataChannels: [WebRTCNegotiatedDataChannel] = []
     ) throws(WebRTCError) -> WebRTCListener {
         let listener = WebRTCListener(
             certificate: certificate,
+            iceConfiguration: iceConfiguration,
             mediaConfiguration: mediaConfiguration,
+            negotiatedDataChannels: negotiatedDataChannels,
             timer: timer,
             logger: logger
         )

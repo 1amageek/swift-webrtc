@@ -158,17 +158,19 @@ struct ICELiteStateMachine: Sendable, Equatable {
         guard let username = input.username else {
             return .reject(.invalidUsernameFormat)
         }
-        // USERNAME is "<ourUfrag>:<peerUfrag>" from our receiving perspective.
+        // RFC 8445 Section 7.2.2: the sender constructs USERNAME as
+        // "<receiverUfrag>:<senderUfrag>". From this receiving agent's
+        // perspective, the local fragment is therefore first.
         let parts = username.split(separator: ":", maxSplits: 1)
         guard parts.count == 2 else {
             return .reject(.invalidUsernameFormat)
         }
-        let receivedLocalUfrag = String(parts[1])
+        let receivedLocalUfrag = String(parts[0])
         guard receivedLocalUfrag == localUfrag else {
             return .reject(.localUfragMismatch)
         }
         if let remoteUfrag {
-            let receivedRemoteUfrag = String(parts[0])
+            let receivedRemoteUfrag = String(parts[1])
             guard receivedRemoteUfrag == remoteUfrag else {
                 return .reject(.remoteUfragMismatch)
             }
