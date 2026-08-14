@@ -22,7 +22,7 @@ concurrency:
 jobs:
   macos:
     name: macOS tests
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -39,6 +39,9 @@ jobs:
               -o "$package"
             installer -pkg "$package" -target CurrentUserHomeDirectory
           fi
+          xcode_ld="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
+          test -x "$xcode_ld"
+          ln -sfn "$xcode_ld" "$toolchain/usr/bin/ld"
           xcrun swiftc --version | tee "$RUNNER_TEMP/swift-version.txt"
           grep -F "Swift ${SWIFT_COMPILER_COMMIT}" "$RUNNER_TEMP/swift-version.txt"
 
