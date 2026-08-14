@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Packetizes one borrowed H.264 access unit and transfers packet owners to a sink.
 public protocol H264RTPAccessUnitSending: Sendable {

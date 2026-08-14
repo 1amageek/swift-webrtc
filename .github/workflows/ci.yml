@@ -42,16 +42,81 @@ jobs:
           xcrun swiftc --version | tee "$RUNNER_TEMP/swift-version.txt"
           grep -F "Swift ${SWIFT_COMPILER_COMMIT}" "$RUNNER_TEMP/swift-version.txt"
 
-      - name: Test package with Xcode
+      - name: Build test bundle with Xcode
         run: |
           set -euo pipefail
           python3 -c \
             'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
-            1200 xcodebuild test \
+            120 xcodebuild build-for-testing \
+              -toolchain "$TOOLCHAINS" \
               -scheme swift-webrtc-Package \
               -destination 'platform=macOS' \
               -parallel-testing-enabled NO \
-              "LD_RUNPATH_SEARCH_PATHS=$HOME/Library/Developer/Toolchains/${SWIFT_SNAPSHOT}.xctoolchain/usr/lib/swift/macosx/testing"
+              'LD_RUNPATH_SEARCH_PATHS=$(inherited) /Users/runner/Library/Developer/Toolchains/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a.xctoolchain/usr/lib/swift/macosx/testing'
+
+      - name: Test portable protocol targets
+        run: |
+          set -euo pipefail
+          python3 -c \
+            'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
+            120 xcodebuild test-without-building \
+              -toolchain "$TOOLCHAINS" \
+              -scheme swift-webrtc-Package \
+              -destination 'platform=macOS' \
+              -parallel-testing-enabled NO \
+              -only-testing:RTPWireCoreTests \
+              -only-testing:H264ByteStreamCoreTests \
+              -only-testing:H264RTPPayloadCoreTests \
+              -only-testing:H264RTPTests \
+              -only-testing:H264RTPSenderTests \
+              -only-testing:H264RTPReceiverTests \
+              -only-testing:SRTPCoreTests \
+              -only-testing:STUNCoreTests \
+              -only-testing:ICELiteTests \
+              -only-testing:ICELiteCoreTests \
+              -only-testing:SCTPCoreTests \
+              -only-testing:DataChannelTests \
+              'LD_RUNPATH_SEARCH_PATHS=$(inherited) /Users/runner/Library/Developer/Toolchains/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a.xctoolchain/usr/lib/swift/macosx/testing'
+
+      - name: Test long WebRTC integration suites
+        run: |
+          set -euo pipefail
+          python3 -c \
+            'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
+            120 xcodebuild test-without-building \
+              -toolchain "$TOOLCHAINS" \
+              -scheme swift-webrtc-Package \
+              -destination 'platform=macOS' \
+              -parallel-testing-enabled NO \
+              -only-testing:WebRTCTests/WebRTCLoopbackTests \
+              -only-testing:WebRTCTests/WebRTCMediaIntegrationTests \
+              -only-testing:WebRTCTests/WebRTCListenerTests \
+              'LD_RUNPATH_SEARCH_PATHS=$(inherited) /Users/runner/Library/Developer/Toolchains/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a.xctoolchain/usr/lib/swift/macosx/testing'
+
+      - name: Test remaining WebRTC facade suites
+        run: |
+          set -euo pipefail
+          python3 -c \
+            'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
+            120 xcodebuild test-without-building \
+              -toolchain "$TOOLCHAINS" \
+              -scheme swift-webrtc-Package \
+              -destination 'platform=macOS' \
+              -parallel-testing-enabled NO \
+              -only-testing:WebRTCTests/WebRTCCertificateTests \
+              -only-testing:WebRTCTests/WebRTCConnectionDemultiplexTests \
+              -only-testing:WebRTCTests/WebRTCConnectionDataChannelEventTests \
+              -only-testing:WebRTCTests/WebRTCDTLSRetransmissionTests \
+              -only-testing:WebRTCTests/WebRTCTimerTests \
+              -only-testing:WebRTCTests/STUNBindingTransactionTests \
+              -only-testing:WebRTCTests/WebRTCMediaConfigurationTests \
+              -only-testing:WebRTCTests/DTLSEndpointTests \
+              -only-testing:WebRTCTests/WebRTCSessionDescriptionTests \
+              -only-testing:WebRTCTests/CertificateFingerprintTests \
+              -only-testing:WebRTCTests/WebRTCTrickleICECandidateTests \
+              -only-testing:WebRTCTests/WebRTCEndpointTests \
+              -only-testing:WebRTCTests/WebRTCConnectionTests \
+              'LD_RUNPATH_SEARCH_PATHS=$(inherited) /Users/runner/Library/Developer/Toolchains/swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a.xctoolchain/usr/lib/swift/macosx/testing'
 
   wasm:
     name: Standard and Embedded WebAssembly probes
@@ -89,25 +154,54 @@ jobs:
             --checksum "$checksum"
           echo "SWIFT_SDKS_PATH=$RUNNER_TEMP/swift-sdks" >> "$GITHUB_ENV"
 
-      - name: Run standard WebAssembly integration probe
+      - name: Build standard WebAssembly integration probe
         run: |
           set -euo pipefail
-          P2P_CORE_WASM=1 xcrun swift run \
+          SWIFT_NETWORKING_WASM=1 xcrun swift build \
             --swift-sdks-path "$SWIFT_SDKS_PATH" \
             --swift-sdk "$STANDARD_WASM_SDK" \
             --build-system swiftbuild \
             --scratch-path "$RUNNER_TEMP/swift-webrtc-wasm" \
             -c release \
-            WebRTCPlatformIntegrationProbe
+            --product WebRTCPlatformIntegrationProbe
 
-      - name: Run Embedded WebAssembly integration probe
+      - name: Run standard WebAssembly integration probe
         run: |
           set -euo pipefail
-          P2P_CORE_EMBEDDED=1 xcrun swift run \
+          python3 -c \
+            'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
+            120 env SWIFT_NETWORKING_WASM=1 xcrun swift run \
+              --swift-sdks-path "$SWIFT_SDKS_PATH" \
+              --swift-sdk "$STANDARD_WASM_SDK" \
+              --build-system swiftbuild \
+              --scratch-path "$RUNNER_TEMP/swift-webrtc-wasm" \
+              -c release \
+              --skip-build \
+              WebRTCPlatformIntegrationProbe
+
+      - name: Build Embedded WebAssembly integration probe
+        run: |
+          set -euo pipefail
+          SWIFT_NETWORKING_EMBEDDED=1 xcrun swift build \
             --swift-sdks-path "$SWIFT_SDKS_PATH" \
             --swift-sdk "$EMBEDDED_WASM_SDK" \
             --build-system swiftbuild \
             --scratch-path "$RUNNER_TEMP/swift-webrtc-embedded" \
             -c release \
             -debug-info-format none \
-            WebRTCPlatformIntegrationProbe
+            --product WebRTCPlatformIntegrationProbe
+
+      - name: Run Embedded WebAssembly integration probe
+        run: |
+          set -euo pipefail
+          python3 -c \
+            'import subprocess,sys; sys.exit(subprocess.run(sys.argv[2:], timeout=int(sys.argv[1])).returncode)' \
+            120 env SWIFT_NETWORKING_EMBEDDED=1 xcrun swift run \
+              --swift-sdks-path "$SWIFT_SDKS_PATH" \
+              --swift-sdk "$EMBEDDED_WASM_SDK" \
+              --build-system swiftbuild \
+              --scratch-path "$RUNNER_TEMP/swift-webrtc-embedded" \
+              -c release \
+              -debug-info-format none \
+              --skip-build \
+              WebRTCPlatformIntegrationProbe

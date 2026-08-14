@@ -2,8 +2,9 @@
 
 A pure Swift WebRTC Direct implementation with data channels and an
 authenticated RTP/RTCP transport. It does not embed a C/C++ WebRTC stack;
-portable cryptography is supplied by `swift-ssl` through
-`swift-p2p-core`'s `P2PCrypto` module. The current development
+portable cryptography and certificate handling are supplied directly by
+`swift-ssl`, while shared bytes and time capabilities come from
+`swift-networking`. The current development
 release also contains zero-copy-oriented H.264 sender and bounded receiver
 pipelines exposed through one optional media facade:
 
@@ -24,9 +25,11 @@ authenticated plaintext RTP packet owner
   → one exact decoder-bound access-unit owner
 ```
 
-> **Release status.** Current release: `2.0.0`. It publishes the unified
+> **Release status.** Current release: `3.0.0`. It publishes the unified
 > `WebRTC` transport and optional `WebRTCMedia` composition product against
-> tagged Pure Swift dependencies.
+> tagged Pure Swift dependencies. Version 3 moves the shared byte and time
+> contracts to `swift-networking` and uses `swift-ssl` directly for portable
+> cryptography, ASN.1, and X.509.
 >
 > **Media status.** The release implements RTP/RTCP wire parsing,
 > DTLS `use_srtp`, the RFC 5705 exporter, AES-CM/HMAC-SHA1-80 SRTP/SRTCP, and
@@ -85,7 +88,7 @@ its mechanism implementation is supplied by `swift-ssl`. See the
 
 ## Requirements
 
-These requirements describe the `2.0.0` release.
+These requirements describe the `3.0.0` release.
 
 - Swift 6.4 development snapshot `2026-07-23`
 - macOS 26+ / iOS 26+ / tvOS 26+ / watchOS 26+ / visionOS 26+
@@ -95,7 +98,7 @@ These requirements describe the `2.0.0` release.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "2.0.0"),
+    .package(url: "https://github.com/1amageek/swift-webrtc.git", from: "3.0.0"),
 ]
 ```
 
@@ -349,32 +352,40 @@ authenticated RTP/RTCP ingress.
 | `DataChannelBenchmarks` | DCEP encode/decode, channel open/lookup |
 | `TURNBenchmarks` | Send/Data Indication payload-owner copies and 1,200-byte throughput |
 
-Current arm64 Release snapshot (2026-08-07, pinned Swift 6.4 toolchain):
+Current arm64 Release snapshot (2026-08-14, Apple M4 Max, macOS 27.0,
+pinned Swift 6.4 toolchain). Latency and throughput values are the median of
+three independent `test-without-building` runs:
 
 | Measurement | Result |
 |---|---:|
 | TURN Send Indication payload-owner copies | 0 at 1, 1,200, and 16,384 bytes |
 | TURN Data Indication additional payload allocations | 0 at 1, 1,200, and 16,384 bytes |
-| TURN Send Indication, 1,200 bytes | 3,534.10 MB/s; 339.55 ns/op |
-| RTP parse, 12 / 1,200 / 65,535 bytes | 8.356 / 8.360 / 8.356 ns; normalized slope -0.000244 |
-| H.264 final materialization, 4 KiB | 72.23 ns bulk; 7,292.42 ns scalar; ratio 0.00990 |
-| H.264 final materialization, 64 KiB | 586.43 ns bulk; 116,270.02 ns scalar; ratio 0.00504 |
+| TURN Send Indication, 1,200 bytes | 2,237.28 MB/s; 536.37 ns/op |
+| RTP parse, 12 / 1,200 / 65,535 bytes | 12.798 / 12.790 / 12.783 ns; normalized slope -0.000408 |
+| H.264 final materialization, 4 KiB | 73.22 ns bulk; 10,169.94 ns scalar; ratio 0.00717 |
+| H.264 final materialization, 64 KiB | 773.93 ns bulk; 164,028.64 ns scalar; ratio 0.00474 |
 
 ### Running benchmarks
 
 ```bash
 SWIFT_TOOLCHAIN_USR="$(dirname "$(dirname "$(xcrun --toolchain org.swift.64202607231a --find swift)")")"
 
-# Build the package with the pinned Swift 6.4 snapshot
+# Build the benchmark test bundles once with the pinned Swift 6.4 snapshot
 SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
-  xcodebuild build -scheme swift-webrtc-Package \
-  -configuration Release -destination 'platform=macOS'
+  xcodebuild build-for-testing \
+  -toolchain org.swift.64202607231a \
+  -scheme swift-webrtc-Package \
+  -configuration Release -destination 'platform=macOS' \
+  ENABLE_TESTABILITY=YES \
+  "LD_RUNPATH_SEARCH_PATHS=\$(inherited) ${SWIFT_TOOLCHAIN_USR}/lib/swift/macosx/testing"
 
 # Run the data-channel benchmarks with an explicit timeout
 SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
-  xcodebuild test -scheme swift-webrtc-Package \
+  xcodebuild test-without-building \
+  -toolchain org.swift.64202607231a \
+  -scheme swift-webrtc-Package \
   -configuration Release \
   -destination 'platform=macOS' \
   -only-testing:PerformanceTests \
@@ -385,7 +396,9 @@ TOOLCHAINS=org.swift.64202607231a \
 # Run the independent RTP asymptotic gate
 SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
-  xcodebuild test -scheme swift-webrtc-Package \
+  xcodebuild test-without-building \
+  -toolchain org.swift.64202607231a \
+  -scheme swift-webrtc-Package \
   -configuration Release \
   -destination 'platform=macOS' \
   -only-testing:RTPWireCorePerformanceTests \
@@ -396,7 +409,9 @@ TOOLCHAINS=org.swift.64202607231a \
 # Run the H.264 final-materialization regression gate
 SWIFT_WEBRTC_ENABLE_BENCHMARKS=1 \
 TOOLCHAINS=org.swift.64202607231a \
-  xcodebuild test -scheme swift-webrtc-Package \
+  xcodebuild test-without-building \
+  -toolchain org.swift.64202607231a \
+  -scheme swift-webrtc-Package \
   -configuration Release \
   -destination 'platform=macOS' \
   -only-testing:H264RTPPayloadCorePerformanceTests \
@@ -431,21 +446,23 @@ SWIFT_TOOLCHAIN_USR="$(dirname "$(dirname "$(xcrun --toolchain org.swift.6420260
 
 # Native tests with the pinned Swift 6.4 snapshot
 TOOLCHAINS=org.swift.64202607231a \
-  xcodebuild test -scheme swift-webrtc-Package \
+  xcodebuild test -toolchain org.swift.64202607231a \
+  -scheme swift-webrtc-Package \
   -destination 'platform=macOS' \
   -maximum-test-execution-time-allowance 60 \
   "LD_RUNPATH_SEARCH_PATHS=\$(inherited) ${SWIFT_TOOLCHAIN_USR}/lib/swift/macosx/testing"
 
 # A focused test suite
 TOOLCHAINS=org.swift.64202607231a \
-  xcodebuild test -scheme swift-webrtc-Package \
+  xcodebuild test -toolchain org.swift.64202607231a \
+  -scheme swift-webrtc-Package \
   -destination 'platform=macOS' \
   -only-testing:H264RTPReceiverTests \
   -maximum-test-execution-time-allowance 60 \
   "LD_RUNPATH_SEARCH_PATHS=\$(inherited) ${SWIFT_TOOLCHAIN_USR}/lib/swift/macosx/testing"
 
 # Normal WASM portable runtime probe
-P2P_CORE_WASM=1 \
+SWIFT_NETWORKING_WASM=1 \
 "$(xcrun --toolchain org.swift.64202607231a --find swift)" run \
   --package-path . --build-system swiftbuild -c release \
   --scratch-path /tmp/swift-webrtc-wasm-normal \
@@ -453,7 +470,7 @@ P2P_CORE_WASM=1 \
   WebRTCPlatformIntegrationProbe
 
 # Embedded WASM portable runtime probe
-P2P_CORE_EMBEDDED=1 \
+SWIFT_NETWORKING_EMBEDDED=1 \
   "$(xcrun --toolchain org.swift.64202607231a --find swift)" run \
   --package-path . --build-system swiftbuild -c release \
   -debug-info-format none \

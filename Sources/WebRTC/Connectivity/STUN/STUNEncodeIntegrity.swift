@@ -3,7 +3,7 @@
 /// Builds the wire format in a single `[UInt8]` buffer: the header length field is
 /// first written to cover MESSAGE-INTEGRITY for the HMAC input, then patched in
 /// place to also cover FINGERPRINT for the CRC input. The HMAC routes through the
-/// `MessageAuthenticationCode` seam backed by `DefaultHMACSHA1`, so the same
+/// `MessageAuthenticationCode` seam backed by `SSLCrypto.HMACSHA1`, so the same
 /// code signs identically on every build.
 ///
 /// This is the Embedded-clean counterpart of the historical

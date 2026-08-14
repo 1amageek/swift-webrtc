@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Materializes a validated packetization layout into caller-owned storage.
 public protocol H264RTPPayloadEncoding: Sendable {

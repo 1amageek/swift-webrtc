@@ -11,6 +11,8 @@
 /// type needs no Foundation import and is shared by both the host adapter and the
 /// Embedded engine.
 
+import NetworkingTime
+
 public enum SCTPError: Error, Sendable {
     case insufficientData(expected: Int, actual: Int)
     case invalidFormat(String)
@@ -61,6 +63,7 @@ public enum SCTPError: Error, Sendable {
     case shutdownTimeout
     case shutdownGuardTimeout
     case invalidShutdownRTO(actual: UInt64)
+    case timeFailed(TimeError)
     case monotonicClockFailure(code: UInt32)
     case monotonicClockValueOutOfRange
 }

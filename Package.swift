@@ -3,9 +3,9 @@ import PackageDescription
 
 // Embedded toggle controls the experimental Embedded feature + WMO for the
 // Embedded-clean cores. Lifetimes is enabled in BOTH modes because Span-returning
-// members of the P2PCoreBytes dependency require @_lifetime.
-let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
-let wasiEnabled = Context.environment["P2P_CORE_WASM"] == "1"
+// members of NetworkingCore require @_lifetime.
+let embeddedEnabled = Context.environment["SWIFT_NETWORKING_EMBEDDED"] == "1"
+let wasiEnabled = Context.environment["SWIFT_NETWORKING_WASM"] == "1"
 let portableEnabled = embeddedEnabled || wasiEnabled
 let includesBenchmarks = Context.environment["SWIFT_WEBRTC_ENABLE_BENCHMARKS"] == "1"
 
@@ -51,17 +51,17 @@ let embeddedWebRTCLinkerSettings: [LinkerSetting] = embeddedEnabled
 // `WebRTC`; they are not separately consumable Swift modules.
 //
 // The DTLS facade (`TLS`) and the portable protocol implementation dual-build
-// under `P2P_CORE_EMBEDDED`. Certificate generation, parsing, and fingerprinting
+// under `SWIFT_NETWORKING_EMBEDDED`. Certificate generation, parsing, and fingerprinting
 // use the same Pure Swift path on Native, WASI, and Embedded. Native, WASI, and
 // Embedded schedule both DTLS flight and SCTP
-// retransmission deadlines through an injected `P2PCoreCrypto.AsyncTimer`.
+// retransmission deadlines through an injected `NetworkingTime.AsyncTimer`.
 //
 // `WebRTC` Embedded-compiles end to end: a full
-// `P2P_CORE_EMBEDDED=1 swift build --target WebRTC -c release`
+// `SWIFT_NETWORKING_EMBEDDED=1 swift build --target WebRTC -c release`
 // builds the same module. The facade exposes a `[UInt8]` public surface (with host-only
 // `Data` convenience overloads gated by `canImport(Foundation)`, so swift-libp2p's
 // `Data`-based consumers are unaffected); Foundation / Logging are optional imports, the fingerprint SHA-256 is
-// routed through `P2PCrypto`'s `DefaultSHA256`, the retransmission driver
+// routed through `SSLCrypto.SHA256`, the retransmission driver
 // uses the `AsyncTimer` seam, and the public facade's throwing entry points use
 // typed throws (`throws(WebRTCError)`). Host builds retain underlying error
 // descriptions where available; Embedded builds use stable operation context
@@ -72,14 +72,13 @@ let webRTCDependencies: [Target.Dependency] = {
         // swift-tls' Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
         // Its DTLS 1.2 mechanism is owned by swift-ssl.
         .product(name: "TLS", package: "swift-tls"),
-        // Time + deadline-sleep seam for the retransmission driver (dual-build).
-        .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-        // Concrete AES-CTR and HMAC-SHA1 provider used by SRTPCore.
-        .product(name: "P2PCrypto", package: "swift-p2p-core"),
-        // Externally-provisioned identity parsing and portable fingerprinting
-        // are required by WASI/Embedded and remain available on hosts.
-        .product(name: "P2PCoreBytes", package: "swift-ssl"),
-        .product(name: "P2PCoreDER", package: "swift-p2p-core"),
+        .product(name: "NetworkingCore", package: "swift-networking"),
+        .product(name: "NetworkingTime", package: "swift-networking"),
+        .product(name: "NetworkingPOSIX", package: "swift-networking"),
+        .product(name: "NetworkingWASI", package: "swift-networking"),
+        .product(name: "SSLCrypto", package: "swift-ssl"),
+        .product(name: "SSLASN1", package: "swift-ssl"),
+        .product(name: "SSLX509", package: "swift-ssl"),
     ]
     d += [
         .product(
@@ -97,18 +96,17 @@ let packageDependencies: [Package.Dependency] = {
         // swift-tls' Tier-1 `TLS` facade (`DTLSClient`/`DTLSServer`).
         // Its DTLS 1.2 mechanism is owned by swift-ssl/SSLDTLS.
         .package(
-            url: "https://github.com/1amageek/swift-tls.git",
-            from: "1.3.3"
-        ),
-        .package(
-            url: "https://github.com/1amageek/swift-p2p-core.git",
-            from: "0.3.2"
+            url: "https://github.com/1amageek/swift-networking.git",
+            from: "0.1.0"
         ),
         .package(
             url: "https://github.com/1amageek/swift-ssl.git",
-            from: "0.1.1"
+            from: "0.3.0"
         ),
-        // `swift-p2p-core` also owns the P2PCrypto protocol adapter module.
+        .package(
+            url: "https://github.com/1amageek/swift-tls.git",
+            from: "2.0.1"
+        ),
     ]
     d += [
         .package(url: "https://github.com/apple/swift-log.git", from: "1.9.0"),
@@ -149,7 +147,7 @@ let package = Package(
             name: "WebRTCMedia",
             dependencies: [
                 "WebRTC",
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
             ],
             path: "Sources/WebRTCMedia",
             exclude: [
@@ -174,7 +172,10 @@ let package = Package(
             dependencies: [
                 "WebRTC",
                 "WebRTCMedia",
-                .product(name: "P2PCoreDER", package: "swift-p2p-core"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
+                .product(name: "SSLASN1", package: "swift-ssl"),
+                .product(name: "SSLX509", package: "swift-ssl"),
             ],
             path: "Tests/WebRTCPlatformIntegrationProbe",
             swiftSettings: platformProbeSettings
@@ -223,8 +224,8 @@ let package = Package(
             name: "SRTPCoreTests",
             dependencies: [
                 "WebRTC",
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
             ],
             path: "Tests/SRTPCoreTests",
             swiftSettings: coreSettings
@@ -236,9 +237,8 @@ let package = Package(
             name: "SCTPCoreTests",
             dependencies: [
                 "WebRTC",
-                .product(name: "P2PCoreBytes", package: "swift-ssl"),
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-                .product(name: "P2PCrypto", package: "swift-p2p-core"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
             ],
             path: "Tests/SCTPCoreTests"
         ),
@@ -251,8 +251,11 @@ let package = Package(
             name: "WebRTCTests",
             dependencies: [
                 "WebRTC",
-                .product(name: "P2PCoreCrypto", package: "swift-ssl"),
-                .product(name: "P2PCoreDER", package: "swift-p2p-core"),
+                .product(name: "NetworkingCore", package: "swift-networking"),
+                .product(name: "NetworkingTime", package: "swift-networking"),
+                .product(name: "SSLCrypto", package: "swift-ssl"),
+                .product(name: "SSLASN1", package: "swift-ssl"),
+                .product(name: "SSLX509", package: "swift-ssl"),
             ],
             path: "Tests/WebRTCTests"
         ),

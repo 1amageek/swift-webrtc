@@ -13,7 +13,7 @@
 ///  |                                                               |
 ///  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// STUN message type (method + class encoded in 14 bits)
 struct STUNMessageType: Sendable, Equatable, Hashable {
@@ -64,7 +64,7 @@ struct STUNMessageType: Sendable, Equatable, Hashable {
 
 /// A STUN message.
 ///
-/// The Embedded-clean core encodes/decodes over `[UInt8]`/`P2PCoreBytes`. The
+/// The Embedded-clean core encodes/decodes over `[UInt8]`/`NetworkingCore`. The
 /// `STUNCore` adapter restores the `Data`-based public surface, the
 /// crypto-backed `encodeWithIntegrity`, and the defaulted convenience inits.
 struct STUNMessage: Sendable {

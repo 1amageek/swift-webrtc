@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 import WebRTC
 /// One-owner RTP packet assembly for RFC 6184 H.264 payloads.
 public struct RFC6184H264RTPPacketAssembler: H264RTPPacketAssembling, Sendable {

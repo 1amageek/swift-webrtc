@@ -76,8 +76,8 @@ and remote exporter material for inbound keys.
   not yet been established as a release claim. A provider that materializes an
   input `Span` internally does not satisfy the packet-copy budget, even though
   the SRTP component itself does not copy it.
-- The WebRTC composition adapter resolves the concrete `P2PCrypto.Default*`
-  implementation on every target and consumes each packet range by a scoped
+- The WebRTC composition adapter resolves the concrete `SSLCrypto` AES-CTR and
+  HMAC-SHA1 implementations on every target and consumes each packet range by a scoped
   `Span` borrow. Provider suites own the incremental-HMAC
   equivalence checks; the SRTP component additionally verifies that a
   caller-reserved trailer capacity preserves the packet owner's storage address through

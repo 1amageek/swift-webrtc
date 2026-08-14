@@ -2,7 +2,7 @@
 ///
 /// Each SCTP chunk has: type (1) + flags (1) + length (2) + value
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// SCTP chunk type identifiers
 enum SCTPChunkType: UInt8, Sendable {

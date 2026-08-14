@@ -4,7 +4,7 @@
 /// compare, expiry) live in the Embedded-clean `SCTPCookieCore`. This adapter
 /// keeps the historical `Data`-based public surface, supplies the monotonic clock
 /// (`ProcessInfo.systemUptime`), and routes the HMAC through the
-/// immutable non-generic crypto context using `P2PCrypto.DefaultHMACSHA256` on
+/// immutable non-generic crypto context using `SSLCrypto.HMACSHA256` on
 /// every target. The cookie-secret rotation stays with the
 /// caller (`SCTPAssociation`). The binding check is fail-closed: any mismatch
 /// (HMAC, expiry, future timestamp) is rejected via the core, never accepted.

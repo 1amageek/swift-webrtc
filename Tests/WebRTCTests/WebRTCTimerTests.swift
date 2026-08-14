@@ -1,4 +1,4 @@
-import P2PCoreCrypto
+import NetworkingTime
 import Synchronization
 import Testing
 @testable import WebRTC
@@ -9,9 +9,10 @@ struct WebRTCTimerTests {
         let backend = RecordingTimerBackend()
         let timer = WebRTCTimer(backend)
 
-        #expect(timer.monotonicNanos() == 123)
-        #expect(timer.monotonicMillis() == 45)
-        try await timer.sleep(untilNanos: 987)
+        #expect(try timer.now().nanoseconds == 123)
+        try await timer.sleep(
+            until: MonotonicInstant(clockIdentifier: 42, nanoseconds: 987)
+        )
         #expect(backend.snapshot.deadlines == [987])
     }
 
@@ -21,7 +22,9 @@ struct WebRTCTimerTests {
         let timer = WebRTCTimer(backend)
 
         do {
-            try await timer.sleep(untilNanos: 987)
+            try await timer.sleep(
+                until: MonotonicInstant(clockIdentifier: 42, nanoseconds: 987)
+            )
             Issue.record("Expected typed timer cancellation")
         } catch {
             #expect(backend.snapshot.deadlines == [987])
@@ -45,20 +48,19 @@ private final class RecordingTimerBackend: AsyncTimer, Sendable {
         state.withLock { $0 }
     }
 
-    func monotonicNanos() -> UInt64 {
-        123
-    }
-
-    func monotonicMillis() -> UInt64 {
-        45
+    func now() throws(TimeError) -> MonotonicInstant {
+        MonotonicInstant(clockIdentifier: 42, nanoseconds: 123)
     }
 
     func sleep(
-        untilNanos deadlineNanos: UInt64
-    ) async throws(CancellationError) {
-        state.withLock { $0.deadlines.append(deadlineNanos) }
+        until deadline: MonotonicInstant
+    ) async throws(TimeError) {
+        guard deadline.clockIdentifier == 42 else {
+            throw .clockDomainMismatch(expected: 42, actual: deadline.clockIdentifier)
+        }
+        state.withLock { $0.deadlines.append(deadline.nanoseconds) }
         if throwsCancellation {
-            throw CancellationError()
+            throw .cancelled
         }
     }
 }

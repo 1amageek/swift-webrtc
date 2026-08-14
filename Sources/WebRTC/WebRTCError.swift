@@ -1,3 +1,5 @@
+import NetworkingTime
+
 /// WebRTC Errors
 
 /// Errors in WebRTC operations
@@ -48,6 +50,8 @@ public enum WebRTCError: Error, Sendable {
     case mediaProtectionFailed(SRTPError)
     /// The synchronous transport boundary rejected an outbound datagram.
     case datagramSendFailed(WebRTCDatagramSendFailure)
+    /// The injected monotonic clock or timer failed.
+    case timeFailed(TimeError)
     case timeout
     case closed
 }

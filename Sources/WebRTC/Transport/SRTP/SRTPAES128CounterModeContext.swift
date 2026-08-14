@@ -1,4 +1,4 @@
-import P2PCoreCrypto
+import NetworkingTime
 
 /// Immutable owner of one keyed AES-128 counter-mode operation.
 ///

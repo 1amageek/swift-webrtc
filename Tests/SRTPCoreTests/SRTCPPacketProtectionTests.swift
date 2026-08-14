@@ -1,5 +1,5 @@
-import P2PCoreCrypto
-import P2PCrypto
+import NetworkingTime
+import SSLCrypto
 import Testing
 @testable import WebRTC
 @Suite("SRTCP packet protection")
@@ -90,11 +90,10 @@ struct SRTCPPacketProtectionTests {
             from: material,
             crypto: defaultSRTPCryptoContext()
         )
-        var authenticator = DefaultCryptoProvider.HMACSHA1(
+        let digest = testHMACSHA1(
+            message: protected.span.extracting(0..<authenticatedByteCount),
             key: keys.rtcpAuthenticationKey.span
         )
-        authenticator.update(protected.span.extracting(0..<authenticatedByteCount))
-        let digest = authenticator.finalize()
         protected.replaceSubrange(
             authenticatedByteCount..<protected.count,
             with: digest.prefix(10)
@@ -124,7 +123,7 @@ struct SRTCPPacketProtectionTests {
         let plaintext = rtcpPictureLossIndication()
         var firstAttempt = plaintext
 
-        #expect(throws: SRTPError.counterMode(.providerFailure)) {
+        #expect(throws: SRTPError.counterMode(.primitiveFailure)) {
             try sender.protectRTCP(&firstAttempt)
         }
         #expect(firstAttempt != plaintext)
@@ -151,7 +150,7 @@ struct SRTCPPacketProtectionTests {
         try sender.protectRTCP(&protected)
         let protectedPacket = protected
 
-        #expect(throws: SRTPError.counterMode(.providerFailure)) {
+        #expect(throws: SRTPError.counterMode(.primitiveFailure)) {
             try receiver.unprotectRTCP(&protected)
         }
         #expect(protected != protectedPacket)
@@ -223,11 +222,11 @@ struct SRTCPPacketProtectionTests {
             from: material,
             crypto: defaultSRTPCryptoContext()
         )
-        var authenticator = DefaultCryptoProvider.HMACSHA1(
+        let authenticationCode = testHMACSHA1(
+            message: packet.span,
             key: keys.rtcpAuthenticationKey.span
         )
-        authenticator.update(packet.span)
-        packet.append(contentsOf: authenticator.finalize().prefix(10))
+        packet.append(contentsOf: authenticationCode.prefix(10))
 
         #expect(throws: SRTPError.unencryptedSRTCPRejected) {
             try receiver.unprotectRTCP(&packet)

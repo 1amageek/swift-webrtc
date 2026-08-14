@@ -1,20 +1,67 @@
-import P2PCoreCrypto
-import P2PCrypto
+import NetworkingTime
+import SSLCrypto
 @testable import WebRTC
 import Synchronization
 
 typealias TestSRTPContext = AESCM128HMACSHA1SRTPContext
 typealias MutatingFailureSRTPContext = AESCM128HMACSHA1SRTPContext
 
+private protocol TestAESCounterModeCipher: Sendable {
+    func applyKeystream(
+        to bytes: inout [UInt8],
+        range: Range<Int>,
+        initialCounter: Span<UInt8>
+    ) throws(AESCounterModeError)
+}
+
+private final class TestAES128CounterMode: TestAESCounterModeCipher, Sendable {
+    private let primitive: AES128CounterMode
+
+    init(key: Span<UInt8>) throws(AESCounterModeError) {
+        do {
+            primitive = try AES128CounterMode(key: key)
+        } catch {
+            throw .invalidKeyLength(expected: 16, actual: key.count)
+        }
+    }
+
+    func applyKeystream(
+        to bytes: inout [UInt8],
+        range: Range<Int>,
+        initialCounter: Span<UInt8>
+    ) throws(AESCounterModeError) {
+        do {
+            try primitive.applyKeystream(
+                to: &bytes,
+                range: range,
+                initialCounter: initialCounter
+            )
+        } catch let error {
+            switch error {
+            case .invalidLength(let expected, let actual):
+                throw .invalidCounterLength(expected: expected, actual: actual)
+            case .invalidRange:
+                throw .invalidRange(
+                    lowerBound: range.lowerBound,
+                    upperBound: range.upperBound,
+                    bufferCount: bytes.count
+                )
+            default:
+                throw .primitiveFailure
+            }
+        }
+    }
+}
+
 /// Test-only provider that succeeds for the master-key PRF but mutates one
 /// packet byte and fails on the first use of each derived session cipher.
 /// This models the strongest failure permitted by `AESCounterModeCipher`.
-final class MutatingFailureAESCounterMode: AESCounterModeCipher, Sendable {
-    private let underlying: DefaultCryptoProvider.AES128CounterMode
+final class MutatingFailureAESCounterMode: TestAESCounterModeCipher, Sendable {
+    private let underlying: TestAES128CounterMode
     private let failurePending: Mutex<Bool>
 
     init(key: Span<UInt8>) throws(AESCounterModeError) {
-        underlying = try DefaultCryptoProvider.makeAES128CounterMode(key: key)
+        underlying = try TestAES128CounterMode(key: key)
 
         var isFixtureMasterKey = key.count == 16
         if isFixtureMasterKey {
@@ -52,7 +99,7 @@ final class MutatingFailureAESCounterMode: AESCounterModeCipher, Sendable {
                 initialCounter: initialCounter
             )
         }
-        throw .providerFailure
+        throw .primitiveFailure
     }
 }
 
@@ -105,11 +152,11 @@ func testKeyMaterial(byteOffset: UInt8 = 0) throws -> SRTPMasterKeyMaterial {
 
 func defaultSRTPCryptoContext() -> SRTPCryptoContext {
     SRTPCryptoContext(
-        hmacSHA1ByteCount: DefaultCryptoProvider.HMACSHA1.macLength,
+        hmacSHA1ByteCount: HMACSHA1.tagByteCount,
         makeAES128CounterMode: { @Sendable (
             key: [UInt8]
         ) throws(AESCounterModeError) -> SRTPAES128CounterModeContext in
-            let cipher = try DefaultCryptoProvider.makeAES128CounterMode(key: key.span)
+            let cipher = try TestAES128CounterMode(key: key.span)
             return erasedCounterModeContext(cipher)
         },
         authenticateSHA1: defaultSHA1AuthenticationCode
@@ -118,7 +165,7 @@ func defaultSRTPCryptoContext() -> SRTPCryptoContext {
 
 func mutatingFailureSRTPCryptoContext() -> SRTPCryptoContext {
     SRTPCryptoContext(
-        hmacSHA1ByteCount: DefaultCryptoProvider.HMACSHA1.macLength,
+        hmacSHA1ByteCount: HMACSHA1.tagByteCount,
         makeAES128CounterMode: { @Sendable (
             key: [UInt8]
         ) throws(AESCounterModeError) -> SRTPAES128CounterModeContext in
@@ -129,7 +176,7 @@ func mutatingFailureSRTPCryptoContext() -> SRTPCryptoContext {
     )
 }
 
-private func erasedCounterModeContext<Cipher: AESCounterModeCipher>(
+private func erasedCounterModeContext<Cipher: TestAESCounterModeCipher>(
     _ cipher: Cipher
 ) -> SRTPAES128CounterModeContext {
     SRTPAES128CounterModeContext(
@@ -153,12 +200,30 @@ private func defaultSHA1AuthenticationCode(
     suffix: [UInt8]?,
     key: [UInt8]
 ) -> [UInt8] {
-    var authenticator = DefaultCryptoProvider.HMACSHA1(key: key.span)
-    authenticator.update(message.span.extracting(authenticatedRange))
-    if let suffix {
-        authenticator.update(suffix.span)
+    var output = [UInt8](repeating: 0, count: HMACSHA1.tagByteCount)
+    do {
+        var authenticator = try HMACSHA1.makeContext(authenticatingWith: key.span)
+        try authenticator.update(message.span.extracting(authenticatedRange))
+        if let suffix {
+            try authenticator.update(suffix.span)
+        }
+        var destination = output.mutableSpan
+        try authenticator.finalize(into: &destination)
+    } catch {
+        preconditionFailure("Test HMAC input violated the primitive contract: \(error)")
     }
-    return authenticator.finalize()
+    return output
+}
+
+func testHMACSHA1(message: Span<UInt8>, key: Span<UInt8>) -> [UInt8] {
+    var output = [UInt8](repeating: 0, count: HMACSHA1.tagByteCount)
+    do {
+        var destination = output.mutableSpan
+        try HMACSHA1.authenticate(message, using: key, into: &destination)
+    } catch {
+        preconditionFailure("Test HMAC input violated the primitive contract: \(error)")
+    }
+    return output
 }
 
 func testContext(

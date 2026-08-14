@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Bounds-checked RFC 6184 Single NAL, STAP-A, and FU-A payload parser.
 public struct RFC6184H264PayloadParser: H264RTPPayloadParsing, Sendable {

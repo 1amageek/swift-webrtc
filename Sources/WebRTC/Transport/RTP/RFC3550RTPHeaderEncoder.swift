@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Encodes RFC 3550 RTP headers without joining or copying the media payload.
 package struct RFC3550RTPHeaderEncoder: RTPHeaderEncoding, RTPHeaderAppending, Sendable {
@@ -8,15 +8,21 @@ package struct RFC3550RTPHeaderEncoder: RTPHeaderEncoding, RTPHeaderAppending, S
         _ header: RTPOutboundHeader,
         extensionProfile: UInt16?,
         extensionData: Span<UInt8>
-    ) throws(RTPWireError) -> Bytes {
-        var bytes = [UInt8]()
-        try appendHeader(
+    ) throws(RTPWireError) -> OwnedBytes {
+        let count = try headerByteCount(
+            header,
+            extensionProfile: extensionProfile,
+            extensionData: extensionData
+        )
+        var bytes = ContiguousArray<UInt8>()
+        bytes.reserveCapacity(count)
+        appendValidatedHeader(
             header,
             extensionProfile: extensionProfile,
             extensionData: extensionData,
             to: &bytes
         )
-        return Bytes(bytes)
+        return OwnedBytes(consuming: bytes)
     }
 
     package func appendHeader(
@@ -38,6 +44,20 @@ package struct RFC3550RTPHeaderEncoder: RTPHeaderEncoding, RTPHeaderAppending, S
         }
         destination.reserveCapacity(requiredCapacity)
 
+        appendValidatedHeader(
+            header,
+            extensionProfile: extensionProfile,
+            extensionData: extensionData,
+            to: &destination
+        )
+    }
+
+    private func appendValidatedHeader<Destination: RangeReplaceableCollection>(
+        _ header: RTPOutboundHeader,
+        extensionProfile: UInt16?,
+        extensionData: Span<UInt8>,
+        to destination: inout Destination
+    ) where Destination.Element == UInt8 {
         let hasExtension = extensionProfile != nil
         let firstByte = UInt8(2 << 6)
             | (hasExtension ? 0x10 : 0)
@@ -93,12 +113,18 @@ package struct RFC3550RTPHeaderEncoder: RTPHeaderEncoding, RTPHeaderAppending, S
     }
 }
 
-private func appendUInt16(_ value: UInt16, to bytes: inout [UInt8]) {
+private func appendUInt16<Destination: RangeReplaceableCollection>(
+    _ value: UInt16,
+    to bytes: inout Destination
+) where Destination.Element == UInt8 {
     bytes.append(UInt8(value >> 8))
     bytes.append(UInt8(truncatingIfNeeded: value))
 }
 
-private func appendUInt32(_ value: UInt32, to bytes: inout [UInt8]) {
+private func appendUInt32<Destination: RangeReplaceableCollection>(
+    _ value: UInt32,
+    to bytes: inout Destination
+) where Destination.Element == UInt8 {
     bytes.append(UInt8(value >> 24))
     bytes.append(UInt8(truncatingIfNeeded: value >> 16))
     bytes.append(UInt8(truncatingIfNeeded: value >> 8))

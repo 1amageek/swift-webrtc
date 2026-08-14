@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-04.
+Last updated: 2026-08-14.
 
 This file tracks observable implementation behavior. Declarations, successful
 type checking, or DTLS certificate authentication alone do not satisfy media
@@ -39,10 +39,10 @@ verify that `DataChannelManager`, `RFC3550RTPPacketParser`, and the removed
 
 | Milestone | Status | Completion evidence | Remaining gate |
 |---|---|---|---|
-| M0 — Swift 6.4 and common state isolation | Implemented in shared source; target-parallel runtime validation remains | Native facade, ordered DataChannel events, SRTP, sender/receiver state, and the tokenized DTLS/SCTP Task registry use `Synchronization.Mutex` on every supported platform. The local consolidated graph passes the complete Native suite and both portable runtime probes with the exact snapshot | Versioned-dependency rerun, Linux runtime, real target-parallel Mutex stress, and production event-loop timer integration |
-| M1 — RTP/RTCP wire path | Implemented across the current probe graph | The internal WebRTC RTP/RTCP component parses RTP by borrowed `Span`, validates compound/reduced RTCP, enforces bounded metadata, classifies RTP/RTCP mux, and directly appends headers; Native wire tests pass 30/30, the payload-size regression gate has passed, and both portable probes parse sender output | Real UDP integration and final versioned-dependency rerun |
-| M2 — Protected media transport boundary | Implemented across the current in-memory probe graph | RFC 7983/RFC 5761 media datagrams enter the internal WebRTC SRTP component before parsing or delivery; unauthenticated, replayed, and malformed packets are dropped. Native integration verifies the protected boundary and owner identity; normal/Embedded probes complete mutual DTLS and authenticated SRTP H.264 reconstruction | Real UDP plus browser/native interoperability |
-| M3 — DTLS-SRTP negotiation and exporter | Implemented locally; release integration pending | `swift-tls` negotiates `use_srtp`, requires the configured profile, exports RFC 5705 keying material, maps client/server directions, and advances repeated record epochs with bounded retained-flight keys; `TLSCanonicalTests` passes 6/6 and the focused `swift-ssl` DTLS 1.2 profile tests pass 2/2 | Publish compatible `swift-tls` and dependency releases after cross-target verification |
+| M0 — Swift 6.4 and common state isolation | Implemented and verified on the published dependency graph; target-parallel runtime validation remains | Native facade, ordered DataChannel events, SRTP, sender/receiver state, and the tokenized DTLS/SCTP Task registry use `Synchronization.Mutex` on every supported platform. Native and both portable runtime probes pass with the exact snapshot and tagged dependencies | Linux runtime, real target-parallel Mutex stress, and production event-loop timer integration |
+| M1 — RTP/RTCP wire path | Implemented across the published probe graph | The internal WebRTC RTP/RTCP component parses RTP by borrowed `Span`, validates compound/reduced RTCP, enforces bounded metadata, classifies RTP/RTCP mux, and directly appends headers; Native wire tests pass 30/30, the payload-size regression gate passes, and both portable probes parse sender output | Real UDP integration |
+| M2 — Protected media transport boundary | Implemented across the published in-memory probe graph | RFC 7983/RFC 5761 media datagrams enter the internal WebRTC SRTP component before parsing or delivery; unauthenticated, replayed, and malformed packets are dropped. Native integration verifies the protected boundary and owner identity; normal/Embedded probes complete mutual DTLS and authenticated SRTP H.264 reconstruction | Real UDP plus browser/native interoperability |
+| M3 — DTLS-SRTP negotiation and exporter | Implemented and integrated with published dependencies | `swift-tls` negotiates `use_srtp`, requires the configured profile, exports RFC 5705 keying material, maps client/server directions, and advances repeated record epochs with bounded retained-flight keys; the versioned Native and portable probe graphs complete the negotiated media path | External browser/native interoperability |
 | M4 — SRTP/SRTCP | Implemented for AES_CM_128_HMAC_SHA1_80 across the current probe graph | RFC 3711 KDF/AES-CM/HMAC-SHA1-80, ROC, per-SSRC replay windows, SRTCP index, nonce-burn failure handling, size limits, concurrency tests, and an independent libSRTP packet fixture; Native tests pass 32/32 and both portable probes execute SRTP | Explicit session rekey orchestration, an independent full SRTCP fixture, and real network loss/reorder validation |
 | M5 — H.264 send/receive path | Implemented in memory; network feedback pending | The `WebRTCMedia` target contains internal components for borrowed parsing, range-only packetization, one-owner RTP assembly, bounded sequence/timestamp policy, and typed partial delivery. The receiver reparses owner/layout identity, bounds reorder and active-unit memory/time, conservatively quarantines loss, retains range-only packet plans, bulk-materializes one exact owner outside `Mutex`, and delivers units incrementally. Focused Native results are 6/6, 24/24, 3/3, 9/9, and receiver 36/36; Native/normal WASM/Embedded WASM probes execute a real sender-to-receiver byte round trip | NACK/PLI, pacing, measured recovery, real UDP, and decoder/browser interoperability |
 | M6 — Jetson to Mac integration | Not started | No Jetson camera/encoder adapter, socket transport, or real stream is present in this package | Hardware encoder ownership, UDP/signaling integration, complete WebRTC/browser interop, Pose correlation, and copy/allocation/latency measurements |
@@ -77,19 +77,15 @@ commits one bounded packet batch while holding its association mutex.
 
 ## Verified toolchain matrix
 
-These rows record the latest successful behavioral runs against a temporarily
-coordinated local dependency graph. The checked-in development manifests still
-point at sibling path dependencies, but the coordinated commits are not
-published yet, so these results are development evidence rather than release
-evidence. Before release, replace those paths with public URL dependencies and
-pass the same matrix against the published graph. Directory structure or
-successful type checking is not a substitute.
+These rows record the latest successful behavioral runs against the public URL
+dependency graph: `swift-networking` 0.1.0, `swift-ssl` 0.3.0, and `swift-tls`
+2.0.1. Directory structure or successful type checking is not a substitute.
 
-| Target | Toolchain / SDK | Local consolidated graph result | Versioned release graph |
-|---|---|---|---|
-| macOS Native | Xcode 27 beta, toolchain `org.swift.64202607231a`, compiler `ef761e567dc94ee` | The complete `xcodebuild test` run reports 527 logical tests / 557 expanded invocations, 0 failed, and 0 skipped. The focused `P2PCryptoTests` run passes 27/27 and the focused `swift-tls` DTLS run passes 215 logical tests / 216 expanded invocations. Release performance gates also pass | Pending publication of compatible dependencies and a clean rerun |
-| WASM | Swift 6.4 development snapshot 2026-07-23 + SDK `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm` | The executable compiles and links, then passes external identities, mutual DTLS, `use_srtp`, exporter directions, typed transport rejection, timer heartbeat/cancellation, and authenticated H.264 byte reconstruction. It uses in-memory datagram exchange, not UDP | Pending publication of compatible dependencies and a clean rerun |
-| Embedded WASM | Swift 6.4 development snapshot 2026-07-23 + SDK `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm-embedded` | The release executable compiles, links, and passes the same in-memory graph. It proves target runtime behavior but not target-parallel Mutex semantics. The portable fallback timer blocks in bounded 20 ms slices; production integration requires an event-loop timer | Pending publication of compatible dependencies and a clean rerun |
+| Target | Toolchain / SDK | Versioned release graph result |
+|---|---|---|
+| macOS Native | Xcode 27.0 (`27A5209h`), toolchain `org.swift.64202607231a`, compiler `ef761e567dc94ee` | 520 logical tests across 13 targets pass with 0 failures and 0 skips. The same behavior is covered by split Address Sanitizer runs with no sanitizer finding. Three opt-in Release benchmark runs also pass |
+| WASM | Swift 6.4 development snapshot 2026-07-23 + SDK `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm` | Release compile/link succeeds and the runtime executable passes external identities, mutual DTLS, `use_srtp`, exporter directions, typed transport rejection, timer heartbeat/cancellation, and authenticated H.264 byte reconstruction. It uses in-memory datagram exchange, not UDP |
+| Embedded WASM | Swift 6.4 development snapshot 2026-07-23 + SDK `swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-23-a_wasm-embedded` | Release compile/link succeeds and the runtime executable passes the same in-memory graph. It proves target runtime behavior but not target-parallel Mutex semantics; production integration should inject an event-loop-integrated timer |
 
 ## Performance and ownership audit
 
@@ -107,12 +103,12 @@ protected UDP owner
 - Inbound protected RTP and RTCP retain their base address through
   authentication, decryption, parsing, and handler delivery.
 - H.264 final payload materialization uses one scoped contiguous append. The
-  dedicated Release regression gate measures 4 KiB at 64.392 ns versus
-  10,335.520 ns scalar and 64 KiB at 758.301 ns versus 166,851.238 ns scalar.
+  three-run Release median measures 4 KiB at 73.22 ns versus 10,169.94 ns
+  scalar and 64 KiB at 773.93 ns versus 164,028.64 ns scalar.
 - RTP header-extension materialization uses the same scoped bulk-copy boundary.
-- The Release RTP parser gate measures 12-byte, 1,200-byte, and 65,535-byte
-  packets at 10.175 ns, 10.163 ns, and 10.135 ns respectively; the normalized
-  payload slope remains effectively flat.
+- The three-run Release RTP parser median measures 12-byte, 1,200-byte, and
+  65,535-byte packets at 12.798 ns, 12.790 ns, and 12.783 ns respectively; the
+  normalized payload slope remains effectively flat at -0.000408.
 - The swift-tls Tier-1 facade makes one required owner copy when a borrowed
   `Span` crosses the mutex transaction, then passes that owner into the engine
   without a second packet-sized materialization. Native hash/HMAC updates retain
@@ -176,20 +172,15 @@ and Lume behavior remain separate acceptance gates.
 
 ## Release integration
 
-The media-capable tree is unreleased. Its development manifests use sibling path
-dependencies while local integration validation aligns the coordinated working
-trees. Publication must replace those paths with public URL dependencies and
-follow the dependency direction:
+The release manifest uses only public URL dependencies and follows this
+dependency direction:
 
 ```text
-swift-ssl
-    -> swift-p2p-core/P2PCrypto
-        -> swift-tls
-            -> swift-webrtc
+swift-networking + swift-ssl
+    -> swift-tls
+        -> swift-webrtc
 ```
 
-No local `.package(path:)` reference remains. Before the swift-webrtc tag is
-created, publish the dependencies in the order above, rerun the complete
-verification matrix from that published graph, and verify that the tag commit
-equals `origin/main`. Stable tag `1.5.3` does not contain the `WebRTCMedia`
-product.
+No local `.package(path:)` reference remains in the release manifest. The
+complete verification matrix above was rerun from the published graph. Release
+publication must still verify that the tag commit equals `origin/main`.

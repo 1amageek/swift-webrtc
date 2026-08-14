@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Writes an RTP header directly into caller-owned packet storage.
 package protocol RTPHeaderAppending: Sendable {

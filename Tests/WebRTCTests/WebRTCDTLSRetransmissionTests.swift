@@ -1,5 +1,5 @@
 import Foundation
-import P2PCoreCrypto
+import NetworkingTime
 import Synchronization
 import Testing
 @testable import WebRTC
@@ -71,6 +71,41 @@ struct WebRTCDTLSRetransmissionTests {
             return
         }
         guard case .datagramSendFailed(.backpressured) = terminalFailure else {
+            Issue.record("Unexpected terminal failure: \(terminalFailure)")
+            return
+        }
+    }
+
+    @Test(
+        "A timer backend failure terminates the DTLS retransmission driver",
+        .timeLimit(.minutes(1))
+    )
+    func retransmissionTimerFailureIsTerminal() async throws {
+        let clientCertificate = try WebRTCTestIdentity.make()
+        let serverCertificate = try WebRTCTestIdentity.make()
+        let timer = FailingTimerProbe(error: .backendFailure(code: 71))
+        let sendCount = Mutex(0)
+        let connection = try WebRTCConnection.asClient(
+            certificate: clientCertificate,
+            remoteFingerprint: serverCertificate.fingerprint,
+            sendHandler: { _ in
+                sendCount.withLock { $0 += 1 }
+                return .success(())
+            },
+            timer: WebRTCTimer(timer)
+        )
+        defer { connection.close() }
+
+        try connection.start()
+        let failureObserved = await waitUntil { connection.state.isTerminal }
+        #expect(failureObserved)
+        #expect(sendCount.withLock { $0 } == 1)
+
+        guard let terminalFailure = connection.terminalFailure else {
+            Issue.record("Expected the timer backend failure to remain observable")
+            return
+        }
+        guard case .timeFailed(.backendFailure(code: 71)) = terminalFailure else {
             Issue.record("Unexpected terminal failure: \(terminalFailure)")
             return
         }
@@ -337,18 +372,14 @@ private final class ReentrantCancellationTimerProbe: AsyncTimer, Sendable {
         state.withLock { $0.reentrantCancellation = nil }
     }
 
-    func monotonicMillis() -> UInt64 {
-        0
-    }
-
-    func monotonicNanos() -> UInt64 {
-        123
+    func now() throws(TimeError) -> MonotonicInstant {
+        MonotonicInstant(clockIdentifier: 42, nanoseconds: 123)
     }
 
     func sleep(
-        untilNanos deadlineNanos: UInt64
-    ) async throws(CancellationError) {
-        state.withLock { $0.snapshot.deadlines.append(deadlineNanos) }
+        until deadline: MonotonicInstant
+    ) async throws(TimeError) {
+        state.withLock { $0.snapshot.deadlines.append(deadline.nanoseconds) }
         await withTaskCancellationHandler {
             while !Task.isCancelled {
                 await Task.yield()
@@ -356,7 +387,7 @@ private final class ReentrantCancellationTimerProbe: AsyncTimer, Sendable {
         } onCancel: {
             runReentrantCancellation()
         }
-        throw CancellationError()
+        throw .cancelled
     }
 
     private func runReentrantCancellation() {
@@ -382,6 +413,30 @@ private final class ReentrantCancellationTimerProbe: AsyncTimer, Sendable {
     }
 }
 
+private final class FailingTimerProbe: AsyncTimer, Sendable {
+    private let error: TimeError
+
+    init(error: TimeError) {
+        self.error = error
+    }
+
+    func now() throws(TimeError) -> MonotonicInstant {
+        MonotonicInstant(clockIdentifier: 42, nanoseconds: 123)
+    }
+
+    func sleep(
+        until deadline: MonotonicInstant
+    ) async throws(TimeError) {
+        guard deadline.clockIdentifier == 42 else {
+            throw .clockDomainMismatch(
+                expected: 42,
+                actual: deadline.clockIdentifier
+            )
+        }
+        throw error
+    }
+}
+
 private final class SuspendingTimerProbe: AsyncTimer, Sendable {
     struct Snapshot: Sendable {
         var sleepCount = 0
@@ -395,26 +450,22 @@ private final class SuspendingTimerProbe: AsyncTimer, Sendable {
         state.withLock { $0 }
     }
 
-    func monotonicMillis() -> UInt64 {
-        0
-    }
-
-    func monotonicNanos() -> UInt64 {
-        123
+    func now() throws(TimeError) -> MonotonicInstant {
+        MonotonicInstant(clockIdentifier: 42, nanoseconds: 123)
     }
 
     func sleep(
-        untilNanos deadlineNanos: UInt64
-    ) async throws(CancellationError) {
+        until deadline: MonotonicInstant
+    ) async throws(TimeError) {
         state.withLock { state in
             state.sleepCount += 1
-            state.lastDeadlineNanos = deadlineNanos
+            state.lastDeadlineNanos = deadline.nanoseconds
         }
         while !Task.isCancelled {
             await Task.yield()
         }
         state.withLock { $0.cancellationCount += 1 }
-        throw CancellationError()
+        throw .cancelled
     }
 }
 
@@ -445,25 +496,21 @@ private final class ControlledTimerProbe: AsyncTimer, Sendable {
         }
     }
 
-    func monotonicMillis() -> UInt64 {
-        0
-    }
-
-    func monotonicNanos() -> UInt64 {
-        123
+    func now() throws(TimeError) -> MonotonicInstant {
+        MonotonicInstant(clockIdentifier: 42, nanoseconds: 123)
     }
 
     func sleep(
-        untilNanos deadlineNanos: UInt64
-    ) async throws(CancellationError) {
+        until deadline: MonotonicInstant
+    ) async throws(TimeError) {
         let sleepOrdinal = state.withLock { state -> Int in
-            state.snapshot.deadlines.append(deadlineNanos)
+            state.snapshot.deadlines.append(deadline.nanoseconds)
             return state.snapshot.deadlines.count
         }
         while true {
             if Task.isCancelled {
                 state.withLock { $0.snapshot.cancellationCount += 1 }
-                throw CancellationError()
+                throw .cancelled
             }
             if state.withLock({
                 $0.releasedSleepOrdinals.contains(sleepOrdinal)

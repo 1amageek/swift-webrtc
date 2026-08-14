@@ -1,4 +1,4 @@
-import P2PCoreCrypto
+import NetworkingTime
 
 /// Typed failures emitted by the RFC 3711 SRTP transform.
 public enum SRTPError: Error, Sendable, Equatable {

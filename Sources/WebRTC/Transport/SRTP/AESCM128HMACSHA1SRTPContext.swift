@@ -1,4 +1,4 @@
-import P2PCoreCrypto
+import NetworkingTime
 import Synchronization
 
 /// RFC 3711 AES_CM_128_HMAC_SHA1_80 protection with per-SSRC replay state.

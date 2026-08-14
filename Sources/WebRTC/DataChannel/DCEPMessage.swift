@@ -2,7 +2,7 @@
 ///
 /// DCEP messages for opening data channels over SCTP.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// DCEP message type
 enum DCEPMessageType: UInt8, Sendable {

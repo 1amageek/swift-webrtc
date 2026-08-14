@@ -85,7 +85,10 @@ struct RTPMuxAndEncoderTests {
             to: &finalPacket
         )
 
-        #expect(Array(finalPacket.dropFirst()) == separatelyOwned.toArray())
+        #expect(finalPacket.count == separatelyOwned.count + 1)
+        for index in 0..<separatelyOwned.count {
+            #expect(finalPacket[index + 1] == separatelyOwned[index])
+        }
     }
 
     @Test("Maximum header extension bulk copy preserves every boundary byte")

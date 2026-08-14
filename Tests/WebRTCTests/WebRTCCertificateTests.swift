@@ -1,5 +1,6 @@
 import Testing
-import P2PCoreDER
+import SSLX509
+import NetworkingCore
 @testable import WebRTC
 
 private struct FixedCertificateClock: WebRTCCertificateClock {
@@ -19,11 +20,9 @@ struct WebRTCCertificateTests {
         let generated = try WebRTCCertificate.generateSelfSigned(
             clock: FixedCertificateClock(seconds: 1_750_000_000)
         )
-        let parsed = try X509CertificateDER.subjectPublicKeyInfo(
-            in: generated.derEncoded
-        )
-        #expect(parsed.curve == .p256)
-        #expect(parsed.keyBytes.count == 65)
+        let parsed = try X509Certificate(der: generated.derEncoded.span)
+        #expect(parsed.subjectPublicKeyInfo.isP256)
+        #expect(parsed.subjectPublicKeyInfo.publicKeyByteCount == 65)
 
         let provisioned = try WebRTCCertificate(
             derEncoded: generated.derEncoded,

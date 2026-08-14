@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Parses RFC 6184 payload structure without retaining or copying media bytes.
 public protocol H264RTPPayloadParsing: Sendable {

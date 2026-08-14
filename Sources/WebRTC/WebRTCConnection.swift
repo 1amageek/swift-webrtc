@@ -10,7 +10,7 @@
 /// the local ``DTLSEndpoint`` wrapper.
 
 import TLS
-import P2PCrypto
+import NetworkingTime
 import Synchronization
 #if canImport(Logging)
 import Logging
@@ -203,7 +203,7 @@ public final class WebRTCConnection: Sendable {
     }
 
     /// Time + deadline-sleep seam for the SCTP retransmission driver
-    /// (`AsyncTimer.sleep(untilNanos:)`, never `Task.sleep` / `ContinuousClock`).
+    /// (`AsyncTimer.sleep(until:)`, never direct `Task.sleep` / `ContinuousClock`).
     private let timer: WebRTCTimer
 
     /// Owns the DTLS and SCTP timer Tasks without retaining this facade.
@@ -523,6 +523,15 @@ public final class WebRTCConnection: Sendable {
         case stopped
         case success(SCTPEgressBatch?)
         case terminal(SCTPEgressBatch?, SCTPError)
+    }
+
+    /// Result of suspending a retransmission driver on the injected clock.
+    /// Cancellation is distinct from a clock/backend failure: only the former
+    /// may stop a driver without making the connection terminal.
+    private enum TimerParkOutcome: Sendable {
+        case elapsed
+        case cancelled
+        case failed(TimeError)
     }
 
     /// Serializes DTLS engine mutation without owning a timer task or facade.
@@ -1336,7 +1345,7 @@ public final class WebRTCConnection: Sendable {
         sendHandler: @escaping SendHandler,
         timer: WebRTCTimer = .platformDefault,
         logger: WebRTCLogger,
-        sctpClock: any SCTPMonotonicClock = SCTPSystemMonotonicClock(),
+        sctpClock: (any SCTPMonotonicClock)? = nil,
         lifecycleHooks: WebRTCLifecycleHooks = WebRTCLifecycleHooks()
     ) throws(WebRTCError) {
         let iceCredentials = iceConfiguration.credentials
@@ -1393,7 +1402,9 @@ public final class WebRTCConnection: Sendable {
         }
         let connState = SharedMutex(ConnState(
             iceAgent: WebRTCICEAgent(configuration: iceConfiguration),
-            sctpAssociation: SCTPAssociation(clock: sctpClock),
+            sctpAssociation: SCTPAssociation(
+                clock: sctpClock ?? SCTPWebRTCTimerClock(timer: timer)
+            ),
             channelManager: channelManager,
             isClient: isClient,
             verifiedRemoteFingerprint: nil,
@@ -1485,12 +1496,14 @@ public final class WebRTCConnection: Sendable {
     public func establishICEConnectivity(
         timeout: Duration = .seconds(10)
     ) async throws(WebRTCError) {
-        let deadline: UInt64 = {
-            let now = timer.monotonicNanos()
-            let delta = timeout.facadeNanoseconds
-            let (sum, overflow) = now.addingReportingOverflow(delta)
-            return overflow ? UInt64.max : sum
-        }()
+        let deadline: MonotonicInstant
+        do {
+            deadline = try timer.now().advanced(
+                byNanoseconds: timeout.facadeNanoseconds
+            )
+        } catch let error {
+            throw .timeFailed(error)
+        }
         var retransmissionNanos: UInt64 = 100_000_000
 
         while true {
@@ -1541,8 +1554,13 @@ public final class WebRTCConnection: Sendable {
                 throw error
             }
 
-            let now = timer.monotonicNanos()
-            if now >= deadline {
+            let now: MonotonicInstant
+            do {
+                now = try timer.now()
+            } catch let error {
+                throw .timeFailed(error)
+            }
+            if now.nanoseconds >= deadline.nanoseconds {
                 let error = WebRTCError.iceFailed(
                     "ICE connectivity check timed out"
                 )
@@ -1553,17 +1571,27 @@ public final class WebRTCConnection: Sendable {
                 failConnection(error, context: "ICE connectivity check timed out")
                 throw error
             }
-            let (candidateWake, wakeOverflow) = now.addingReportingOverflow(
-                retransmissionNanos
-            )
-            let wake = min(
-                deadline,
-                wakeOverflow ? UInt64.max : candidateWake
-            )
+            let candidateWake: MonotonicInstant
             do {
-                try await timer.sleep(untilNanos: wake)
+                candidateWake = try now.advanced(
+                    byNanoseconds: retransmissionNanos
+                )
             } catch {
-                throw .closed
+                candidateWake = MonotonicInstant(
+                    clockIdentifier: now.clockIdentifier,
+                    nanoseconds: UInt64.max
+                )
+            }
+            let wake = candidateWake.nanoseconds < deadline.nanoseconds
+                ? candidateWake
+                : deadline
+            do {
+                try await timer.sleep(until: wake)
+            } catch let error {
+                if error == .cancelled {
+                    throw .closed
+                }
+                throw .timeFailed(error)
             }
             retransmissionNanos = min(
                 retransmissionNanos &* 2,
@@ -3122,6 +3150,7 @@ public final class WebRTCConnection: Sendable {
         let timer = self.timer
         let pump = dtlsTimeoutPump
         let taskRegistry = timerTaskRegistry
+        let terminalCoordinator = self.terminalCoordinator
 
         // Publish the token before creating the unstructured task. A task may
         // start and finish immediately when a test or platform injects a timer
@@ -3140,10 +3169,23 @@ public final class WebRTCConnection: Sendable {
                 delayNanos: installation.delayNanos
             )
             while !Task.isCancelled {
-                guard await WebRTCConnection.parkForDelay(
+                switch await WebRTCConnection.parkForDelay(
                     schedule.delayNanos,
                     on: timer
-                ) else {
+                ) {
+                case .elapsed:
+                    break
+                case .cancelled:
+                    return
+                case .failed(let error):
+                    let failure = WebRTCError.timeFailed(error)
+                    if terminalCoordinator.commitFailure(
+                        failure,
+                        context: "DTLS retransmission timer failed"
+                    ) {
+                        terminalCoordinator.prepare()
+                    }
+                    taskRegistry.cancelAll()
                     return
                 }
                 switch pump.drive(
@@ -3213,23 +3255,37 @@ public final class WebRTCConnection: Sendable {
         guard let token else { return }
 
         // The retransmission tick is scheduled through the injected
-        // `AsyncTimer` seam (`timer.sleep(untilNanos:)`), NOT `Task.sleep` /
+        // `AsyncTimer` seam (`timer.sleep(until:)`), not direct `Task.sleep` /
         // `ContinuousClock`, both of which are unavailable under Embedded.
         let tickNanos = Self.retransmitTickInterval.facadeNanoseconds
         let timer = self.timer
         let pump = sctpRetransmissionPump
-        // The tick suspension goes through `parkForTick(_:on:)`, a NON-throwing
-        // helper that swallows the timer's typed `CancellationError` internally.
-        // The Task closure therefore contains no throwing call, so Embedded does
-        // not have to infer a thrown type across the `await` boundary (a bare
-        // `catch` there widens to `any Error`, which Embedded rejects).
+        let terminalCoordinator = self.terminalCoordinator
+        // The tick suspension goes through a non-throwing outcome helper so the
+        // Task closure preserves the timer's typed failure without widening the
+        // thrown type across the Embedded `await` boundary.
         // The closure captures only the connection-independent pump. The
         // facade remains deinitializable even when the caller omits close().
         let task = Task {
             guard taskRegistry.containsSCTP(token: token) else { return }
             defer { taskRegistry.clearSCTP(token: token) }
             while !Task.isCancelled {
-                if !(await Self.parkForTick(tickNanos, on: timer)) { return }
+                switch await Self.parkForTick(tickNanos, on: timer) {
+                case .elapsed:
+                    break
+                case .cancelled:
+                    return
+                case .failed(let error):
+                    let failure = WebRTCError.timeFailed(error)
+                    if terminalCoordinator.commitFailure(
+                        failure,
+                        context: "SCTP retransmission timer failed"
+                    ) {
+                        terminalCoordinator.prepare()
+                    }
+                    taskRegistry.cancelAll()
+                    return
+                }
                 if pump.drive() {
                     taskRegistry.cancelAll()
                     return
@@ -3245,30 +3301,29 @@ public final class WebRTCConnection: Sendable {
         }
     }
 
-    /// Suspend for one retransmission tick via the injected `AsyncTimer`,
-    /// swallowing the timer's typed `CancellationError`.
-    ///
-    /// - Returns: `true` if the tick elapsed normally, `false` if the task was
-    ///   cancelled during the suspension (the caller stops the loop).
+    /// Suspend for one retransmission tick via the injected `AsyncTimer`.
     private static func parkForTick(
         _ tickNanos: UInt64,
         on timer: WebRTCTimer
-    ) async -> Bool {
+    ) async -> TimerParkOutcome {
         await parkForDelay(tickNanos, on: timer)
     }
 
-    /// Suspend for one relative delay using a saturating absolute deadline.
+    /// Suspend for one relative delay while preserving typed clock failures.
     private static func parkForDelay(
         _ delayNanos: UInt64,
         on timer: WebRTCTimer
-    ) async -> Bool {
-        let now = timer.monotonicNanos()
-        let (deadline, overflow) = now.addingReportingOverflow(delayNanos)
-        do {
-            try await timer.sleep(untilNanos: overflow ? UInt64.max : deadline)
-            return true
-        } catch {
-            return false
+    ) async -> TimerParkOutcome {
+        do throws(TimeError) {
+            let now = try timer.now()
+            let deadline = try now.advanced(byNanoseconds: delayNanos)
+            try await timer.sleep(until: deadline)
+            return .elapsed
+        } catch let error {
+            if case .cancelled = error, Task.isCancelled {
+                return .cancelled
+            }
+            return .failed(error)
         }
     }
 

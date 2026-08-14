@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Validated metadata for one inbound STAP-A payload.
 ///

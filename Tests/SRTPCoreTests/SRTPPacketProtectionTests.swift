@@ -203,7 +203,7 @@ struct SRTPPacketProtectionTests {
         let plaintext = rtpPacket(sequenceNumber: 22)
         var firstAttempt = plaintext
 
-        #expect(throws: SRTPError.counterMode(.providerFailure)) {
+        #expect(throws: SRTPError.counterMode(.primitiveFailure)) {
             try context.protectRTP(&firstAttempt)
         }
         #expect(firstAttempt != plaintext)

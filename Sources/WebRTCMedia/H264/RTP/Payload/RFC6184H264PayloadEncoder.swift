@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// RFC 6184 payload encoder that writes directly into caller-owned storage.
 public struct RFC6184H264PayloadEncoder: H264RTPPayloadEncoding, Sendable {

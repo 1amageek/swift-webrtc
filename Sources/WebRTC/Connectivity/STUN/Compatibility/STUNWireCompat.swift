@@ -1,6 +1,6 @@
 /// Foundation `Data` compatibility layer over the Embedded-clean `STUNWireCore`.
 ///
-/// `STUNWireCore` expresses the STUN wire codec over `[UInt8]`/`P2PCoreBytes` so
+/// `STUNWireCore` expresses the STUN wire codec over `[UInt8]`/`NetworkingCore` so
 /// it can build under Embedded Swift. This adapter restores the historical
 /// `Data`-based public surface that the rest of `swift-webrtc` (ICE, WebRTC) and
 /// the existing test suite bind to. It is pure bridging plus the crypto-bearing

@@ -11,10 +11,11 @@
 /// certificate, `digitalSignature` key usage, not a CA, valid for one year.
 
 import TLS
-import P2PCoreBytes
-import P2PCoreCrypto
-import P2PCrypto
-import P2PCoreDER
+import NetworkingCore
+import NetworkingTime
+import SSLCrypto
+import SSLASN1
+import SSLX509
 #if canImport(Foundation)
 import Foundation
 #endif
@@ -82,13 +83,19 @@ public struct CertificateFingerprint: Sendable, Hashable, Equatable {
 
     /// Compute a fingerprint from a DER-encoded X.509 certificate by hashing it.
     ///
-    /// The SHA-256 is routed through a build-gated seam so DTLS-SRTP fingerprint
-    /// verification (RFC 8122) is byte-identical and fail-closed on every
-    /// supported platform through `P2PCrypto.DefaultSHA256`. There is no
-    /// platform on which fingerprint computation silently degrades.
+    /// The SHA-256 is computed by swift-ssl's Pure Swift primitive on every
+    /// supported platform. There is no platform-specific fallback.
     public static func fromDER(_ data: [UInt8]) -> CertificateFingerprint {
-        let hash = DefaultSHA256.hash(data.span)
-        return CertificateFingerprint(algorithm: .sha256, bytes: [UInt8](hash))
+        var hash = [UInt8](repeating: 0, count: SHA256.digestByteCount)
+        do {
+            var output = hash.mutableSpan
+            try SHA256.hash(data.span, into: &output)
+        } catch {
+            preconditionFailure(
+                "Validated certificate fingerprint input exceeded SHA-256 limits: \(error)"
+            )
+        }
+        return CertificateFingerprint(algorithm: .sha256, bytes: hash)
     }
 
     /// Create from an existing SHA-256 digest (e.g. extracted from a multihash
@@ -231,22 +238,28 @@ public struct WebRTCCertificate: Sendable {
         guard let now = clock.nowUnixSeconds() else {
             throw .clockUnavailable
         }
-        let signingKey: DefaultCryptoProvider.P256Signature.SigningKey
-        do {
-            signingKey = try DefaultCryptoProvider.P256Signature.generateSigningKey()
-        } catch {
-            throw .generationFailed
+        let signingKey = try Self.generateSigningKey()
+        let publicPoint = signingKey.publicKey().withBorrowedBytes {
+            materialize($0)
         }
-        let publicPoint = DefaultCryptoProvider.P256Signature.rawRepresentation(
-            of: DefaultCryptoProvider.P256Signature.verifyingKey(for: signingKey)
-        )
         let spki: [UInt8]
         do {
-            spki = try SubjectPublicKeyInfoDER.encodeP256(uncompressedPoint65: publicPoint)
+            spki = try Self.encodeP256SubjectPublicKeyInfo(publicPoint)
         } catch {
             throw .generationFailed
         }
-        let serial = DefaultCryptoProvider.random.randomBytes(16).map { $0 & 0x7F }
+        var serial = [UInt8](repeating: 0, count: 16)
+        do {
+            var destination = serial.mutableSpan
+            try SystemRandom.fill(&destination)
+        } catch {
+            throw .generationFailed
+        }
+        serial[0] &= 0x7F
+        if serial.allSatisfy({ $0 == 0 }) {
+            serial[serial.count - 1] = 1
+        }
+        let rawPrivateKey = signingKey.withBorrowedBytes { materialize($0) }
         let certificate: [UInt8]
         do {
             certificate = try Self.buildSelfSignedCertificate(
@@ -261,7 +274,7 @@ public struct WebRTCCertificate: Sendable {
         }
         return try self.init(
             derEncoded: certificate,
-            rawPrivateKey: DefaultCryptoProvider.P256Signature.rawRepresentation(of: signingKey)
+            rawPrivateKey: rawPrivateKey
         )
     }
 
@@ -280,25 +293,22 @@ public struct WebRTCCertificate: Sendable {
         derEncoded: [UInt8],
         rawPrivateKey: [UInt8]
     ) throws(WebRTCCertificateError) {
-        let parsed: SubjectPublicKeyInfoDER.Parsed
+        let certificate: X509Certificate
         do {
-            parsed = try X509CertificateDER.subjectPublicKeyInfo(in: derEncoded)
+            certificate = try X509Certificate(der: derEncoded.span)
         } catch {
             throw .malformedCredential
         }
-        guard parsed.curve == .p256 else {
+        guard certificate.subjectPublicKeyInfo.isP256 else {
             throw .malformedCredential
         }
 
-        let signingKey: DefaultCryptoProvider.P256Signature.SigningKey
-        let verifyingKey: DefaultCryptoProvider.P256Signature.VerifyingKey
+        let signingKey = try Self.importSigningKey(rawPrivateKey)
+        let verifyingKey: P256PublicKey
         do {
-            signingKey = try DefaultCryptoProvider.P256Signature.signingKey(
-                rawRepresentation: rawPrivateKey.span
-            )
-            verifyingKey = try DefaultCryptoProvider.P256Signature.verifyingKey(
-                rawRepresentation: parsed.keyBytes.span
-            )
+            verifyingKey = try certificate.subjectPublicKeyInfo.withPublicKeyBytes {
+                try P256PublicKey(bytes: $0)
+            }
         } catch {
             throw .malformedPrivateKey
         }
@@ -311,20 +321,29 @@ public struct WebRTCCertificate: Sendable {
             0x57, 0x65, 0x62, 0x52, 0x54, 0x43, 0x20, 0x69,
             0x64, 0x65, 0x6E, 0x74, 0x69, 0x74, 0x79,
         ]
-        let signature: [UInt8]
+        var challengeHash = [UInt8](repeating: 0, count: SHA256.digestByteCount)
+        let signature: ContiguousArray<UInt8>
         do {
-            signature = try DefaultCryptoProvider.P256Signature.sign(
-                challenge.span,
-                with: signingKey
+            var output = challengeHash.mutableSpan
+            try SHA256.hash(challenge.span, into: &output)
+            signature = try P256ECDSA.sign(
+                messageHash: challengeHash.span,
+                using: signingKey
             )
         } catch {
             throw .malformedPrivateKey
         }
-        guard DefaultCryptoProvider.P256Signature.isValid(
-            signature: signature.span,
-            for: challenge.span,
-            with: verifyingKey
-        ) else {
+        let matches: Bool
+        do {
+            matches = try P256ECDSA.verify(
+                signature: signature.span,
+                messageHash: challengeHash.span,
+                using: verifyingKey
+            )
+        } catch {
+            throw .malformedCredential
+        }
+        guard matches else {
             throw .credentialKeyMismatch
         }
 
@@ -333,55 +352,92 @@ public struct WebRTCCertificate: Sendable {
         self.fingerprint = CertificateFingerprint.fromDER(derEncoded)
     }
 
+    private static func generateSigningKey(
+    ) throws(WebRTCCertificateError) -> P256PrivateKey {
+        do {
+            return try P256PrivateKey.generate()
+        } catch {
+            throw .generationFailed
+        }
+    }
+
+    private static func importSigningKey(
+        _ bytes: [UInt8]
+    ) throws(WebRTCCertificateError) -> P256PrivateKey {
+        do {
+            return try P256PrivateKey(bytes: bytes.span)
+        } catch {
+            throw .malformedPrivateKey
+        }
+    }
+
     private static func buildSelfSignedCertificate(
         spki: [UInt8],
         serial: [UInt8],
         notBefore: Int64,
         notAfter: Int64,
-        signingKey: DefaultCryptoProvider.P256Signature.SigningKey
-    ) throws(CryptoError) -> [UInt8] {
-        let signatureAlgorithm = DERWriter.sequence([DERWriter.encodeOID(.ecdsaSHA256)])
-        let version = DERWriter.encode(.context0, DERWriter.encodeInteger([0x02]))
-        let basicConstraintsOID = DERWriter.encodeOID(ObjectID([0x55, 0x1D, 0x13]))
-        let keyUsageOID = DERWriter.encodeOID(ObjectID([0x55, 0x1D, 0x0F]))
-        let basicConstraints = DERWriter.sequence([
-            basicConstraintsOID,
-            DERWriter.encodeBoolean(true),
-            DERWriter.encodeOctetString(DERWriter.sequence([])),
+        signingKey: borrowing P256PrivateKey
+    ) throws -> [UInt8] {
+        let signatureAlgorithm = try sequence([
+            try objectIdentifier([1, 2, 840, 10045, 4, 3, 2]),
         ])
-        let digitalSignature = DERWriter.encode(.bitString, [0x07, 0x80])
-        let keyUsage = DERWriter.sequence([
-            keyUsageOID,
-            DERWriter.encodeBoolean(true),
-            DERWriter.encodeOctetString(digitalSignature),
-        ])
-        let extensions = DERWriter.encode(
-            .context3,
-            DERWriter.sequence([basicConstraints, keyUsage])
+        let version = try element(
+            tag: SSLASN1.DERTag(tagClass: .contextSpecific, isConstructed: true, number: 0),
+            content: try positiveInteger([2])
         )
-        let validity = DERWriter.sequence([
-            Self.utcTime(notBefore),
-            Self.utcTime(notAfter),
+        let basicConstraints = try sequence([
+            try objectIdentifier([2, 5, 29, 19]),
+            try boolean(true),
+            try octetString(try sequence([])),
         ])
-        let tbs = DERWriter.sequence([
+        let keyUsage = try sequence([
+            try objectIdentifier([2, 5, 29, 15]),
+            try boolean(true),
+            try octetString(try bitString(unusedBitCount: 7, bytes: [0x80])),
+        ])
+        let extensions = try element(
+            tag: SSLASN1.DERTag(tagClass: .contextSpecific, isConstructed: true, number: 3),
+            content: try sequence([basicConstraints, keyUsage])
+        )
+        let validity = try sequence([
+            try utcTime(notBefore),
+            try utcTime(notAfter),
+        ])
+        let tbs = try sequence([
             version,
-            DERWriter.encodeInteger(serial),
+            try positiveInteger(serial),
             signatureAlgorithm,
-            DERWriter.sequence([]),
+            try sequence([]),
             validity,
-            DERWriter.sequence([]),
+            try sequence([]),
             spki,
             extensions,
         ])
-        let signature = try DefaultCryptoProvider.P256Signature.sign(tbs.span, with: signingKey)
-        return DERWriter.sequence([
+        var digest = [UInt8](repeating: 0, count: SHA256.digestByteCount)
+        do {
+            var destination = digest.mutableSpan
+            try SHA256.hash(tbs.span, into: &destination)
+        }
+        let rawSignature = try P256ECDSA.sign(
+            messageHash: digest.span,
+            using: signingKey
+        )
+        let derSignature = try DERECDSASignatureCodec.encode(
+            rawSignature: rawSignature.span,
+            scalarByteCount: P256PrivateKey.byteCount
+        )
+        let encodedSignature = derSignature.withBorrowedBytes { materialize($0) }
+        return try sequence([
             tbs,
             signatureAlgorithm,
-            DERWriter.encodeBitString(signature),
+            try bitString(
+                unusedBitCount: 0,
+                bytes: encodedSignature
+            ),
         ])
     }
 
-    private static func utcTime(_ epochSeconds: Int64) -> [UInt8] {
+    private static func utcTime(_ epochSeconds: Int64) throws -> [UInt8] {
         // DERTime is intentionally internal to the shared codec; this fixed
         // Gregorian conversion keeps certificate creation target-independent.
         let days = epochSeconds / 86_400
@@ -399,7 +455,129 @@ public struct WebRTCCertificate: Sendable {
         Self.appendTwoDigits(minute, to: &content)
         Self.appendTwoDigits(second, to: &content)
         content.append(contentsOf: [0x5A])
-        return DERWriter.encode(.utcTime, content)
+        return try element(
+            tag: SSLASN1.DERTag(tagClass: .universal, isConstructed: false, number: 23),
+            content: content
+        )
+    }
+
+    private static func encodeP256SubjectPublicKeyInfo(
+        _ uncompressedPoint: [UInt8]
+    ) throws -> [UInt8] {
+        guard uncompressedPoint.count == P256PublicKey.uncompressedByteCount else {
+            throw WebRTCCertificateError.generationFailed
+        }
+        let algorithm = try sequence([
+            try objectIdentifier([1, 2, 840, 10045, 2, 1]),
+            try objectIdentifier([1, 2, 840, 10045, 3, 1, 7]),
+        ])
+        return try sequence([
+            algorithm,
+            try bitString(unusedBitCount: 0, bytes: uncompressedPoint),
+        ])
+    }
+
+    private static func sequence(_ elements: [[UInt8]]) throws -> [UInt8] {
+        var content = [UInt8]()
+        var total = 0
+        for bytes in elements {
+            let (next, overflow) = total.addingReportingOverflow(bytes.count)
+            guard !overflow else {
+                throw DERWriteError.capacity(
+                    .offsetOverflow(offset: total, count: bytes.count)
+                )
+            }
+            total = next
+        }
+        content.reserveCapacity(total)
+        for bytes in elements {
+            content.append(contentsOf: bytes)
+        }
+        return try element(
+            tag: SSLASN1.DERTag(tagClass: .universal, isConstructed: true, number: 16),
+            content: content
+        )
+    }
+
+    private static func positiveInteger(_ bytes: [UInt8]) throws -> [UInt8] {
+        var first = 0
+        while first + 1 < bytes.count, bytes[first] == 0 {
+            first += 1
+        }
+        var content = bytes.isEmpty ? [UInt8(0)] : Array(bytes[first...])
+        if content[0] & 0x80 != 0 {
+            content.insert(0, at: 0)
+        }
+        return try element(
+            tag: SSLASN1.DERTag(tagClass: .universal, isConstructed: false, number: 2),
+            content: content
+        )
+    }
+
+    private static func boolean(_ value: Bool) throws -> [UInt8] {
+        try element(
+            tag: SSLASN1.DERTag(tagClass: .universal, isConstructed: false, number: 1),
+            content: [value ? 0xFF : 0]
+        )
+    }
+
+    private static func octetString(_ bytes: [UInt8]) throws -> [UInt8] {
+        try element(
+            tag: SSLASN1.DERTag(tagClass: .universal, isConstructed: false, number: 4),
+            content: bytes
+        )
+    }
+
+    private static func bitString(
+        unusedBitCount: UInt8,
+        bytes: [UInt8]
+    ) throws -> [UInt8] {
+        guard unusedBitCount <= 7 else {
+            throw DERWriteError.invalidLength
+        }
+        var content = [UInt8]()
+        content.reserveCapacity(bytes.count + 1)
+        content.append(unusedBitCount)
+        content.append(contentsOf: bytes)
+        return try element(
+            tag: SSLASN1.DERTag(tagClass: .universal, isConstructed: false, number: 3),
+            content: content
+        )
+    }
+
+    private static func objectIdentifier(_ arcs: [UInt64]) throws -> [UInt8] {
+        var writer = try DERWriter(maximumByteCount: 128, minimumCapacity: 16)
+        try writer.appendObjectIdentifier(arcs.span)
+        let encoded = writer.finish()
+        return encoded.withBorrowedBytes { materialize($0) }
+    }
+
+    private static func element(
+        tag: SSLASN1.DERTag,
+        content: [UInt8]
+    ) throws -> [UInt8] {
+        let (maximumByteCount, overflow) = content.count.addingReportingOverflow(8)
+        guard !overflow else {
+            throw DERWriteError.capacity(
+                .offsetOverflow(offset: content.count, count: 8)
+            )
+        }
+        var writer = try DERWriter(
+            maximumByteCount: maximumByteCount,
+            minimumCapacity: maximumByteCount
+        )
+        try writer.append(tag: tag, content: content.span)
+        let encoded = writer.finish()
+        return encoded.withBorrowedBytes { materialize($0) }
+    }
+
+    private static func materialize(_ bytes: Span<UInt8>) -> [UInt8] {
+        var output = [UInt8]()
+        output.reserveCapacity(bytes.count)
+        bytes.withUnsafeBufferPointer { buffer in
+            output.append(contentsOf: buffer)
+        }
+        return output
     }
 
     private static func appendTwoDigits(_ value: Int64, to output: inout [UInt8]) {

@@ -2,7 +2,7 @@
 ///
 /// SCTP common header and chunk format for SCTP-over-DTLS.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// SCTP packet header (12 bytes).
 ///

@@ -1,5 +1,7 @@
 import WebRTCMedia
-import P2PCoreDER
+import NetworkingTime
+import SSLASN1
+import SSLX509
 import Synchronization
 import WebRTC
 import _Concurrency
@@ -36,14 +38,8 @@ private enum WebRTCPlatformIntegrationProbeSinkError: Error, Sendable {
 @main
 enum WebRTCPlatformIntegrationProbe {
     static func main() async throws(WebRTCPlatformIntegrationProbeError) {
-        let clientCertificate = try provisionedCertificate(
-            scalarLastByte: 1,
-            uncompressedPoint: p256Generator
-        )
-        let serverCertificate = try provisionedCertificate(
-            scalarLastByte: 2,
-            uncompressedPoint: p256GeneratorTimesTwo
-        )
+        let clientCertificate = try provisionedCertificate(clockSeconds: 1_750_000_000)
+        let serverCertificate = try provisionedCertificate(clockSeconds: 1_750_000_001)
         let mediaConfiguration = try configuredMedia()
         try verifyTypedTransportFailure(certificate: clientCertificate)
         try await verifyTimerCooperation()
@@ -74,14 +70,11 @@ enum WebRTCPlatformIntegrationProbe {
         let sleeper = Task {
             state.beginSleeping()
             startGate.open()
-            let now = timer.monotonicNanos()
-            let (candidate, overflow) = now.addingReportingOverflow(
-                2_000_000_000
-            )
-            let deadline = overflow ? UInt64.max : candidate
             let wasCancelled: Bool
             do {
-                try await timer.sleep(untilNanos: deadline)
+                let now = try timer.now()
+                let deadline = try now.advanced(byNanoseconds: 2_000_000_000)
+                try await timer.sleep(until: deadline)
                 wasCancelled = false
             } catch {
                 wasCancelled = true
@@ -137,38 +130,15 @@ enum WebRTCPlatformIntegrationProbe {
     }
 
     private static func provisionedCertificate(
-        scalarLastByte: UInt8,
-        uncompressedPoint: [UInt8]
+        clockSeconds: Int64
     ) throws(WebRTCPlatformIntegrationProbeError) -> WebRTCCertificate {
-        let subjectPublicKeyInfo: [UInt8]
         do {
-            subjectPublicKeyInfo = try SubjectPublicKeyInfoDER.encodeP256(
-                uncompressedPoint65: uncompressedPoint
+            let generated = try WebRTCCertificate.generateSelfSigned(
+                clock: PortableCertificateClock(seconds: clockSeconds)
             )
-        } catch {
-            throw .certificateEncodingFailed
-        }
-
-        let certificate = try LibP2PCertificateDER.buildSelfSignedCert(
-            spkiDER: subjectPublicKeyInfo,
-            signedKeyExtension: [],
-            serial16: [UInt8](repeating: scalarLastByte, count: 16),
-            notBefore: 1_735_689_600,
-            notAfter: 1_830_297_600,
-            signFn: { (_: [UInt8]) throws(WebRTCPlatformIntegrationProbeError) -> [UInt8] in
-                // Structurally valid ECDSA-Sig-Value. WebRTC binds this leaf by
-                // its complete SHA-256 fingerprint, while DTLS separately proves
-                // possession of the corresponding private key.
-                [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]
-            }
-        )
-
-        var rawPrivateKey = [UInt8](repeating: 0, count: 32)
-        rawPrivateKey[31] = scalarLastByte
-        do {
             return try WebRTCCertificate(
-                derEncoded: certificate,
-                rawPrivateKey: rawPrivateKey
+                derEncoded: generated.derEncoded,
+                rawPrivateKey: generated.rawPrivateKey
             )
         } catch {
             throw .certificateRejected
@@ -330,29 +300,12 @@ enum WebRTCPlatformIntegrationProbe {
         }
     }
 
-    private static let p256Generator: [UInt8] = [
-        0x04,
-        0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47,
-        0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40, 0xF2,
-        0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0,
-        0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98, 0xC2, 0x96,
-        0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B,
-        0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E, 0x16,
-        0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE,
-        0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5,
-    ]
+}
 
-    private static let p256GeneratorTimesTwo: [UInt8] = [
-        0x04,
-        0x7C, 0xF2, 0x7B, 0x18, 0x8D, 0x03, 0x4F, 0x7E,
-        0x8A, 0x52, 0x38, 0x03, 0x04, 0xB5, 0x1A, 0xC3,
-        0xC0, 0x89, 0x69, 0xE2, 0x77, 0xF2, 0x1B, 0x35,
-        0xA6, 0x0B, 0x48, 0xFC, 0x47, 0x66, 0x99, 0x78,
-        0x07, 0x77, 0x55, 0x10, 0xDB, 0x8E, 0xD0, 0x40,
-        0x29, 0x3D, 0x9A, 0xC6, 0x9F, 0x74, 0x30, 0xDB,
-        0xBA, 0x7D, 0xAD, 0xE6, 0x3C, 0xE9, 0x82, 0x29,
-        0x9E, 0x04, 0xB7, 0x9D, 0x22, 0x78, 0x73, 0xD1,
-    ]
+private struct PortableCertificateClock: WebRTCCertificateClock {
+    let seconds: Int64
+
+    func nowUnixSeconds() -> Int64? { seconds }
 }
 
 private final class PortableMediaConnectionPair: Sendable {

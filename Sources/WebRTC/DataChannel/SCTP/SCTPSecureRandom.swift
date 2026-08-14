@@ -1,21 +1,26 @@
 /// CSPRNG for SCTP handshake material (initiate tags, initial TSN, cookie
 /// secret) routed through the Embedded-clean `RandomSource` seam.
 ///
-/// The same `DefaultRandom` backend is used on Native, WASI, and Embedded.
+/// The same `SystemRandom` backend is used on Native, WASI, and Embedded.
 /// The seam keeps this file Embedded-clean and prevents platform-specific
 /// weakening of the randomness contract.
 
-import P2PCoreCrypto
-import P2PCrypto
+import SSLCrypto
+import NetworkingCore
 
 enum SCTPSecureRandom {
     /// The concrete CSPRNG for this build.
-    private static let source = DefaultRandom()
-
     /// Returns `count` fresh random bytes.
     static func bytes(count: Int) -> [UInt8] {
         guard count > 0 else { return [] }
-        return source.randomBytes(count)
+        var bytes = [UInt8](repeating: 0, count: count)
+        do {
+            var destination = bytes.mutableSpan
+            try SystemRandom.fill(&destination)
+        } catch {
+            preconditionFailure("Secure random generation failed: \(error)")
+        }
+        return bytes
     }
 
     static func uint32() -> UInt32 {

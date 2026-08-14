@@ -1,6 +1,6 @@
 /// Foundation `Data` compatibility layer over the Embedded-clean `SCTPWireCore`.
 ///
-/// `SCTPWireCore` expresses the SCTP wire codec over `[UInt8]`/`P2PCoreBytes` so
+/// `SCTPWireCore` expresses the SCTP wire codec over `[UInt8]`/`NetworkingCore` so
 /// it can build under Embedded Swift. This adapter restores the historical
 /// `Data`-based public surface that the SCTP state machine (`SCTPAssociation`,
 /// `FragmentAssembler`, `SCTPCookie`, …), `WebRTC`, and the existing test suite

@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Produces RFC 6184 packet layouts without taking ownership of media bytes.
 public protocol H264RTPPacketizing: Sendable {

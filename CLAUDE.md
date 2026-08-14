@@ -28,7 +28,7 @@ TOOLCHAINS=org.swift.64202607231a \
   "LD_RUNPATH_SEARCH_PATHS=\$(inherited) ${SWIFT_TOOLCHAIN_USR}/lib/swift/macosx/testing"
 
 # Normal WASM runtime probe using the matching SDK.
-P2P_CORE_WASM=1 \
+SWIFT_NETWORKING_WASM=1 \
 "$(xcrun --toolchain org.swift.64202607231a --find swift)" run \
   --package-path . --build-system swiftbuild -c release \
   --scratch-path /tmp/swift-webrtc-wasm-normal \
@@ -36,7 +36,7 @@ P2P_CORE_WASM=1 \
   WebRTCPlatformIntegrationProbe
 
 # Embedded WASM runtime probe. Release is required for Embedded WMO.
-P2P_CORE_EMBEDDED=1 \
+SWIFT_NETWORKING_EMBEDDED=1 \
   "$(xcrun --toolchain org.swift.64202607231a --find swift)" run \
   --package-path . --build-system swiftbuild -c release \
   --scratch-path /tmp/swift-webrtc-wasm-embedded \
@@ -47,7 +47,8 @@ P2P_CORE_EMBEDDED=1 \
 ## Architecture
 
 This is a pure Swift WebRTC Direct implementation with no C/C++ WebRTC stack.
-Portable cryptography uses `swift-ssl` through `swift-p2p-core/P2PCrypto` on every target. The protocol stack is:
+Portable cryptography uses `swift-ssl/SSLCrypto` directly on every target, with
+shared bytes and time capabilities from `swift-networking`. The protocol stack is:
 
 ```
                                   ┌→ SCTP → Data Channels
@@ -83,11 +84,10 @@ WebRTC drives DTLS through swift-tls's Tier-1 `TLS` facade value types
 (`DTLSClient` / `DTLSServer`). The former swift-tls `DTLSCore` / `DTLSRecord`
 products were demoted to `package` visibility in the facade redesign and are no
 longer importable here (swift-tls now exports only `TLS`, `TLSWire`, `DTLSWire`).
-swift-tls is consumed through its `TLS` product. The current unreleased
-integration has been validated against coordinated local working trees. The
-development manifest uses sibling path dependencies; no swift-webrtc tag may be
-created until compatible dependency commits are published, those paths are
-replaced with public URLs, and the public graph passes the same validation matrix.
+swift-tls is consumed through its `TLS` product. The release manifest resolves
+published `swift-networking`, `swift-ssl`, and `swift-tls` versions. A
+swift-webrtc tag may be created only after the public graph passes the Native,
+WASM, and Embedded validation matrix and the tag commit equals `origin/main`.
 
 - **DTLSEndpoint** (`Sources/WebRTC/DTLSEndpoint.swift`) - Internal enum wrapping
   `DTLSClient` / `DTLSServer` behind one sans-IO surface: `receive` / `send` /

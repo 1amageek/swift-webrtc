@@ -2,9 +2,9 @@
 
 import Testing
 import Foundation
-import P2PCoreBytes
-import P2PCoreCrypto
-import P2PCrypto
+import NetworkingCore
+import NetworkingTime
+import SSLCrypto
 @testable import WebRTC
 @Suite("SCTP Packet Tests")
 struct SCTPPacketTests {
@@ -198,7 +198,7 @@ struct SCTPPacketTests {
         let legacyMAC = legacyCookieAuthenticationCode(
             message: legacyInput,
             key: secretKey,
-            as: DefaultHMACSHA256.self
+            as: HMACSHA256.self
         )
 
         #expect(cookie.hmac == legacyMAC)
@@ -297,7 +297,14 @@ private func legacyCookieAuthenticationCode<MAC: MessageAuthenticationCode>(
     key: [UInt8],
     as macType: MAC.Type
 ) -> [UInt8] {
-    MAC.authenticationCode(for: message.span, key: key.span)
+    var output = [UInt8](repeating: 0, count: MAC.tagByteCount)
+    do {
+        var destination = output.mutableSpan
+        try MAC.authenticate(message.span, using: key.span, into: &destination)
+    } catch {
+        preconditionFailure("Test HMAC input violated the primitive contract: \(error)")
+    }
+    return output
 }
 
 /// Regression coverage for the ordered-delivery Stream-Sequence-Number (SSN)

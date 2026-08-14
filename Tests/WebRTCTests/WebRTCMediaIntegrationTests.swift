@@ -1,3 +1,4 @@
+import NetworkingTime
 import Synchronization
 import Testing
 @testable import WebRTC
@@ -333,16 +334,23 @@ struct WebRTCMediaIntegrationTests {
 
     @Test("Background SCTP retransmission preserves typed transport failure", .timeLimit(.minutes(1)))
     func backgroundRetransmissionFailureIsObservable() async throws {
-        let pair = try MediaConnectionPair()
+        let clock = ManuallyAdvancedTimer()
+        let pair = try MediaConnectionPair(timer: WebRTCTimer(clock))
         try pair.completeHandshake()
+        for _ in 0..<10_000 where clock.activeDeadlineCount(
+            nanoseconds: 250_000_000
+        ) < 2 {
+            await Task.yield()
+        }
+        #expect(clock.activeDeadlineCount(nanoseconds: 250_000_000) == 2)
         let channelID = try pair.openClientDataChannel()
         try pair.client.send([0xD0, 0x0D], on: channelID)
         _ = try #require(pair.nextClientDatagram())
         pair.rejectNextClientDatagram(with: .destinationUnreachable)
 
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while !pair.client.state.isTerminal, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
+        clock.advance(byNanoseconds: 4_000_000_000)
+        for _ in 0..<10_000 where !pair.client.state.isTerminal {
+            await Task.yield()
         }
 
         #expect(pair.client.state.isTerminal)
@@ -457,7 +465,7 @@ private final class MediaConnectionPair {
     private let clientOutbox: DatagramOutbox
     private let serverOutbox: DatagramOutbox
 
-    init() throws {
+    init(timer: WebRTCTimer = .platformDefault) throws {
         let clientCertificate = try WebRTCTestIdentity.make()
         let serverCertificate = try WebRTCTestIdentity.make()
         let media = try WebRTCMediaConfiguration(
@@ -475,7 +483,8 @@ private final class MediaConnectionPair {
             mediaConfiguration: media,
             sendHandler: { [clientOutbox] datagram in
                 clientOutbox.accept(datagram)
-            }
+            },
+            timer: timer
         )
         self.server = try WebRTCConnection.asServer(
             certificate: serverCertificate,
@@ -483,7 +492,8 @@ private final class MediaConnectionPair {
             mediaConfiguration: media,
             sendHandler: { [serverOutbox] datagram in
                 serverOutbox.accept(datagram)
-            }
+            },
+            timer: timer
         )
     }
 
@@ -548,6 +558,60 @@ private final class MediaConnectionPair {
 
     func clientLastAcceptedBaseAddress() -> UInt? {
         clientOutbox.lastAcceptedBaseAddress
+    }
+}
+
+private final class ManuallyAdvancedTimer: AsyncTimer, Sendable {
+    private static let clockIdentifier: UInt64 = 0x5745_4252_5443_544D
+    private struct State: Sendable {
+        var currentNanoseconds: UInt64 = 0
+        var nextSleepIdentifier: UInt64 = 0
+        var activeDeadlines: [UInt64: UInt64] = [:]
+    }
+
+    private let state = Mutex(State())
+
+    func advance(byNanoseconds delta: UInt64) {
+        state.withLock { state in
+            let (advanced, overflow) = state.currentNanoseconds
+                .addingReportingOverflow(delta)
+            state.currentNanoseconds = overflow ? UInt64.max : advanced
+        }
+    }
+
+    func activeDeadlineCount(nanoseconds: UInt64) -> Int {
+        state.withLock { state in
+            state.activeDeadlines.values.count { $0 == nanoseconds }
+        }
+    }
+
+    func now() throws(TimeError) -> MonotonicInstant {
+        MonotonicInstant(
+            clockIdentifier: Self.clockIdentifier,
+            nanoseconds: state.withLock { $0.currentNanoseconds }
+        )
+    }
+
+    func sleep(until deadline: MonotonicInstant) async throws(TimeError) {
+        guard deadline.clockIdentifier == Self.clockIdentifier else {
+            throw .clockDomainMismatch(
+                expected: Self.clockIdentifier,
+                actual: deadline.clockIdentifier
+            )
+        }
+        let identifier = state.withLock { state -> UInt64 in
+            let identifier = state.nextSleepIdentifier
+            state.nextSleepIdentifier &+= 1
+            state.activeDeadlines[identifier] = deadline.nanoseconds
+            return identifier
+        }
+        defer {
+            state.withLock { $0.activeDeadlines[identifier] = nil }
+        }
+        while state.withLock({ $0.currentNanoseconds }) < deadline.nanoseconds {
+            guard !Task.isCancelled else { throw .cancelled }
+            await Task.yield()
+        }
     }
 }
 

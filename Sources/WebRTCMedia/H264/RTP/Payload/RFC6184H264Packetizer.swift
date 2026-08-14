@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// RFC 6184 Single NAL, STAP-A, and FU-A packetization planner.
 public struct RFC6184H264Packetizer: H264RTPPacketizing, Sendable {

@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 import WebRTC
 import Synchronization
 

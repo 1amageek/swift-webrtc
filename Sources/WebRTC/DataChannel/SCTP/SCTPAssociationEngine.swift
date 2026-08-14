@@ -25,7 +25,7 @@
 /// does not mutate it; only a validated COOKIE-ECHO commits peer parameters), and
 /// the verification-tag checks (RFC 4960 §8.5).
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// SCTP association state.
 enum SCTPAssociationState: Sendable, Equatable {
@@ -86,7 +86,7 @@ private struct SCTPInitAckParameters {
 /// The Embedded-clean SCTP association FSM.
 ///
 /// Cookie authentication is injected as one immutable, non-generic operation
-/// owner. The adapter resolves `P2PCrypto.DefaultHMACSHA256` for every build.
+/// owner. The adapter resolves `SSLCrypto.HMACSHA256` for every build.
 struct SCTPAssociationEngine: Sendable {
     // MARK: - Stored state
 

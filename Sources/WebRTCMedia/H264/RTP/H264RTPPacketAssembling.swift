@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Composes validated RTP and RFC 6184 metadata into one final packet owner.
 public protocol H264RTPPacketAssembling: Sendable {

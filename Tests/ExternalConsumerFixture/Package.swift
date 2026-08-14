@@ -1,7 +1,7 @@
 // swift-tools-version: 6.4
 import PackageDescription
 
-let embeddedEnabled = Context.environment["P2P_CORE_EMBEDDED"] == "1"
+let embeddedEnabled = Context.environment["SWIFT_NETWORKING_EMBEDDED"] == "1"
 let portableEnabled =
     embeddedEnabled
     || Context.environment["WEBRTC_PORTABLE"] == "1"

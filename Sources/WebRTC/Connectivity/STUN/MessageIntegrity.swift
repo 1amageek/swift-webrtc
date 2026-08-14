@@ -3,18 +3,17 @@
 /// The integrity-input construction and the constant-time verification live in
 /// the Embedded-clean `MessageIntegrityCore` (STUNWireCore), which routes the
 /// HMAC through the `MessageAuthenticationCode` seam. This adapter selects
-/// `DefaultHMACSHA1` on every target and exposes both a `[UInt8]` surface
+/// `SSLCrypto.HMACSHA1` on every target and exposes both a `[UInt8]` surface
 /// (Embedded-clean) and the historical `Data` surface (non-Embedded only).
 /// Verification is fail-closed: a mismatch yields `.invalid`, never `.valid`.
 
-import P2PCoreCrypto
+import SSLCrypto
 #if !hasFeature(Embedded) && !os(WASI)
 import Foundation
 #endif
-import P2PCrypto
 
 /// The concrete MESSAGE-INTEGRITY HMAC-SHA1 for every build.
-typealias STUNIntegrityMAC = DefaultHMACSHA1
+typealias STUNIntegrityMAC = HMACSHA1
 
 /// MESSAGE-INTEGRITY computation and verification.
 enum MessageIntegrity: Sendable {

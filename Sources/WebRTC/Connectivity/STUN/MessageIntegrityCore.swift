@@ -7,8 +7,8 @@
 /// caller (the STUNCore adapter's FoundationProvider). The verification is
 /// fail-closed: a mismatch yields `.invalid`, never `.valid`.
 
-import P2PCoreBytes
-import P2PCoreCrypto
+import NetworkingCore
+import SSLCrypto
 
 /// Result of MESSAGE-INTEGRITY verification.
 enum IntegrityResult: Sendable, Equatable {
@@ -37,7 +37,16 @@ enum MessageIntegrityCore: Sendable {
         key: [UInt8],
         as macType: M.Type
     ) -> [UInt8] {
-        M.authenticationCode(for: data.span, key: key.span)
+        var output = [UInt8](repeating: 0, count: M.tagByteCount)
+        do {
+            var destination = output.mutableSpan
+            try M.authenticate(data.span, using: key.span, into: &destination)
+        } catch {
+            preconditionFailure(
+                "Validated STUN HMAC input exceeded the primitive contract: \(error)"
+            )
+        }
+        return output
     }
 
     /// Verify MESSAGE-INTEGRITY in a STUN message (tri-state result).
@@ -92,7 +101,16 @@ enum MessageIntegrityCore: Sendable {
 
                 // Constant-time recompute-and-compare via the seam. `M.isValid`
                 // never short-circuits on a byte difference.
-                let valid = M.isValid(receivedMAC.span, for: adjustedMsg.span, key: key.span)
+                let valid: Bool
+                do {
+                    valid = try M.isValidAuthenticationCode(
+                        receivedMAC.span,
+                        authenticating: adjustedMsg.span,
+                        using: key.span
+                    )
+                } catch {
+                    return .invalid
+                }
                 return valid ? .valid : .invalid
             }
 

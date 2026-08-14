@@ -1,8 +1,7 @@
-import P2PCoreBytes
-import P2PCoreCrypto
-import P2PCrypto
+import NetworkingCore
+import SSLCrypto
 
-private typealias SCTPConcreteCookieMAC = DefaultHMACSHA256
+private typealias SCTPConcreteCookieMAC = HMACSHA256
 
 /// Resolves the package's default cookie HMAC once at the SCTP composition boundary.
 ///
@@ -15,21 +14,38 @@ func makeSCTPCookieCryptoContext() -> SCTPCookieCryptoContext {
             message: [UInt8],
             key: [UInt8]
         ) -> [UInt8] in
-            SCTPConcreteCookieMAC.authenticationCode(
-                for: message.span,
-                key: key.span
+            var output = [UInt8](
+                repeating: 0,
+                count: SCTPConcreteCookieMAC.tagByteCount
             )
+            do {
+                var destination = output.mutableSpan
+                try SCTPConcreteCookieMAC.authenticate(
+                    message.span,
+                    using: key.span,
+                    into: &destination
+                )
+            } catch {
+                preconditionFailure(
+                    "Validated SCTP cookie input exceeded the primitive contract"
+                )
+            }
+            return output
         },
         isValid: { @Sendable (
             authenticationCode: [UInt8],
             message: [UInt8],
             key: [UInt8]
         ) -> Bool in
-            SCTPConcreteCookieMAC.isValid(
-                authenticationCode.span,
-                for: message.span,
-                key: key.span
-            )
+            do {
+                return try SCTPConcreteCookieMAC.isValidAuthenticationCode(
+                    authenticationCode.span,
+                    authenticating: message.span,
+                    using: key.span
+                )
+            } catch {
+                return false
+            }
         }
     )
 }

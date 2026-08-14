@@ -8,7 +8,7 @@
 /// adapter-side. The binding check is fail-closed: any mismatch (expiry, length,
 /// or MAC) returns `false`; it never accepts on mismatch.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// SCTP State Cookie value type, Embedded-clean.
 ///

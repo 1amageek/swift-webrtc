@@ -1,4 +1,4 @@
-import P2PCoreCrypto
+import NetworkingTime
 
 /// RFC 3711 Section 4.3 AES-CM PRF with a fixed key-derivation rate of zero.
 struct RFC3711KeyDeriver: Sendable {

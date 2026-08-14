@@ -5,7 +5,7 @@
 /// ``FacadeLock`` (the same `Synchronization.Mutex` contract on every target),
 /// keeps the historical `Data`-based
 /// public API, supplies the COOKIE HMAC via an immutable non-generic crypto
-/// context backed by `P2PCrypto.DefaultHMACSHA256`, sources the random handshake material from the
+/// context backed by `SSLCrypto.HMACSHA256`, sources the random handshake material from the
 /// `RandomSource` seam, and supplies the monotonic millisecond clock the
 /// engine's T3-rtx / cookie timing needs.
 ///

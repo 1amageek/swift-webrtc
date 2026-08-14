@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Encodes the small RTP header independently from media-payload ownership.
 package protocol RTPHeaderEncoding: Sendable {
@@ -7,5 +7,5 @@ package protocol RTPHeaderEncoding: Sendable {
         _ header: RTPOutboundHeader,
         extensionProfile: UInt16?,
         extensionData: Span<UInt8>
-    ) throws(RTPWireError) -> Bytes
+    ) throws(RTPWireError) -> OwnedBytes
 }

@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Zero-copy Annex B and AVCC framing parser for one H.264 access unit.
 public struct H264ByteStreamParser: H264ByteStreamParsing, Sendable {

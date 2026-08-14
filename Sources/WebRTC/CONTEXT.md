@@ -198,14 +198,14 @@ See the workspace
   (`WebRTCConnection` / `WebRTCEndpoint` / `WebRTCListener` / `WebRTCCertificate`)
   route their host-only deps through build-gated seams: common `FacadeLock`
   (`Synchronization.Mutex` on every supported platform), `WebRTCDefaultTimer` (the `AsyncTimer` seam — host
-  `ContinuousClock`+`Task.sleep`, WASI/Embedded platform monotonic clock + sliced
-  park; drives both DTLS flight and SCTP T3-rtx scheduling), `WebRTCLogger`
+  `ContinuousAsyncTimer`, `WASIAsyncTimer`, or `POSIXAsyncTimer`; drives both
+  DTLS flight and SCTP T3-rtx scheduling), `WebRTCLogger`
   (host swift-log / Embedded no-op),
-  and the common `P2PCrypto.DefaultSHA256` certificate fingerprint path. Do not introduce target-specific state isolation /
+  and the common `SSLCrypto.SHA256` certificate fingerprint path. Do not introduce target-specific state isolation /
   `Task.sleep` / `ContinuousClock` / `Logging.Logger` into the facade.
 - **Pure Swift identity generation is shared by every target.**
   `WebRTCCertificate.generateSelfSigned` builds a v3 ECDSA P-256 leaf with the
-  shared DER writer and `P2PCrypto` provider. The same `[UInt8]` certificate and
+  `SSLASN1` writer and `SSLCrypto` provider. The same `[UInt8]` certificate and
   raw scalar representation is used on Native, WASI, and Embedded. Its wall
   clock is an injectable `WebRTCCertificateClock`, so Embedded deployments can
   use an RTC without importing a platform clock into the facade. If no clock is
@@ -228,11 +228,10 @@ See the workspace
 ## Dependencies & seams
 
 - The Tier-1 `TLS` facade (`DTLSClient` / `DTLSServer`) is consumed from
-  `swift-tls`. The development manifest points at coordinated sibling working
-  trees so unpublished commits can be validated together. A release must replace
-  those path dependencies with the published graph and pass the same matrix.
-- Certificate generation and validation use the shared Pure Swift DER and
-  `P2PCrypto` path. The WebRTC manifest has no Darwin-only certificate trait or
+  `swift-tls`. The release manifest resolves published versions of
+  `swift-networking`, `swift-ssl`, and `swift-tls`.
+- Certificate generation and validation use `swift-ssl`'s Pure Swift
+  cryptography, ASN.1, and X.509 modules. The WebRTC manifest has no Darwin-only certificate trait or
   platform-specific crypto dependency; the package declares no traits and does
   not need trait flags to select the identity contract.
 - The internal SRTP component owns RFC 3711 key derivation, in-place
@@ -277,7 +276,7 @@ belong to the adapter surrounding its synchronous sink.
 - Normal and Embedded WASM use the exact 2026-07-23 Swift 6.4 toolchain and
   matching SDK identifiers shown in `CLAUDE.md`. Both run the Tests-contained
   `WebRTCPlatformIntegrationProbe` with `--build-system swiftbuild`; both
-  select the same P2PCrypto default backend.
+  select the same `swift-ssl` cryptographic backend.
 - The pinned Embedded compiler requires `-debug-info-format none` for this
   executable-only async probe because its DWARF emitter asserts on conflicting
   frame locations. Release optimization remains enabled for library targets.
@@ -286,7 +285,7 @@ belong to the adapter surrounding its synchronous sink.
   typed transport rejection, and observes timer heartbeat/cancellation. It is
   not real UDP, browser interoperability, target-parallel Mutex validation, or
   a production event-loop timer claim.
-- The portable default timer parks the executor thread in bounded 20 ms platform
-  slices before yielding. It exists as a deterministic runtime fallback; a
-  production single-threaded WASI/Embedded integration must inject an
-  event-loop-integrated `WebRTCTimer` to meet low-latency scheduling budgets.
+- The platform default timer is supplied by `swift-networking`: continuous time
+  on Native, WASI time on WASI, and POSIX time where the Embedded platform
+  provides POSIX. A board integration with a different runtime should inject an
+  event-loop-integrated `WebRTCTimer`.

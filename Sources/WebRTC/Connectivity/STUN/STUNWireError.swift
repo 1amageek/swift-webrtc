@@ -3,14 +3,14 @@
 /// Embedded Swift forbids untyped `throws` (which is `throws(any Error)`), so the
 /// wire codec uses typed throws with this single error type. It wraps the two
 /// error kinds the codec can raise:
-/// - ``ByteError`` from the `P2PCoreBytes` reader/writer,
+/// - ``ByteError`` from the `NetworkingCore` reader/writer,
 /// - ``STUNDecodeError`` for malformed STUN structure.
 ///
 /// The `STUNCore` adapter unwraps this back to the original concrete `STUNError`
 /// at the `Data`-based boundary, so callers (and the existing test suite)
 /// continue to catch `STUNError` directly.
 
-import P2PCoreBytes
+import NetworkingCore
 
 /// Structural decoding failures for the STUN wire codec.
 ///

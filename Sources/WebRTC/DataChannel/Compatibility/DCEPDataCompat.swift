@@ -1,6 +1,6 @@
 /// Foundation `Data` compatibility layer over the Embedded-clean DCEP codec.
 ///
-/// The internal codec uses `[UInt8]`/`P2PCoreBytes` so it can build under
+/// The internal codec uses `[UInt8]`/`NetworkingCore` so it can build under
 /// Embedded Swift. This adapter restores the historical
 /// `Data`-based `encode()`/`decode(from:Data)` surface that `DataChannelManager`,
 /// `WebRTC`, and the existing test suite bind to.

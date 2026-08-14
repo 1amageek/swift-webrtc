@@ -1,4 +1,4 @@
-import P2PCoreCrypto
+import NetworkingTime
 
 /// Immutable operations required by the RFC 3711 AES-CM/HMAC-SHA1 profile.
 ///

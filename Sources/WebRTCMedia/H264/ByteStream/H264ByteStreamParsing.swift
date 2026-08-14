@@ -1,4 +1,4 @@
-import P2PCoreBytes
+import NetworkingCore
 
 /// Extracts H.264 NAL-unit ranges while borrowing the encoded byte owner.
 public protocol H264ByteStreamParsing: Sendable {

@@ -1,5 +1,5 @@
-import P2PCoreCrypto
-import P2PCrypto
+import NetworkingTime
+import SSLCrypto
 import Testing
 @testable import WebRTC
 @Suite("RFC 3711 key derivation")
@@ -45,7 +45,7 @@ struct RFC3711KeyDerivationTests {
     func appendixB2() throws {
         let key = try fixtureBytes("2B7E151628AED2A6ABF7158809CF4F3C")
         let counter = try fixtureBytes("F0F1F2F3F4F5F6F7F8F9FAFBFCFD0000")
-        let cipher = try DefaultCryptoProvider.makeAES128CounterMode(key: key.span)
+        let cipher = try AES128CounterMode(key: key.span)
         var output = [UInt8](repeating: 0, count: 48)
 
         try cipher.applyKeystream(
